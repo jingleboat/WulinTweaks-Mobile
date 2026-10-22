@@ -36,6 +36,10 @@
 
 /* 排查探针：1 = 往 wulin.log 打水面/阻挡诊断，正式包改回 0 */
 #define WULIN_PROBE 0
+/* 名字排查探针（v92/v93 那套）：1 = 把 TMP 里的 ASCII 文本、getter 返回的 ASCII 名、
+ * 以及实例/模板的名字字段全打出来。定位「名字变 OutPort」时用过，正式包保持 0。
+ * v94 的读侧消毒与 v91 的类型校验不受这个开关影响。 */
+#define WULIN_NAMEPROBE 0
 
 /* DynamicModifier 运行时懒加载兜底：实测不可用（见 install_tweaks 注释） */
 #define WULIN_DM_LAZY 0
@@ -711,6 +715,8 @@ static int g_log_rename = 0;
 static int g_log_tpl = 0;
 static int g_log_ready = 0;
 static int g_log_name_sink = 0;   /* 文本层 / 气泡改名 的日志上限 */
+static int g_ascii_log = 0;       /* v91-probe：TMP 里出现纯 ASCII 短串的日志上限 */
+static int g_port_probe = 0;      /* v92-probe：TMP 里出现 "Port" 字样的日志上限 */
 
 
 static int str_empty(void* s) {
@@ -752,6 +758,63 @@ static int snap_match_u16(void* s, const uint16_t* want, int wantlen) {
     if (l != wantlen) return 0;
     return memcmp((char*)s + OFF_IL2STR_CHARS, want, (size_t)wantlen * 2) == 0;
 }
+
+/* ---- v91：写名字前的「类型体检」-----------------------------------------
+ * 症状：洛天雄离队后再去找他，名字变成 "OutPort"。
+ * 离队会把角色实例销毁/重建，`GameCharacterManager.GetCharacter(uid)` 之后可能
+ * 返回**已释放的地址**（被别的对象复用，很可能是剧情图里的节点/端口对象 ——
+ * 那些对象身上到处是 "OutPort" / "conditionPort" 这类字符串）。
+ * 这时我们去读 c+OFF_GCI_TEMPLATE 得到的是野指针，读 +0x20/+0x28 拿到某个
+ * 字符串（正好是端口名），再把它写进 m_surName/m_givenName —— 名字就成了 "OutPort"。
+ * 所以写之前先按 il2cpp 类名 + 实例 uid 双重确认，宁可这一次不改名。 */
+static int obj_is_class(void* obj, const char* want) {
+    if ((uintptr_t)obj < 0x10000) return 0;
+    if (!A_obj_get_class || !A_class_get_name) return 1;   /* 拿不到 API 就不拦 */
+    void* k = A_obj_get_class(obj);
+    if ((uintptr_t)k < 0x10000) return 0;
+    const char* n = A_class_get_name(k);
+    return (n && strcmp(n, want) == 0);
+}
+
+/* ---- v92-probe：定位「端口名被当成名字显示」到底走哪条路 ------------------
+ * 判断标准：3~32 个字符、全部是可打印 ASCII、且至少含一个字母。
+ * `OutPort`、`conditionPort`、`HeadName` 这类运行时串都符合，中文名一律不符合。 */
+static int str_is_ascii_name(void* s) {
+    if (!il2str_len_ok(s)) return 0;
+    int L = *(int*)((char*)s + OFF_IL2STR_LEN);
+    if (L < 3 || L > 32) return 0;
+    const unsigned short* p = (const unsigned short*)((char*)s + OFF_IL2STR_CHARS);
+    int alpha = 0;
+    for (int k = 0; k < L; ++k) {
+        unsigned short c = p[k];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) { alpha = 1; continue; }
+        if (c < 0x20 || c > 0x7E) return 0;
+    }
+    return alpha;
+}
+
+#if WULIN_NAMEPROBE
+/* Unity 组件 → GameObject 名（用来判断是哪块 UI 在显示这个串） */
+static void comp_go_name(void* comp, char* buf, int cap) {
+    if (buf && cap > 0) buf[0] = 0;
+    if ((uintptr_t)comp < 0x10000) return;
+    typedef void* (*fn_go)(void*);
+    void* go = ((fn_go)(g_base + RVA_COMP_GET_GO))(comp);
+    if ((uintptr_t)go < 0x10000) return;
+    typedef void* (*fn_name)(void*);
+    void* nm = ((fn_name)(g_base + RVA_GET_NAME))(go);
+    if ((uintptr_t)nm > 0x10000) str_to_buf(nm, buf, cap);
+}
+
+static void obj_class_name(void* obj, char* buf, int cap) {
+    if (buf && cap > 0) buf[0] = 0;
+    if ((uintptr_t)obj < 0x10000 || !A_obj_get_class || !A_class_get_name) return;
+    void* k = A_obj_get_class(obj);
+    if ((uintptr_t)k < 0x10000) return;
+    const char* n = A_class_get_name(k);
+    if (n) snprintf(buf, cap, "%s", n);
+}
+#endif
 
 /* 取「熟悉后姓名」的分层兜底，全部基于传入的角色实例 self（不查管理器、不依赖缓存）：
  *   ① get_RealFullName —— 陌生状态下从模板拼 SurName + GivenName（「姓+名」，不带称号）
@@ -832,8 +895,27 @@ static void rn_apply_rename(int i) {
     void* c = ((fn_getchar)(g_base + RVA_GET_CHARACTER))(m, uid);
     if ((uintptr_t)c < 0x10000) return;
 
+    /* v91：实例地址可能已被释放/复用（离队、换图都会），先验类名与 uid 再动字段 */
+    if (!obj_is_class(c, "GameCharacterInstance") ||
+        *(int*)((char*)c + OFF_GCI_TPL_UID) != uid) {
+        if (g_log_name_sink < 12) {
+            g_log_name_sink++;
+            LOGI("[name] uid=%d 实例不可信（类名/uid 不符），跳过改名", uid);
+        }
+        return;
+    }
+
     void* tpl = *(void**)((char*)c + OFF_GCI_TEMPLATE);
     if ((uintptr_t)tpl < 0x10000) return;
+    /* v91：模板同样要验 —— 这里读错就是「名字被写成 OutPort」的直接来源 */
+    if (!obj_is_class(tpl, "CharacterPoolData") ||
+        *(int*)((char*)tpl + OFF_CPD_UID) != *(int*)((char*)c + OFF_GCI_TPL_UID)) {
+        if (g_log_name_sink < 12) {
+            g_log_name_sink++;
+            LOGI("[name] uid=%d 模板不可信（类名/uid 不符），跳过改名", uid);
+        }
+        return;
+    }
 
     /* v78 快路径：已经改过名、而且给定的名字确实不再是陌生名（不带 @ 前缀）→ 直接返回。
      * 游戏会按几十上百次/秒的节奏重判 Hold 条件，每次都走完整流程纯属浪费。 */
@@ -936,6 +1018,8 @@ static void rn_patch_tpl(int i) {
 
     void* tpl = (g_rn[i].tpl_patched) ? g_rn[i].tpl : tpl_by_uid(uid);
     if ((uintptr_t)tpl < 0x10000) return;
+    /* v91：模板也要验类名 + uid（tpl_by_uid 走 FindObjectsOfTypeAll，返回值不可全信） */
+    if (!obj_is_class(tpl, "CharacterPoolData") || *(int*)((char*)tpl + OFF_CPD_UID) != uid) return;
 
     if (!g_rn[i].tpl_patched) {
         g_rn[i].tpl = tpl;
@@ -1125,6 +1209,12 @@ static void rn_restore_rename(int i) {
     typedef void* (*fn_getchar)(void*, int);
     void* c = ((fn_getchar)(g_base + RVA_GET_CHARACTER))(m, uid);
     if (c != g_rn[i].renamed_inst) { g_rn[i].renamed = 0; return; }
+    /* v91：只比指针不够 —— 地址可能已被别的对象复用（离队后常见），再验类名与 uid */
+    if (!obj_is_class(c, "GameCharacterInstance") ||
+        *(int*)((char*)c + OFF_GCI_TPL_UID) != uid) {
+        g_rn[i].renamed = 0;
+        return;
+    }
 
     /* v90：按文本快照重建原始串再写回（原来是写缓存的裸指针 → 可能是被复用的垃圾，
      * 表现就是人物名字变成 "OutPort" 这种别的字符串）。 */
@@ -1158,16 +1248,93 @@ static void* story_real_name(void* self) {
     return real;
 }
 
+static int g_get_probe = 0;      /* v92-probe：getter 返回 ASCII 名的日志上限 */
+static int g_fix_log = 0;        /* v94：名字被写成端口名后改回正名的日志上限 */
+
+/* v94：**读侧消毒**。
+ * v93 探针查明：实例的 m_givenName 字段确实被写成了 "OutPort"（sur 是空串），
+ * 而模板里 姓/名/陌生名 都是对的 —— 也就是「别的东西」把这个字段写坏了，
+ * 不是我们写名字那一步（v91 的类型校验一次没触发）。
+ * 与其继续找那个写者，直接在 get_FullName / get_FullNameWithTitle 出口处把
+ * 「端口名之类的 ASCII 垃圾」换成本该显示的名字：不动任何游戏字段，零风险。
+ * 头顶名牌(HeadName) 与 对话/信息面板(Text (TMP)) 都是读这两个 getter，
+ * 所以这里一改，两处都正常。 */
+static void* rn_fix_ascii_name(void* self) {
+    if (!obj_is_class(self, "GameCharacterInstance")) return nullptr;
+    const char* how = "?";
+    void* fix = real_name_of(self, &how);
+    if (!fix || str_is_ascii_name(fix)) return nullptr;
+    int uid = *(int*)((char*)self + OFF_GCI_TPL_UID);
+    if (g_fix_log < 10) {
+        g_fix_log++;
+        char fb[64] = {0};
+        str_to_buf(fix, fb, sizeof(fb));
+        LOGI("[name] uid=%d 名字被写成端口名，按模板改成 \"%s\"（%s）", uid, fb, how);
+    }
+    return fix;
+}
+
+/* 名字 getter 的返回值体检：出现 ASCII 名（OutPort/HeadName 之类）就记一条 */
+static void probe_name_result(const char* tag, void* self, void* r) {
+#if !WULIN_NAMEPROBE
+    (void)tag; (void)self; (void)r;
+    return;
+#else
+    if (!str_is_ascii_name(r)) return;
+    if (g_get_probe >= 30) return;
+    g_get_probe++;
+    char ab[40] = {0}, cls[64] = {0};
+    str_to_buf(r, ab, sizeof(ab));
+    obj_class_name(self, cls, sizeof(cls));
+    LOGI("[probe:get] %s -> ASCII 名 \"%s\" self=%p cls=%s", tag, ab, self, cls);
+
+    /* v93-probe：把「这个实例此刻的姓/名」和「它模板的四个名字字段」都打出来，
+     * 一次就能看出是实例字段被写成端口名，还是模板字段被写坏。 */
+    if (g_get_probe > 6) return;
+    if (!obj_is_class(self, "GameCharacterInstance")) return;
+    char sb[64] = {0}, gb[64] = {0};
+    void* sur = *(void**)((char*)self + OFF_GCI_SURNAME);
+    void* giv = *(void**)((char*)self + OFF_GCI_GIVENNAME);
+    str_to_buf(sur, sb, sizeof(sb));
+    str_to_buf(giv, gb, sizeof(gb));
+    int uid = *(int*)((char*)self + OFF_GCI_TPL_UID);
+    void* tpl = *(void**)((char*)self + OFF_GCI_TEMPLATE);
+    char tc[64] = {0};
+    obj_class_name(tpl, tc, sizeof(tc));
+    char un[48] = {0}, st[64] = {0}, ts[48] = {0}, tg[48] = {0};
+    if (obj_is_class(tpl, "CharacterPoolData")) {
+        str_to_buf(*(void**)((char*)tpl + OFF_CPD_UNAME), un, sizeof(un));
+        str_to_buf(*(void**)((char*)tpl + OFF_CPD_NAME_STRANGER), st, sizeof(st));
+        str_to_buf(*(void**)((char*)tpl + OFF_CPD_SURNAME), ts, sizeof(ts));
+        str_to_buf(*(void**)((char*)tpl + OFF_CPD_GIVENNAME), tg, sizeof(tg));
+    }
+    LOGI("[probe:det] uid=%d sur=%p\"%s\" giv=%p\"%s\" | tpl=%p(%s) uName=\"%s\" 陌生名=\"%s\" 姓=\"%s\" 名=\"%s\"",
+         uid, sur, sb, giv, gb, tpl, tc[0] ? tc : "?", un, st, ts, tg);
+#endif
+}
+
 static void* hook_fullname(void* self) {
     void* r = story_real_name(self);
     if (r) return r;
-    return orig_fullname ? orig_fullname(self) : nullptr;
+    void* v = orig_fullname ? orig_fullname(self) : nullptr;
+    probe_name_result("get_FullName", self, v);
+    if (str_is_ascii_name(v)) {                    /* v94：读侧消毒 */
+        void* fix = rn_fix_ascii_name(self);
+        if (fix) return fix;
+    }
+    return v;
 }
 
 static void* hook_fullname_title(void* self) {
     void* r = story_real_name(self);
     if (r) return r;
-    return orig_fullname_title ? orig_fullname_title(self) : nullptr;
+    void* v = orig_fullname_title ? orig_fullname_title(self) : nullptr;
+    probe_name_result("get_FullNameWithTitle", self, v);
+    if (str_is_ascii_name(v)) {                    /* v94：读侧消毒 */
+        void* fix = rn_fix_ascii_name(self);
+        if (fix) return fix;
+    }
+    return v;
 }
 
 /* ---- v79：剧情播放的起止钩子 --------------------------------------------
@@ -1458,6 +1625,37 @@ static void* hook_tmp_get(void* self) {
 }
 
 static void hook_tmp_set(void* self, void* str) {
+#if WULIN_NAMEPROBE
+    /* v92-probe：TMP 里出现纯 ASCII 短串就记一条（含 GameObject 名，方便认是哪块 UI）；
+     * 带 "Port" 的单独记、不受普通 ASCII 的额度限制 —— 那是名字变 OutPort 的直接线索。 */
+    if ((uintptr_t)str > 0x10000 && il2str_len_ok(str)) {
+        int L = *(int*)((char*)str + OFF_IL2STR_LEN);
+        if (L >= 3 && L <= 32) {
+            const unsigned short* p = (const unsigned short*)((char*)str + OFF_IL2STR_CHARS);
+            char ab[40];
+            int n = (L < (int)sizeof(ab) - 1) ? L : (int)sizeof(ab) - 1;
+            int ascii = 1;
+            for (int k = 0; k < n; ++k) {
+                unsigned short c = p[k];
+                ab[k] = (char)((c < 0x80) ? c : '?');
+                if (c < 0x20 || c > 0x7E) ascii = 0;
+            }
+            ab[n] = 0;
+            int has_port = (strstr(ab, "Port") != nullptr);
+            if (has_port && g_port_probe < 10) {
+                g_port_probe++;
+                char go[80] = {0};
+                comp_go_name(self, go, sizeof(go));
+                LOGI("[probe:port] TMP 文本=\"%s\" tmp=%p go=\"%s\"", ab, self, go);
+            } else if (ascii && g_ascii_log < 30) {
+                g_ascii_log++;
+                char go[80] = {0};
+                comp_go_name(self, go, sizeof(go));
+                LOGI("[probe:tmp] ASCII 文本 \"%s\" tmp=%p go=\"%s\"", ab, self, go);
+            }
+        }
+    }
+#endif
     if (orig_tmp_set && is_credits_text(str)) {
         void* m = mod_string();
         if ((uintptr_t)m > 0x10000) {
@@ -1478,6 +1676,7 @@ static void hook_tmp_set(void* self, void* str) {
  * 所以这里在 Init 之后直接把 nameText 改成「熟悉后姓名」—— 唯一确定能显示出来的地方。 */
 static void (*orig_bubble_init)(void* self, void* adaptor, void* content) = nullptr;
 static int g_bn_log = 0;
+static int g_bn_probe = 0;     /* v91-probe：气泡名日志上限 */
 
 static int rn_live(int uid) {
     int i = rn_find(uid);
@@ -1486,6 +1685,23 @@ static int rn_live(int uid) {
 
 static void hook_bubble_init(void* self, void* adaptor, void* content) {
     if (orig_bubble_init) orig_bubble_init(self, adaptor, content);
+
+#if WULIN_NAMEPROBE
+    /* v91-probe：把气泡「游戏自己写进去的名字」打出来 —— 名字位置出现端口名
+     * （OutPort 之类）时，这条能直接定位是气泡在显示它。 */
+    if (g_bn_probe < 20 && (uintptr_t)self > 0x10000 && orig_tmp_get) {
+        void* nt = *(void**)((char*)self + OFF_BUBBLE_NAMETEXT);
+        if ((uintptr_t)nt > 0x10000) {
+            void* t = orig_tmp_get(nt);
+            if ((uintptr_t)t > 0x10000) {
+                char tb[64];
+                str_to_buf(t, tb, sizeof(tb));
+                if (tb[0]) { g_bn_probe++; LOGI("[probe:bubble] 气泡名=\"%s\"", tb); }
+            }
+        }
+    }
+#endif
+
     if (!F_STORY) return;
     if ((uintptr_t)self < 0x10000 || (uintptr_t)content < 0x10000) return;
 
@@ -1522,6 +1738,7 @@ static int g_nn_log = 0;
 
 static void* npc_name_common(void* self, void* (*orig)(void*), const char* tag) {
     void* r = orig ? orig(self) : nullptr;
+    probe_name_result(tag, self, r);          /* v92-probe：ASCII 名立刻记一条 */
     if (!F_STORY || (uintptr_t)self < 0x10000) return r;
 
     int uid = *(int*)((char*)self + OFF_TMN_NPCID);
@@ -2120,4 +2337,6 @@ static void wulin_on_load() {
     }
     pthread_detach(t);
 }
+
+
 
