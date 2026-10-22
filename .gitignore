@@ -1,0 +1,36 @@
+# 大文件与产物（不要进库）
+dumpout-intl/
+dumpout/
+dlc/
+mobile-cn-vs-intl/
+dumper/
+modswap4/
+device-saves/
+patch-out/
+__pycache__/
+*.apk
+*.idsig
+*.zip
+*.log
+*.save
+*.json.bak
+
+# 游戏原始二进制（体积大、可重新获取）
+libil2cpp*.so
+global-metadata*.dat
+libwulin.so
+stub.bin
+*.o
+
+# 构建中间产物
+native/*.so
+native/*.o
+native/*.bin
+
+# 密钥与签名材料 —— 绝对不能上传
+keystore/
+*.jks
+*.pem
+*.crt
+*.p12
+key.pem
