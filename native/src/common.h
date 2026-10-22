@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v58-credits-to-mod"   /* 本 mod 自己的版本号，只用来对日志 */
+#define MOD_VER "v62-realname-textswap"   /* 本 mod 自己的版本号，只用来对日志 */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
@@ -128,9 +128,32 @@ extern volatile int F_WATER;        /* 水面可走（进水池 + 触发入水�
  * 文本来自 config_assets_all.bundle 的本地化表，改数据要重打包 bundle（还牵扯 m_Crc），
  * 所以改在 Text.set_text 上做替换：只匹配长度 2 的「鳴謝/鸣谢」，命中就换成 "mod"。
  * Il2CppString 布局：+0x10 = 长度(int)，+0x14 = UTF-16 字符数组。 */
+#define RVA_TEXT_GET 0x4B9A414
+/* TMPro.TMP_Text（主界面按钮实测用的是 TMP，不是 UGUI Text）*/
+#define RVA_TMP_TEXT_GET 0x4A422D4   /* TMPro.TMP_Text.get_text */
+#define RVA_TMP_TEXT_SET 0x4A423BC   /* TMPro.TMP_Text.set_text */
 #define RVA_TEXT_SET 0x4B9A41C           /* UnityEngine.UI.Text.set_text(string) */
 #define OFF_IL2STR_LEN 0x10
 #define OFF_IL2STR_CHARS 0x14
+/* ---- 剧情期间显示「熟悉后姓名」（v61）
+ * 放宽之后剧情触发并不算"互动过一次"，所以那些角色头顶/对话框里仍是陌生名（@冷峻严肃的中年人），
+ * 光看立绘分不清是谁的彩蛋。这里在「放宽命中」后的窗口期内，把 FullName 换成 RealFullName
+ * （陌生状态下 RealFullName 会从模板 CharacterPoolData 拼 SurName + GivenName）。
+ *
+ *   GameCharacterInstance: +0x98 = CharacterPoolData*  +0xA0 = m_templeteUid
+ *                          +0xA8 = m_surName          +0xB0 = m_givenName
+ *   CharacterPoolData:     +0x20 = NameAsStranger     +0x28 = SurName  +0x30 = GivenName
+ */
+#define RVA_GCI_FULLNAME 0x223B75C        /* GameCharacterInstance.get_FullName */
+#define RVA_GCI_FULLNAME_TITLE 0x223B828  /* get_FullNameWithTitle */
+#define RVA_GCI_REALFULLNAME 0x223B920    /* get_RealFullName（陌生时从模板拼真名） */
+#define OFF_GCI_TEMPLATE 0x98
+#define OFF_GCI_TPL_UID 0xA0
+#define OFF_GCI_SURNAME 0xA8
+#define OFF_GCI_GIVENNAME 0xB0
+#define OFF_CPD_NAME_STRANGER 0x20
+#define OFF_CPD_SURNAME 0x28
+#define OFF_CPD_GIVENNAME 0x30
 
 /* ChangePartnerNode 字段（dump: WuLin.StateMachine.ChangePartnerNode） */
 #define OFF_CP_MODE 0x60                 /* SelectionMode: ID=0 / 队中位置=1 */

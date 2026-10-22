@@ -567,17 +567,95 @@ static int keep_original_for_uncached(void* condNode) {
  * 没碰就说明这个 Hold 与放宽无关，不该被压制 —— 否则会打断游戏设计的可重复剧情。 */
 static __thread int g_team_cond_hits = 0;
 
+/* ---- 剧情期间显示「熟悉后姓名」（v61） ----------------------------------
+ * 放宽之后剧情触发并不算"互动过一次"，所以那些角色仍是陌生名（@冷峻严肃的中年人），
+ * 光看立绘分不清是谁的彩蛋。做法：放宽命中时记下「放过了谁」并开一个窗口，
+ * 窗口内把这个角色的 FullName 换成 RealFullName —— 后者在陌生状态下会从模板
+ * CharacterPoolData 拼 SurName + GivenName；若模板里也是空，再兜底回 NameAsStranger。 */
+static volatile int g_relax_uid = 0;
+static volatile uint64_t g_relax_until = 0;
+#define RELAX_NAME_WIN_MS 90000ull     /* 一场对话足够；每次放宽命中都会刷新 */
+
+static void refresh_relax_names(void);   /* 定义在后面（需要 orig_realfullname） */
+
+static uint64_t rn_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+/* 条件节点里记下"这次放宽放过了谁"。条件节点自身的 partnerID 偏移与角色实例不同：
+ * ConditionNode(IsJoinedTeam/HavePartner).partnerID = +0x58（见 OFF_PARTNER_ID）。 */
+static void mark_relaxed(void* condNode) {
+    if ((uintptr_t)condNode < 0x10000) return;
+    int pid = *(int*)((char*)condNode + OFF_PARTNER_ID);
+    int neg = *(int*)((char*)condNode + OFF_PARTNER_NEGATE);
+    if (pid <= 0 || neg) return;            /* 只记「要求某人在队」这一侧被放宽的 */
+    if (pid != g_relax_uid) refresh_relax_names();   /* 换了人 → 重新取陌生名/真名 */
+    g_relax_uid = pid;
+    g_relax_until = rn_now_ms() + RELAX_NAME_WIN_MS;
+}
+
+static void* (*orig_fullname)(void* self) = nullptr;
+static void* (*orig_fullname_title)(void* self) = nullptr;
+static void* (*orig_realfullname)(void* self) = nullptr;
+static int g_rn_log = 0;
+
+static int str_empty(void* s) {
+    return ((uintptr_t)s < 0x10000) || *(int*)((char*)s + OFF_IL2STR_LEN) == 0;
+}
+
+/* 剧情窗口内，被放宽的那个角色返回"熟悉后姓名" */
+static void* story_real_name(void* self) {
+    if (!F_STORY || !g_relax_uid || rn_now_ms() > g_relax_until) return nullptr;
+    if ((uintptr_t)self < 0x10000) return nullptr;
+    if (*(int*)((char*)self + OFF_GCI_TPL_UID) != g_relax_uid) return nullptr;
+    if (!orig_realfullname) return nullptr;
+
+    void* real = orig_realfullname(self);
+    if (!str_empty(real)) {
+        if (g_rn_log++ < 20) LOGI("[name] uid=%d 剧情期间显示熟悉后姓名", g_relax_uid);
+        return real;
+    }
+    /* 模板里姓/名也空 → 兜底用陌生名（宁可显示 @xxx 也不要空） */
+    void* tpl = *(void**)((char*)self + OFF_GCI_TEMPLATE);
+    if ((uintptr_t)tpl > 0x10000) {
+        void* s = *(void**)((char*)tpl + OFF_CPD_NAME_STRANGER);
+        if (!str_empty(s)) {
+            if (g_rn_log++ < 20) LOGI("[name] uid=%d 真名为空 → 回退陌生名", g_relax_uid);
+            return s;
+        }
+    }
+    return nullptr;
+}
+
+static void* hook_fullname(void* self) {
+    void* r = story_real_name(self);
+    if (r) return r;
+    return orig_fullname ? orig_fullname(self) : nullptr;
+}
+
+static void* hook_fullname_title(void* self) {
+    void* r = story_real_name(self);
+    if (r) return r;
+    return orig_fullname_title ? orig_fullname_title(self) : nullptr;
+}
+
 static bool hook_check_joined(void* self, int io, void* line) {
     g_team_cond_hits++;
-    if (F_STORY && base_check_all && !keep_original_for(self))
+    if (F_STORY && base_check_all && !keep_original_for(self)) {
+        mark_relaxed(self);                 /* v61：记下"这次放宽放过了谁"，用于显示真名 */
         return base_check_all(self, io, line);
+    }
     return orig_check_joined ? orig_check_joined(self, io, line) : false;
 }
 
 static bool hook_check_partner(void* self, int io, void* line) {
     g_team_cond_hits++;
-    if (F_STORY && base_check_all && !keep_original_for(self))
+    if (F_STORY && base_check_all && !keep_original_for(self)) {
+        mark_relaxed(self);
         return base_check_all(self, io, line);
+    }
     return orig_check_partner ? orig_check_partner(self, io, line) : false;
 }
 
@@ -682,13 +760,57 @@ static void hook_change_partner(void* self) {
     if (orig_change_partner) orig_change_partner(self);
 }
 
-/* ---- 主界面「鸣谢」按钮改字（v58） --------------------------------------
- * 手机版把「鸣谢」位当成了 mod 入口，所以按钮文字直接显示 mod。
- * 文本在 config_assets_all.bundle 的本地化表里，改数据要重打包 bundle + 重算 m_Crc，
- * 代价和风险都高；这里改在 Text.set_text 上：只认长度为 2 的「鳴謝 / 鸣谢」，
- * 命中就换成 "mod"。长度不等一进来就返回，热路径开销就一次内存读。 */
+/* ---- 主界面「鸣谢」按钮改字（v59） --------------------------------------
+ * v58 只 hook 了 set_text，实测一次都没命中 —— 说明那按钮的文字是**预制体里写死的**，
+ * 创建时直接赋 m_Text(+0xE0)，根本不过 setter。所以改在 get_text（渲染时读）上：
+ * 读到「鳴謝 / 鸣谢」就换成 "mod"。get_text 只是 ldr [x0+0xE0]; ret，hook 成本很低，
+ * 且只按长度先挡掉，99% 的调用就一次内存读。
+ * set_text 那一路保留着（万一别处确实走 setter）。 */
 static void (*orig_text_set)(void* self, void* str) = nullptr;
+static void* (*orig_text_get)(void* self) = nullptr;
+static void* g_mod_str = nullptr;
 static int g_thx_log = 0;
+
+/* ---- v62：文本层替换「陌生名 → 熟悉后姓名」 ----------------------------
+ * 不去猜对话框到底调 FullName 还是 GivenName：名字最终一定进 Text/TMP 的 set_text，
+ * 所以在 set_text 入口按字符串比对替换，最稳。
+ * 只替换「被放宽的那个角色」的陌生名（m_givenName，形如 @冷峻严肃的中年人），
+ * 其它文本一律原样放行。 */
+static void* g_relax_stranger = nullptr;   /* 该角色的陌生名字符串 */
+static void* g_relax_real = nullptr;       /* 该角色的熟悉后姓名字符串 */
+
+static int il2str_eq(void* a, void* b) {
+    if (a == b) return 1;
+    if ((uintptr_t)a < 0x10000 || (uintptr_t)b < 0x10000) return 0;
+    int la = *(int*)((char*)a + OFF_IL2STR_LEN);
+    int lb = *(int*)((char*)b + OFF_IL2STR_LEN);
+    if (la != lb) return 0;
+    return memcmp((char*)a + OFF_IL2STR_CHARS, (char*)b + OFF_IL2STR_CHARS, (size_t)la * 2) == 0;
+}
+
+static void refresh_relax_names(void) {
+    g_relax_stranger = nullptr;
+    g_relax_real = nullptr;
+    if (g_relax_uid <= 0) return;
+    void* m = char_mgr();
+    if ((uintptr_t)m < 0x10000) return;
+    typedef void* (*fn_getchar)(void*, int);
+    void* c = ((fn_getchar)(g_base + RVA_GET_CHARACTER))(m, g_relax_uid);
+    if ((uintptr_t)c < 0x10000) return;
+    g_relax_stranger = *(void**)((char*)c + OFF_GCI_GIVENNAME);   /* 陌生名 = @xxx */
+    if (orig_realfullname) g_relax_real = orig_realfullname(c);
+    if (str_empty(g_relax_real)) g_relax_real = nullptr;
+    if (g_rn_log < 20 && g_relax_stranger && g_relax_real)
+        LOGI("[name] uid=%d 陌生名/真名已就绪", g_relax_uid);
+}
+
+static void* swap_if_stranger(void* str) {
+    if (!F_STORY || g_relax_uid <= 0 || rn_now_ms() > g_relax_until) return str;
+    if (!g_relax_stranger || !g_relax_real) return str;
+    if (!il2str_eq(str, g_relax_stranger)) return str;
+    if (g_rn_log++ < 20) LOGI("[name] 文本层替换：陌生名 -> 熟悉后姓名 (uid=%d)", g_relax_uid);
+    return g_relax_real;
+}
 
 static int is_credits_text(void* s) {
     if ((uintptr_t)s < 0x10000) return 0;
@@ -699,16 +821,63 @@ static int is_credits_text(void* s) {
     return 0;
 }
 
+static void* mod_string(void) {
+    if ((uintptr_t)g_mod_str < 0x10000 && A_string_new) g_mod_str = A_string_new("mod");
+    return g_mod_str;
+}
+
+static void* hook_text_get(void* self) {
+    void* s = orig_text_get ? orig_text_get(self) : nullptr;
+    if (is_credits_text(s)) {
+        void* m = mod_string();
+        if ((uintptr_t)m > 0x10000) {
+            if (g_thx_log++ < 3) LOGI("[ui] 鸣谢按钮显示 -> mod（get_text 拦截）");
+            return m;
+        }
+    }
+    return s;
+}
+
 static void hook_text_set(void* self, void* str) {
-    if (orig_text_set && is_credits_text(str) && A_string_new) {
-        void* mod = A_string_new("mod");
-        if ((uintptr_t)mod > 0x10000) {
-            if (g_thx_log++ < 3) LOGI("[ui] 鸣谢按钮文字 -> mod");
-            orig_text_set(self, mod);
+    if (orig_text_set && is_credits_text(str)) {
+        void* m = mod_string();
+        if ((uintptr_t)m > 0x10000) {
+            if (g_thx_log++ < 3) LOGI("[ui] 鸣谢按钮文字 -> mod（set_text 拦截）");
+            orig_text_set(self, m);
             return;
         }
     }
-    if (orig_text_set) orig_text_set(self, str);
+    if (orig_text_set) orig_text_set(self, swap_if_stranger(str));
+}
+
+/* v60：主界面那个按钮实测不是 UGUI Text（v58 拦 set_text、v59 拦 get_text 全都没命中），
+ * 是 TMPro.TMP_Text（TextMeshProUGUI 没 override，直接用基类的 set_text）。
+ * m_text 同样在 +0xE0，所以判定逻辑完全复用。 */
+static void (*orig_tmp_set)(void* self, void* str) = nullptr;
+static void* (*orig_tmp_get)(void* self) = nullptr;
+
+static void* hook_tmp_get(void* self) {
+    void* s = orig_tmp_get ? orig_tmp_get(self) : nullptr;
+    if (is_credits_text(s)) {
+        void* m = mod_string();
+        if ((uintptr_t)m > 0x10000) {
+            if (g_thx_log++ < 3) LOGI("[ui] 鸣谢按钮显示 -> mod（TMP get_text）");
+            return m;
+        }
+    }
+    return s;
+}
+
+static void hook_tmp_set(void* self, void* str) {
+    if (orig_tmp_set && is_credits_text(str)) {
+        void* m = mod_string();
+        if ((uintptr_t)m > 0x10000) {
+            if (g_thx_log++ < 3) LOGI("[ui] 鸣谢按钮文字 -> mod（TMP set_text）");
+            orig_tmp_set(self, m);
+            return;
+        }
+    }
+    if (orig_tmp_set) orig_tmp_set(self, swap_if_stranger(str));
 }
 
 /* ---- 诊断（v51）：进场区域条件 ------------------------------------------
@@ -1110,10 +1279,38 @@ static void install_tweaks() {
         LOGI("诊断: 进场区域条件 已挂 @ 0x%X", RVA_ENTER_AREA_CC);
     }
 
-    /* v58：主界面「鸣谢」按钮文字改成 mod */
-    if (hook_install("界面.鸣谢改mod", (void*)(g_base + RVA_TEXT_SET),
+    /* v58/v59：主界面「鸣谢」按钮文字改成 mod
+     * set_text 那条实测没命中（文字是预制体写死的），所以真正起作用的是 get_text。 */
+    if (hook_install("界面.鸣谢get", (void*)(g_base + RVA_TEXT_GET),
+                     (void*)hook_text_get, (void**)&orig_text_get)) {
+        LOGI("界面: 鸣谢 get_text 改 mod 已挂 @ 0x%X", RVA_TEXT_GET);
+    }
+    if (hook_install("界面.鸣谢set", (void*)(g_base + RVA_TEXT_SET),
                      (void*)hook_text_set, (void**)&orig_text_set)) {
-        LOGI("界面: 鸣谢按钮文字改 mod 已挂 @ 0x%X", RVA_TEXT_SET);
+        LOGI("界面: 鸣谢 set_text 改 mod 已挂 @ 0x%X", RVA_TEXT_SET);
+    }
+
+    /* v60：TMPro 那套（主界面按钮实测走这个） */
+    if (hook_install("界面.鸣谢TMPget", (void*)(g_base + RVA_TMP_TEXT_GET),
+                     (void*)hook_tmp_get, (void**)&orig_tmp_get)) {
+        LOGI("界面: TMP get_text 已挂 @ 0x%X", RVA_TMP_TEXT_GET);
+    }
+    if (hook_install("界面.鸣谢TMPset", (void*)(g_base + RVA_TMP_TEXT_SET),
+                     (void*)hook_tmp_set, (void**)&orig_tmp_set)) {
+        LOGI("界面: TMP set_text 已挂 @ 0x%X", RVA_TMP_TEXT_SET);
+    }
+
+    /* v61：剧情期间显示「熟悉后姓名」
+     * 只需要 get_RealFullName 的地址（直接调），不需要 hook 它。 */
+    orig_realfullname = (void* (*)(void*))(g_base + RVA_GCI_REALFULLNAME);
+    LOGI("名字: get_RealFullName = %p（直接调用，不 hook）", (void*)orig_realfullname);
+    if (hook_install("名字.get_FullName", (void*)(g_base + RVA_GCI_FULLNAME),
+                     (void*)hook_fullname, (void**)&orig_fullname)) {
+        LOGI("名字: get_FullName 已挂 @ 0x%X", RVA_GCI_FULLNAME);
+    }
+    if (hook_install("名字.get_FullNameWithTitle", (void*)(g_base + RVA_GCI_FULLNAME_TITLE),
+                     (void*)hook_fullname_title, (void**)&orig_fullname_title)) {
+        LOGI("名字: get_FullNameWithTitle 已挂 @ 0x%X", RVA_GCI_FULLNAME_TITLE);
     }
 
 #if WULIN_PROBE
