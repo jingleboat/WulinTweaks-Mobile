@@ -594,21 +594,35 @@ static __thread int g_team_cond_hits = 0;
  *
  * 现在每个 uid 一个独立槽位 + 独立到期时间，刷屏的门对只能污染它自己那一格。 */
 #define RN_SLOTS 24
+/* ⚠️ v90 修掉的真 bug：这里原来把「陌生名 / 真名 / 原始姓 / 原始名 / 模板原陌生名」
+ * 全部以 void* 直接缓存托管字符串（il2cpp string）。而我们随后就把实例/模板上的那个
+ * 字段改成别的字符串 —— 原来那串在托管堆上就**没人引用了**，Boehm GC 很快回收，
+ * 之后再用缓存的裸指针就是 dangling：还原时把野指针写回 m_surName/m_givenName，
+ * 或者把 real 交给 TMP 显示。碰巧那块内存被别的字符串对象复用（本 mod 自己每次
+ * 展开剧情图都会 A_string_new("OutPort") / "conditionPort"），于是人物名字就显示成
+ * "OutPort" —— 就是这版之前偶发的「名字变成 outport」。
+ * 现在一律缓存**文本快照**（UTF-8 / UTF-16），要字符串就现 new 一个。 */
+#define RN_SLOTS 24
+#define RN_U16_MAX 48            /* 陌生名快照（UTF-16 码元）上限 */
 typedef struct {
     int      uid;
-    void*    stranger;   /* 该角色当前的陌生名（m_givenName，形如 @冷峻严肃的中年人） */
-    void*    real;       /* 要换成的「熟悉后姓名」 */
+    uint16_t stranger_u16[RN_U16_MAX];   /* 陌生名快照，用于和 TMP 文本逐码元比对 */
+    int      stranger_u16_len;
+    char     real_txt[128];               /* 「熟悉后姓名」快照 */
     uint64_t until;      /* 到期时刻（ms） */
     /* v75：数据层改名用 —— 直接把实例的 m_surName/m_givenName 换成真名，
      * 这样**任何 UI 路径**读到的都是真名，不用再猜谁是显示 sink。 */
     void*    renamed_inst;   /* 被改过名的角色实例（换档后指针失效，恢复时必须比对） */
-    void*    orig_sur;
-    void*    orig_given;
+    char     orig_sur_txt[64];       /* 原始姓（文本快照） */
+    char     orig_given_txt[128];     /* 原始名（文本快照） */
+    int      orig_sur_null;          /* 原本就是 null 字符串 → 还原成 null */
+    int      orig_given_null;
     int      renamed;
     /* v76：模板改名 —— 没有实例的角色（不在队/不在场景）只能从 CharacterPoolData 读名字，
      * 直接改它的 NameAsStranger(0x20) 才是覆盖到位的做法。 */
     void*    tpl;
-    void*    orig_tpl_stranger;
+    char     orig_tpl_stranger_txt[128];
+    int      orig_tpl_stranger_null;
     int      tpl_patched;
     /* v79：这个窗口是从哪张剧情图记下来的。播放期间只改「同一张图」的角色，
      * 避免把全城被重判放宽的 NPC 都改名。 */
@@ -648,6 +662,12 @@ static int rn_find(int uid) {
     return -1;
 }
 
+static void rn_clear_slot(int i, int restore) {
+    if (i < 0 || i >= RN_SLOTS) return;
+    if (restore) { rn_restore_rename(i); rn_restore_tpl(i); }   /* 别把改过的名字留在游戏里 */
+    memset(&g_rn[i], 0, sizeof(g_rn[i]));
+}
+
 static int rn_alloc(int uid) {
     for (int i = 0; i < RN_SLOTS; ++i)
         if (g_rn[i].uid == uid) return i;
@@ -657,10 +677,8 @@ static int rn_alloc(int uid) {
     int worst = 0;
     for (int i = 1; i < RN_SLOTS; ++i)
         if (g_rn[i].until < g_rn[worst].until) worst = i;
+    rn_clear_slot(worst, 1);
     g_rn[worst].uid = uid;
-    g_rn[worst].stranger = nullptr;
-    g_rn[worst].real = nullptr;
-    g_rn[worst].until = 0;
     return worst;
 }
 
@@ -699,6 +717,42 @@ static int str_empty(void* s) {
     return ((uintptr_t)s < 0x10000) || *(int*)((char*)s + OFF_IL2STR_LEN) == 0;
 }
 
+/* ---- v90：托管字符串的「文本快照」工具 ----------------------------------
+ * 缓存裸指针 = 缓存一个随时会被 GC 回收并被别的字符串复用的地址（见 RN_SLOT 注释）。
+ * 统一改成：要留就留文本，要字符串就现造。 */
+static void snap_str(void* obj, int off, char* buf, int cap, int* was_null) {
+    if (buf && cap > 0) buf[0] = 0;
+    if (was_null) *was_null = 1;
+    if ((uintptr_t)obj < 0x10000) return;
+    void* s = *(void**)((char*)obj + off);
+    if (!il2str_len_ok(s)) return;                       /* null 或悬空 → 当作 null */
+    int l = *(int*)((char*)s + OFF_IL2STR_LEN);
+    if (was_null) *was_null = 0;
+    if (l <= 0) return;                                  /* 空串 */
+    str_to_buf(s, buf, cap);
+}
+
+static void* str_rebuild(const char* txt, int was_null) {
+    if (was_null || !A_string_new) return nullptr;
+    void* s = A_string_new(txt ? txt : "");
+    return ((uintptr_t)s > 0x10000) ? s : nullptr;
+}
+
+static int snap_take_u16(void* s, uint16_t* out, int cap) {
+    if (!il2str_len_ok(s)) return 0;
+    int l = *(int*)((char*)s + OFF_IL2STR_LEN);
+    if (l <= 0 || l > cap) return 0;
+    memcpy(out, (char*)s + OFF_IL2STR_CHARS, (size_t)l * 2);
+    return l;
+}
+
+static int snap_match_u16(void* s, const uint16_t* want, int wantlen) {
+    if (wantlen <= 0 || !il2str_len_ok(s)) return 0;
+    int l = *(int*)((char*)s + OFF_IL2STR_LEN);
+    if (l != wantlen) return 0;
+    return memcmp((char*)s + OFF_IL2STR_CHARS, want, (size_t)wantlen * 2) == 0;
+}
+
 /* 取「熟悉后姓名」的分层兜底，全部基于传入的角色实例 self（不查管理器、不依赖缓存）：
  *   ① get_RealFullName —— 陌生状态下从模板拼 SurName + GivenName（「姓+名」，不带称号）
  *   ② 模板正式名 CharacterPoolData.name(+0x18)
@@ -725,11 +779,13 @@ static void* real_name_of(void* self, const char** how) {
     return nullptr;
 }
 
-/* 刷新第 i 个槽位缓存的陌生名/真名（供 swap_if_stranger 的字符串比对用） */
+/* 刷新第 i 个槽位缓存的陌生名/真名（供 swap_if_stranger 的字符串比对用）
+ * v90：只存文本快照。原来存的是陌生名的裸指针，而 rn_apply_rename 随后就把
+ * m_givenName 改掉 → 那串没人引用 → GC 回收后比对的就是垃圾。 */
 static void refresh_rn_slot(int i) {
     if (i < 0 || i >= RN_SLOTS) return;
-    g_rn[i].stranger = nullptr;
-    g_rn[i].real = nullptr;
+    g_rn[i].stranger_u16_len = 0;
+    g_rn[i].real_txt[0] = 0;
     int uid = g_rn[i].uid;
     if (uid <= 0) return;
 
@@ -740,16 +796,21 @@ static void refresh_rn_slot(int i) {
     if ((uintptr_t)c < 0x10000) return;
 
     void* stranger = *(void**)((char*)c + OFF_GCI_GIVENNAME);      /* 陌生名 = @xxx */
+    /* 已经改成真名了就别把真名当陌生名记下来 */
+    g_rn[i].stranger_u16_len = snap_take_u16(stranger, g_rn[i].stranger_u16, RN_U16_MAX);
+    if (g_rn[i].stranger_u16_len > 0 && g_rn[i].stranger_u16[0] == 0x40) {
+        /* 以 @ 开头 = 陌生名，正常 */
+    } else if (g_rn[i].stranger_u16_len > 0) {
+        g_rn[i].stranger_u16_len = 0;                              /* 不是陌生名，别拿来比对 */
+    }
+
     const char* how = "?";
     void* real = real_name_of(c, &how);
-    if (str_empty(stranger) || str_empty(real)) return;
-    g_rn[i].stranger = stranger;
-    g_rn[i].real = real;
+    if (str_empty(real)) return;
+    str_to_buf(real, g_rn[i].real_txt, sizeof(g_rn[i].real_txt));
     if (g_log_ready < 20) {
         g_log_ready++;
-        char rb[64];
-        str_to_buf(real, rb, sizeof(rb));
-        LOGI("[name] uid=%d 已就绪：熟悉后姓名=\"%s\"（%s）", uid, rb, how);
+        LOGI("[name] uid=%d 已就绪：熟悉后姓名=\"%s\"（%s）", uid, g_rn[i].real_txt, how);
     }
 }
 
@@ -801,12 +862,15 @@ static void rn_apply_rename(int i) {
         if (L > 0 && p[0] == 0x40) return;
     }
 
-    /* 第一次动这个实例：记下原始值 */
+    /* 第一次动这个实例：记下原始值（v90：记文本，不记指针 —— 字段马上就被我们覆盖，
+     * 原来那串随即失去引用，GC 一回收缓存的指针就是野的） */
     int was_renamed = (g_rn[i].renamed && g_rn[i].renamed_inst == c);
     if (!was_renamed) {
         g_rn[i].renamed_inst = c;
-        g_rn[i].orig_sur = *(void**)((char*)c + OFF_GCI_SURNAME);
-        g_rn[i].orig_given = *(void**)((char*)c + OFF_GCI_GIVENNAME);
+        snap_str(c, OFF_GCI_SURNAME, g_rn[i].orig_sur_txt, sizeof(g_rn[i].orig_sur_txt),
+                 &g_rn[i].orig_sur_null);
+        snap_str(c, OFF_GCI_GIVENNAME, g_rn[i].orig_given_txt, sizeof(g_rn[i].orig_given_txt),
+                 &g_rn[i].orig_given_null);
         g_rn[i].renamed = 1;
     }
 
@@ -875,7 +939,9 @@ static void rn_patch_tpl(int i) {
 
     if (!g_rn[i].tpl_patched) {
         g_rn[i].tpl = tpl;
-        g_rn[i].orig_tpl_stranger = *(void**)((char*)tpl + OFF_CPD_NAME_STRANGER);
+        /* v90：模板的 NameAsStranger 马上被我们覆盖 → 同样只留文本快照 */
+        snap_str(tpl, OFF_CPD_NAME_STRANGER, g_rn[i].orig_tpl_stranger_txt,
+                 sizeof(g_rn[i].orig_tpl_stranger_txt), &g_rn[i].orig_tpl_stranger_null);
         g_rn[i].tpl_patched = 1;
     }
 
@@ -899,9 +965,8 @@ static void rn_patch_tpl(int i) {
 
     if (g_log_tpl < 20) {
         g_log_tpl++;
-        char ob[64] = {0};
-        str_to_buf(g_rn[i].orig_tpl_stranger, ob, sizeof(ob));
-        LOGI("[name] uid=%d 模板陌生名 \"%s\" -> \"%s\"", uid, ob, full);
+        LOGI("[name] uid=%d 模板陌生名 \"%s\" -> \"%s\"", uid,
+             g_rn[i].orig_tpl_stranger_txt, full);
     }
 }
 
@@ -909,7 +974,8 @@ static void rn_restore_tpl(int i) {
     if (i < 0 || i >= RN_SLOTS) return;
     if (!g_rn[i].tpl_patched) return;
     if ((uintptr_t)g_rn[i].tpl > 0x10000)
-        *(void**)((char*)g_rn[i].tpl + OFF_CPD_NAME_STRANGER) = g_rn[i].orig_tpl_stranger;
+        *(void**)((char*)g_rn[i].tpl + OFF_CPD_NAME_STRANGER) =
+            str_rebuild(g_rn[i].orig_tpl_stranger_txt, g_rn[i].orig_tpl_stranger_null);
     g_rn[i].tpl_patched = 0;
     g_rn[i].tpl = nullptr;
 }
@@ -981,7 +1047,7 @@ static void rn_sync(void) {
         int want = playing && rn_now_ms() <= g_rn[i].until &&
                    g_rn[i].graph && g_rn[i].graph == g_play_graph;
         if (want) {
-            if (!g_rn[i].stranger || !g_rn[i].real) refresh_rn_slot(i);
+            if (g_rn[i].stranger_u16_len <= 0 || !g_rn[i].real_txt[0]) refresh_rn_slot(i);
             rn_apply_rename(i);
             rn_patch_tpl(i);
         } else if (g_rn[i].renamed || g_rn[i].tpl_patched) {
@@ -1060,8 +1126,12 @@ static void rn_restore_rename(int i) {
     void* c = ((fn_getchar)(g_base + RVA_GET_CHARACTER))(m, uid);
     if (c != g_rn[i].renamed_inst) { g_rn[i].renamed = 0; return; }
 
-    *(void**)((char*)c + OFF_GCI_SURNAME) = g_rn[i].orig_sur;
-    *(void**)((char*)c + OFF_GCI_GIVENNAME) = g_rn[i].orig_given;
+    /* v90：按文本快照重建原始串再写回（原来是写缓存的裸指针 → 可能是被复用的垃圾，
+     * 表现就是人物名字变成 "OutPort" 这种别的字符串）。 */
+    *(void**)((char*)c + OFF_GCI_SURNAME) =
+        str_rebuild(g_rn[i].orig_sur_txt, g_rn[i].orig_sur_null);
+    *(void**)((char*)c + OFF_GCI_GIVENNAME) =
+        str_rebuild(g_rn[i].orig_given_txt, g_rn[i].orig_given_null);
     g_rn[i].renamed = 0;
     if (g_rn_log < 60) { g_rn_log++; LOGI("[name] uid=%d 姓名已还原", uid); }
 }
@@ -1305,14 +1375,8 @@ static int g_thx_log = 0;
  * 只替换「被放宽的那个角色」的陌生名（m_givenName，形如 @冷峻严肃的中年人），
  * 其它文本一律原样放行。 */
 
-static int il2str_eq(void* a, void* b) {
-    if (a == b) return 1;
-    if (!il2str_len_ok(a) || !il2str_len_ok(b)) return 0;
-    int la = *(int*)((char*)a + OFF_IL2STR_LEN);
-    int lb = *(int*)((char*)b + OFF_IL2STR_LEN);
-    if (la != lb) return 0;
-    return memcmp((char*)a + OFF_IL2STR_CHARS, (char*)b + OFF_IL2STR_CHARS, (size_t)la * 2) == 0;
-}
+/* v90：原来的 il2str_eq(a,b) 需要两个「活着的」托管字符串；现在陌生名只留文本快照，
+ * 比对统一走 snap_match_u16()。 */
 
 static void* swap_if_stranger(void* str) {
     if (!F_STORY || (uintptr_t)str < 0x10000) return str;
@@ -1329,16 +1393,18 @@ static void* swap_if_stranger(void* str) {
         if (now > g_rn[i].until) continue;
         /* 放宽命中那一刻角色实例可能还没创建（尤其读档后刚进场景），缓存是空的。
          * 按 500ms 节流补取一次，避免整段对话都换不到名字。 */
-        if (!g_rn[i].stranger || !g_rn[i].real) {
+        if (g_rn[i].stranger_u16_len <= 0 || !g_rn[i].real_txt[0]) {
             static uint64_t last_try = 0;
             if (now - last_try < 500) continue;
             last_try = now;
             refresh_rn_slot(i);
-            if (!g_rn[i].stranger || !g_rn[i].real) continue;
+            if (g_rn[i].stranger_u16_len <= 0 || !g_rn[i].real_txt[0]) continue;
         }
-        if (!il2str_eq(str, g_rn[i].stranger)) continue;
+        if (!snap_match_u16(str, g_rn[i].stranger_u16, g_rn[i].stranger_u16_len)) continue;
         if (g_rn_log++ < 8) LOGI("[name] 文本层替换：陌生名 -> 熟悉后姓名 (uid=%d)", g_rn[i].uid);
-        return g_rn[i].real;
+        /* v90：现造一个新字符串交回去 —— 缓存里只留文本，不再返回可能已被回收的指针 */
+        void* fresh = str_rebuild(g_rn[i].real_txt, 0);
+        return ((uintptr_t)fresh > 0x10000) ? fresh : str;
     }
     return str;
 }
@@ -1351,15 +1417,8 @@ static void clear_relax_name_state(void) {
     g_play_graph = nullptr;
     g_play_until = 0;
     g_play_state = 0;
-    for (int i = 0; i < RN_SLOTS; ++i) { rn_restore_rename(i); rn_restore_tpl(i); }   /* 还原实例姓名与模板陌生名 */
-    for (int i = 0; i < RN_SLOTS; ++i) {
-        g_rn[i].uid = 0;
-        g_rn[i].stranger = nullptr;
-        g_rn[i].real = nullptr;
-        g_rn[i].until = 0;
-        g_rn[i].renamed = 0;
-        g_rn[i].renamed_inst = nullptr;
-    }
+    /* v90：槽位里只缓存文本，不会有悬空指针了；这里仍然先还原再清空 */
+    for (int i = 0; i < RN_SLOTS; ++i) rn_clear_slot(i, 1);
 }
 
 static int is_credits_text(void* s) {
@@ -1475,16 +1534,16 @@ static void* npc_name_common(void* self, void* (*orig)(void*), const char* tag) 
 
     int i = rn_find(uid);
     if (i < 0 || rn_now_ms() > g_rn[i].until) return r;
-    if (!g_rn[i].real) refresh_rn_slot(i);
-    if (!g_rn[i].real) return r;
+    if (!g_rn[i].real_txt[0]) refresh_rn_slot(i);
+    if (!g_rn[i].real_txt[0]) return r;
 
     if (g_nn_log < 60) {
         g_nn_log++;
-        char nb[64];
-        str_to_buf(g_rn[i].real, nb, sizeof(nb));
-        LOGI("[name] %s uid=%d 替换 -> \"%s\"", tag, uid, nb);
+        LOGI("[name] %s uid=%d 替换 -> \"%s\"", tag, uid, g_rn[i].real_txt);
     }
-    return g_rn[i].real;
+    /* v90：现造字符串，别把缓存里的裸指针交出去（可能已被 GC 回收并复用） */
+    void* fresh = str_rebuild(g_rn[i].real_txt, 0);
+    return ((uintptr_t)fresh > 0x10000) ? fresh : r;
 }
 
 static void* hook_tmn_name(void* self) { return npc_name_common(self, orig_tmn_name, "对话名"); }
@@ -2061,3 +2120,4 @@ static void wulin_on_load() {
     }
     pthread_detach(t);
 }
+
