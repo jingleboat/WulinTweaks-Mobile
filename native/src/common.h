@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v79-playonly"           /* 本 mod 自己的版本号，只用来对日志 */
+#define MOD_VER "v80-generic"           /* 本 mod 自己的版本号，只用来对日志 */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
@@ -50,6 +50,7 @@ void relax_name_open(int uid, void* graph);
 /* 剧情播放起止（由 StoryScenarioNode.OnActive / Continue 钩子驱动）。 */
 void story_play_begin(void* playNode);
 void story_play_end(void);
+void story_play_end_now(void);   /* v80：剧情收尾时立刻还原（StoryCloseNode.OnResult 驱动） */
 
 /* ================================================================== RVA */
 /* ---- il2cpp 通用 ---- */
@@ -84,6 +85,8 @@ void story_play_end(void);
  * 用来把「显示熟悉后姓名」收窄到播放期间（而不是被 Hold 重判一直续命）。 */
 #define RVA_SSN_ONACTIVE  0x3DA0730
 #define RVA_SSN_CONTINUE  0x3DA0798
+#define RVA_SCN_ONRESULT        0x3DAC5AC  /* StoryCloseNode.OnResult —— 剧情真正收尾（v80 用它立刻还原姓名） */
+#define OFF_SCN_GRAPHNAME       0x60       /* StoryCloseNode.GraphName（string） */
 #define RVA_GET_NAME 0x4AD8B9C           /* Object.get_name() */
 #define RVA_GO_CHILD_OBJ 0x4AD34C8       /* Component.get_transform()（拿子节点 Transform 时也用它） */
 #define RVA_COMP_GET_GO 0x4AD3504        /* Component.get_gameObject() */

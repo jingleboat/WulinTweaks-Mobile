@@ -1,35 +1,51 @@
 /*
- * WulinTweaks · 剧情分支展开（Branch Flattener）  v67
- * ==================================================
- * 目的：原版剧情图里「某角色是否在队」的互补兄弟条件（Negate=0 / Negate=1）是 if/else，
- * 引擎按顺序问、第一个满足的就被走，另一条永远不播。这里把「讲解类」分支的出口
- * 从汇合点改接到下一段讲解，让所有在队讲解按顺序播完，再走「无伙伴」那条兜底。
+ * WulinTweaks · 剧情分支展开（Branch Flattener）  v80-generic
+ * =========================================================
+ * 通用规则，不再针对某一张图。与 PC 端 BranchFlatten.cs v2 完全同一套逻辑。
  *
- * 为什么改内存对象而不是 bundle 字节：
- *   实测 AssetBundle.LoadFromFileAsync 在这个游戏里从不被调用（剧情 bundle 走别处）。
+ * 规则（一句话）：
+ *   把「在队侧（Negate=0）」的**出口**改接到「不在队侧那道门（Negate=1）」，
+ *   再让这两道门都判真 —— 于是先播在队侧的内容，接着播不在队侧的内容。
  *
- * 为什么不用「类名 + 条件」去认门（v65 的错法）：
- *   v65 用 ports 字典的 keys/values 平行数组按名找端口 → 播放剧情全找到、门一个没找到。
- *   XNode 的 NodePortDictionary 有 ClearSerialize()，运行期两个 List 很可能已被清空。
- *   v67 改成：
- *     ① 端口用 Node.GetOutputPort / Node.GetPort（走 Dictionary 的托管 API）取；
- *     ② 门**纯靠结构走**：从 _2_1 起沿 OutPort.connections[1] 连走 5 次，
- *        依次得到 门9 → 门11 → 门13 → 门15 → 门17（每级 Neg=1 的那个）；
- *        完全不依赖类名、不依赖条件字段扫描。
+ * 为什么成立：
+ *   一对门的父节点出边是 [G0(Negate=0), G1(Negate=1)]，引擎按顺序问、第一个满足的就走；
+ *   两道都真时永远走 G0。所以只把「G0 分支走完之后指向外面那条边」改成指向 G1，
+ *   G1 侧原样保留（它连着的是一对门还是汇合点都无所谓）。
+ *     · A 类：一侧「播放剧情」/ 一侧「直通」 —— 改完变成梯子顺序展开
+ *     · B 类：两侧都是「播放剧情」 —— 改完变成"先播在队那段、再播不在队那段"
  *
- * 结构偏移（V1.2.0820B131，dump.cs 标定）：
- *   XNode.Node        graph 0x18  position 0x20
- *   XNode.NodePort    _fieldName 0x10  _node 0x18  connections 0x20  _direction 0x28
- *   NodePort.PortConnection  fieldName 0x10  node 0x18  port 0x20
+ * 内容区域怎么界定（不靠"取第 1 条出边"，那样遇到多节点剧情/内部带分支就废）：
+ *   region = reach(G0) − reach(G1) − {G0, G1}
+ *   也就是只有在队侧能到、不在队侧到不了的节点 = 该侧独占内容；
+ *   汇合点和之后的流程因为两侧都能到，天然被排除。
+ *   exits = region 内所有指向 region 外的边（已指向 G1 的除外）
+ *   动作  = exits 全部改指 G1；G0、G1 的条件登记进「恒真」表
+ *
+ * 跳过条件（宁可不动，也不要改坏）：
+ *   · region 为空（两侧内容重叠）、region 过大、region 没有对外出口
+ *   · 与另一对门的 region 相交（嵌套门对）→ 两对都跳过，留给人工
+ *   · partnerID <= 0 的伪条件；两侧都不是「单节点剧情」的 X 类
+ *
+ * 接管方式：把两道门的**条件节点**登记进 g_flat_cond，由 wulin_main.cpp 的
+ * hook_check_partner / hook_check_joined 在判定入口直接走基类实现（= 丢掉这一个条件）。
+ * ⚠️ 仍然**不写 partnerID / Negate 字段** —— 那两个字段被「显示熟悉后姓名」用来
+ *    记录"放宽放过了谁"，抹掉姓名功能就失效（v69 的教训）。
+ *
+ * 结构偏移（V1.2.0820B131）：
+ *   XNode.Node        graph 0x18
+ *   XNode.NodePort    connections 0x20
+ *   NodePort.PortConnection  node 0x18
  *   NodeGraph         nodes 0x18（List<Node>）
  *   StoryScenarioNode ScenarioKey 0x60
- *   HavePartnerCondition  partnerID 0x58（int）  Negate 0x5C（bool）
+ *   HavePartnerCondition     partnerID 0x58(int)  Negate 0x5C(bool)
+ *   il2cpp 数组元素起点 0x20（List._items 指向数组对象）
  */
 #include "common.h"
 
 #include <string.h>
 
-extern volatile int F_FLAT;
+extern volatile int F_FLAT;      /* 面板第 8 行开关 */
+extern volatile int F_STORY;     /* 剧情条件放宽（姓名窗口也受它约束） */
 
 /* ---------------------------------------------------------------- 偏移 */
 #define OFF_NODEPORT_CONNS   0x20
@@ -39,17 +55,19 @@ extern volatile int F_FLAT;
 #define OFF_HP_PARTNER_ID    0x58
 #define OFF_HP_NEGATE        0x5C
 
+/* ---------------------------------------------------------------- 容量 */
+#define FLAT_MAX_NODES   2050        /* 单图节点上限（最大的图约 1300） */
+#define FLAT_MAX_EDGES   8200
+#define FLAT_MAX_PAIRS   48
+#define FLAT_MAX_CONDS   128
+#define FLAT_MAX_REGION  512         /* region 节点上限 */
+#define FLAT_DONE_MAX    96          /* 处理过的图指针（环形） */
+#define FLAT_LOG_GRAPH   40
+
 /* ---------------------------------------------------------------- 列表访问 */
 /* ⚠️ il2cpp 数组（T[]）的元素不是从数组对象头开始，而是 +0x20：
  *      klass 0x00 | monitor 0x08 | bounds 0x10 | max_length 0x18 | 元素从 0x20
- *   而 List<T> 的 _items 字段（0x10）指向的就是这个数组对象。
- *   踩过的坑（v65~v68）：
- *     · 按 (T*)arr[i] 从 0x00 读 → [0] 拿到数组的 klass 指针（当节点用会闪退）、
- *       [1] 拿到 monitor=0（当 PortConnection 用 → 取到的 node 恒为 null）。
- *     · 表现为：ScenarioKey 还能命中（偏 4 位后仍覆盖到大部分元素），
- *       但「取 connections[1]」永远空、对「伪节点」调 GetPort 直接 SIGSEGV。 */
-#define OFF_ARRAY_DATA 0x20
-
+ *   而 List<T> 的 _items 字段（0x10）指向的就是这个数组对象。 */
 static int lcnt(void* lst) {
     if ((uintptr_t)lst < 0x10000) return 0;
     int n = *(int*)((char*)lst + OFF_LIST_SIZE);
@@ -89,7 +107,9 @@ static const char* cls_name(void* o, char* buf, int cap) {
 }
 
 /* 按端口名取 NodePort —— 走托管方法 Node.GetOutputPort / Node.GetPort。
- * 端口名是 ASCII，用 il2cpp_string_new 造一个托管字符串传进去。 */
+ * 端口名是 ASCII，用 il2cpp_string_new 造一个托管字符串传进去。
+ * ⚠️ 不要改成读端口字段：手机端当初就是用这两个方法才绕开「ports 字典的
+ *    keys/values 在运行期被清空」那个坑。 */
 static void* node_port(void* node, const char* want, int output_only) {
     if ((uintptr_t)node < 0x10000 || !A_string_new) return nullptr;
     void* s = A_string_new(want);
@@ -101,14 +121,14 @@ static void* node_port(void* node, const char* want, int output_only) {
 }
 
 static int port_conn_count(void* port) {
-    if ((uintptr_t)port < 0x10000) return -1;
+    if ((uintptr_t)port < 0x10000) return 0;
     return lcnt(*(void**)((char*)port + OFF_NODEPORT_CONNS));
 }
 
 static void* port_conn_node(void* port, int idx) {
-    if ((uintptr_t)port < 0x10000) return nullptr;
+    if ((uintptr_t)port < 0x10000 || idx < 0) return nullptr;
     void* cs = *(void**)((char*)port + OFF_NODEPORT_CONNS);
-    if (idx < 0 || idx >= lcnt(cs)) return nullptr;
+    if (idx >= lcnt(cs)) return nullptr;
     void* c = litem(cs, idx);
     if ((uintptr_t)c < 0x10000) return nullptr;
     void* t = *(void**)((char*)c + OFF_PORTCONN_NODE);
@@ -116,7 +136,7 @@ static void* port_conn_node(void* port, int idx) {
 }
 
 static int port_set_conn_node(void* port, int idx, void* target) {
-    if ((uintptr_t)port < 0x10000) return 0;
+    if ((uintptr_t)port < 0x10000 || (uintptr_t)target < 0x10000) return 0;
     void* cs = *(void**)((char*)port + OFF_NODEPORT_CONNS);
     if (idx < 0 || idx >= lcnt(cs)) return 0;
     void* c = litem(cs, idx);
@@ -125,39 +145,18 @@ static int port_set_conn_node(void* port, int idx, void* target) {
     return 1;
 }
 
-/* ================================================================ 补丁 */
-#define FLAT_GRAPH_NAME   "R10049-2"
-#define FLAT_START_KEY    "R10049-2_2_1"
-
-/* 讲解链上的 5 个角色 id。每个各有一对 Negate=0/1 的门（共 10 个）。
- *
- * ⚠️ v69 的做法是「partnerID 改成 0 + Negate=1」把它做成恒真 —— v70 撤掉。
- * 原因：它把「这是谁」一起抹掉了，mark_relaxed() 里 `pid <= 0 → return`，
- * 于是姓名窗口永远不开，「陌生名 → 熟悉后姓名」直接失效（用户实测报的问题）。
- *
- * v70 改成**一个字段都不写**：只记下这些条件节点的指针，
- * 在 hook_check_partner 里把这个条件强制判真（flatten_cond_always_true）。
- *   · partnerID / Negate 原样保留 → mark_relaxed 照常工作 → 姓名功能恢复
- *   · 仍然与「剧情条件放宽」解耦（放宽关着也恒真，不会卡死在半路）
- * 只碰这 5 个 id —— 图里还有 10054/10075/10071/10015/10039/10056/10098 的
- * 「两侧都有剧情」分支，那是 B 类，本期不动。 */
-static const int k_neutral_pids[] = { 10084, 10083, 10078, 10053, 10008 };
-#define FLAT_NEUTRAL_PIDS_N ((int)(sizeof(k_neutral_pids) / sizeof(k_neutral_pids[0])))
-
-/* 被接管的条件节点表（恒真）*/
-#define FLAT_COND_MAX 24
-static void* g_flat_cond[FLAT_COND_MAX];
+/* ================================================================ 恒真表 */
+/* 被接管的条件节点（门的 conditionPort 连着的那个 ConditionNode） */
+static void* g_flat_cond[FLAT_MAX_CONDS];
 static int g_flat_cond_n = 0;
 
 static void flat_add_cond(void* cond) {
     if ((uintptr_t)cond < 0x10000) return;
     for (int i = 0; i < g_flat_cond_n; ++i)
         if (g_flat_cond[i] == cond) return;
-    if (g_flat_cond_n < FLAT_COND_MAX) g_flat_cond[g_flat_cond_n++] = cond;
+    if (g_flat_cond_n < FLAT_MAX_CONDS) g_flat_cond[g_flat_cond_n++] = cond;
 }
 
-/* 这个条件节点是否已被「分支展开」接管（= 恒真）。wulin_main.cpp 的
- * hook_check_partner / hook_check_joined 会在判定前先问一句。 */
 int flatten_cond_always_true(void* cond) {
     if (!F_FLAT || (uintptr_t)cond < 0x10000) return 0;
     for (int i = 0; i < g_flat_cond_n; ++i)
@@ -165,214 +164,305 @@ int flatten_cond_always_true(void* cond) {
     return 0;
 }
 
-/* 依次串起来的 5 段讲解（第 5 段之后接「无伙伴」兜底门） */
-static const char* k_chain_keys[] = {
-    "R10049-2_2_2",   /* 洛千雪 10084 */
-    "R10049-2_2_3",   /* 洛天雄 10083 */
-    "R10049-2_2_4",   /* 裘之墨 10078 */
-    "R10049-2_2_5",   /* 说书人 10053 */
-    "R10049-2_2_6",   /* 凌梦蝶 10008 */
-};
-#define FLAT_CHAIN_N ((int)(sizeof(k_chain_keys) / sizeof(k_chain_keys[0])))
+/* ================================================================ 图处理状态 */
+/* 处理过的图指针（环形）。通用规则下「任何图都要扫一次」，所以比原来大得多，
+ * 否则指针一被挤出环形就会被反复重扫（每次都是几千次 il2cpp 调用）。 */
+static void* g_done[FLAT_DONE_MAX];
+static int g_done_n = 0;
+static int g_done_rr = 0;
+static int g_log_graph = 0;
+static int g_log_pair = 0;
 
-/* 从 _2_1 起沿 OutPort.connections[1] 要走几次才到最后的 Neg=1 门（门17）：
- *   _2_1 --[1]--> 门9 --[1]--> 门11 --[1]--> 门13 --[1]--> 门15 --[1]--> 门17
- * 前四级各对应 10084/10083/10078/10053 的 Neg=1 门，第五级是 10008 的 Neg=1 门。 */
-#define FLAT_WALK_STEPS 5
-
-/* ================================================================ 主逻辑 */
-#define FLAT_DONE_MAX 16
-static void* g_flat_done[FLAT_DONE_MAX];
-static int g_flat_done_n = 0;
-static int g_flat_log = 0;
-/* 最近被判定为「不是目标图」的 graph 指针（v78：从 1 个扩成 16 个）。
- * flatten_try 挂在很热的 hooks 上（进场条件 / 队友条件 / Hold 判定），
- * 而游戏会按几十上百次/秒的节奏重判 Hold 条件 —— 只缓存一个的话，
- * 多个图交替出现时几乎每次都要重新取名字（unity_name + strcmp）。 */
-#define FLAT_NOPE_MAX 16
-static void* g_flat_nope[FLAT_NOPE_MAX];
-static int g_flat_nope_n = 0;
-static int g_flat_nope_rr = 0;
-
-static int flat_already(void* g) {
-    for (int i = 0; i < g_flat_nope_n; ++i)
-        if (g_flat_nope[i] == g) return 1;
-    for (int i = 0; i < g_flat_done_n; ++i)
-        if (g_flat_done[i] == g) return 1;
+static int flat_done(void* g) {
+    for (int i = 0; i < g_done_n; ++i)
+        if (g_done[i] == g) return 1;
     return 0;
 }
 
-static void flat_mark_nope(void* g) {
+static void flat_mark_done(void* g) {
     if ((uintptr_t)g < 0x10000) return;
-    for (int i = 0; i < g_flat_nope_n; ++i)
-        if (g_flat_nope[i] == g) return;
-    g_flat_nope[g_flat_nope_rr] = g;
-    g_flat_nope_rr = (g_flat_nope_rr + 1) % FLAT_NOPE_MAX;
-    if (g_flat_nope_n < FLAT_NOPE_MAX) g_flat_nope_n++;
+    g_done[g_done_rr] = g;
+    g_done_rr = (g_done_rr + 1) % FLAT_DONE_MAX;
+    if (g_done_n < FLAT_DONE_MAX) g_done_n++;
 }
 
-static void flat_mark(void* g) {
-    if (g_flat_done_n < FLAT_DONE_MAX) g_flat_done[g_flat_done_n++] = g;
+/* ================================================================ 单图工作区 */
+typedef struct { int src; int tgt; int slot; void* port; } FLAT_EDGE;
+typedef struct { int g0, g1; int pid; int both_story; int reg_n; int ex_start; int ex_n; } FLAT_PAIR;
+
+static void*          g_nd[FLAT_MAX_NODES];      /* 节点指针 */
+static int            g_e0[FLAT_MAX_NODES];      /* 该节点第一条出边下标 */
+static int            g_ec[FLAT_MAX_NODES];      /* 该节点出边条数 */
+static void*          g_cond[FLAT_MAX_NODES];    /* 门的条件节点（非门为 0） */
+static FLAT_EDGE      g_edge[FLAT_MAX_EDGES];
+static FLAT_PAIR      g_pair[FLAT_MAX_PAIRS];
+static int            g_exit[FLAT_MAX_EDGES];    /* 各 pair 的出口边下标（按 pair 顺序排） */
+static unsigned char  g_reg[FLAT_MAX_PAIRS][FLAT_MAX_NODES];  /* 每对的 region 位图 */
+static int            g_nnodes, g_nedges, g_npairs, g_nexit;
+
+/* 节点指针 → 下标 的小哈希（BFS 要反复查） */
+#define FLAT_HASH 4096
+static void* g_hk[FLAT_HASH];
+static int   g_hv[FLAT_HASH];
+
+static unsigned hash_ptr(void* p) {
+    uintptr_t x = (uintptr_t)p;
+    x ^= x >> 13; x *= 0x9E3779B1u; x ^= x >> 15;
+    return (unsigned)x & (FLAT_HASH - 1);
 }
 
-/* 在已加载的图对象上套用补丁。node 可以是图上任意一个节点（用它的 graph 指针）。 */
+static void hash_put(void* p, int v) {
+    unsigned h = hash_ptr(p);
+    for (int i = 0; i < 64; ++i) {
+        unsigned k = (h + i) & (FLAT_HASH - 1);
+        if (!g_hk[k]) { g_hk[k] = p; g_hv[k] = v; return; }
+    }
+}
+
+static int hash_get(void* p) {
+    unsigned h = hash_ptr(p);
+    for (int i = 0; i < 64; ++i) {
+        unsigned k = (h + i) & (FLAT_HASH - 1);
+        if (!g_hk[k]) return -1;
+        if (g_hk[k] == p) return g_hv[k];
+    }
+    return -1;
+}
+
+/* 扫图：收节点 + 出边 + 门→条件节点 */
+static int flat_build(void* g) {
+    void* nodes = *(void**)((char*)g + OFF_GRAPH_NODES);
+    int n = lcnt(nodes);
+    if (n <= 2 || n > FLAT_MAX_NODES) return 0;
+
+    memset(g_hk, 0, sizeof(g_hk));
+    g_nnodes = 0; g_nedges = 0; g_nexit = 0;
+
+    for (int i = 0; i < n; ++i) {
+        void* nd = litem(nodes, i);
+        if ((uintptr_t)nd < 0x10000) continue;
+        if (*(void**)((char*)nd + OFF_NODE_GRAPH) != g) continue;   /* 数组读偏的保险 */
+        g_nd[g_nnodes] = nd;
+        hash_put(nd, g_nnodes);
+        g_nnodes++;
+    }
+    if (g_nnodes < 2) return 0;
+
+    /* 出边：只看 OutPort（剧情走线就在它上面）；顺便记下门的条件节点 */
+    for (int i = 0; i < g_nnodes; ++i) {
+        void* nd = g_nd[i];
+        g_cond[i] = nullptr;
+        g_e0[i] = g_nedges;
+        g_ec[i] = 0;
+
+        void* op = node_port(nd, "OutPort", 1);
+        int cnt = port_conn_count(op);
+        if (cnt > 0 && cnt <= 32) {
+            for (int k = 0; k < cnt; ++k) {
+                void* t = port_conn_node(op, k);
+                int ti = hash_get(t);
+                if (ti < 0) continue;
+                if (g_nedges >= FLAT_MAX_EDGES) break;
+                g_edge[g_nedges].src = i;
+                g_edge[g_nedges].tgt = ti;
+                g_edge[g_nedges].slot = k;
+                g_edge[g_nedges].port = op;
+                g_nedges++;
+                g_ec[i]++;
+            }
+        }
+
+        void* cp = node_port(nd, "conditionPort", 0);
+        if ((uintptr_t)cp > 0x10000) g_cond[i] = port_conn_node(cp, 0);
+    }
+    return 1;
+}
+
+static int is_story_idx(int i) {
+    if (i < 0 || i >= g_nnodes) return 0;
+    char cb[64];
+    if (strcmp(cls_name(g_nd[i], cb, sizeof(cb)), "StoryScenarioNode") != 0) return 0;
+    void* sk = *(void**)((char*)g_nd[i] + OFF_SSN_SCENARIOKEY);
+    return (uintptr_t)sk > 0x10000;
+}
+
+/* 这一侧是不是「单个播放剧情节点」——用来区分 A 类 / B 类 */
+static int story_exit(int gateIdx) {
+    if (gateIdx < 0 || gateIdx >= g_nnodes) return 0;
+    if (g_ec[gateIdx] != 1) return 0;
+    return is_story_idx(g_edge[g_e0[gateIdx]].tgt);
+}
+
+/* 算第 k 对的独占区域 → 写进 g_reg[k]，返回节点数。
+ *   region = reach(G0) − reach(G1) − {G0, G1}
+ * 标记：1 = 只在 G0 侧可达（region）；2 = G1 侧可达（要排除） */
+static int flat_region(int k) {
+    static int st[FLAT_MAX_NODES];
+    FLAT_PAIR* p = &g_pair[k];
+    unsigned char* out = g_reg[k];
+    memset(out, 0, (size_t)g_nnodes);
+
+    int head = 0;
+    if (p->g1 >= 0 && p->g1 < g_nnodes) { out[p->g1] = 2; st[head++] = p->g1; }
+    while (head > 0) {
+        int cur = st[--head];
+        for (int e = 0; e < g_ec[cur]; ++e) {
+            int t = g_edge[g_e0[cur] + e].tgt;
+            if (out[t]) continue;
+            out[t] = 2;
+            if (head < FLAT_MAX_NODES) st[head++] = t;
+        }
+    }
+
+    head = 0;
+    if (p->g0 >= 0 && p->g0 < g_nnodes && !out[p->g0]) { out[p->g0] = 3; st[head++] = p->g0; }
+    while (head > 0) {
+        int cur = st[--head];
+        for (int e = 0; e < g_ec[cur]; ++e) {
+            int t = g_edge[g_e0[cur] + e].tgt;
+            if (out[t]) continue;
+            out[t] = 1;
+            if (head < FLAT_MAX_NODES) st[head++] = t;
+        }
+    }
+
+    if (p->g0 >= 0 && p->g0 < g_nnodes) out[p->g0] = 0;
+    if (p->g1 >= 0 && p->g1 < g_nnodes) out[p->g1] = 0;
+
+    int n = 0;
+    for (int i = 0; i < g_nnodes; ++i) if (out[i] == 1) n++;
+    return n;
+}
+
+/* ================================================================ 主流程 */
 void flatten_try(void* any_node) {
     if (!F_FLAT) return;
     if ((uintptr_t)any_node < 0x10000) return;
 
     void* g = *(void**)((char*)any_node + OFF_NODE_GRAPH);
     if ((uintptr_t)g < 0x10000) return;
-    if (flat_already(g)) return;
+    if (flat_done(g)) return;
 
     char gb[96];
-    if (strcmp(unity_name(g, gb, sizeof(gb)), FLAT_GRAPH_NAME) != 0) {
-        flat_mark_nope(g);
-        return;
-    }
-
-    void* nodes = *(void**)((char*)g + OFF_GRAPH_NODES);
-    int n = lcnt(nodes);
-    if (n <= 0 || n > 4096) { flat_mark(g); return; }
-
-    char cb[64];
-
-    /* ---- 第一遍：按 ScenarioKey 找出起点和 5 段讲解 ---- */
-    void* start = nullptr;
-    void* chain[FLAT_CHAIN_N];
-    for (int i = 0; i < FLAT_CHAIN_N; ++i) chain[i] = nullptr;
-
-    for (int i = 0; i < n; ++i) {
-        void* nd = litem(nodes, i);
-        if (!nd) continue;
-        if (*(void**)((char*)nd + OFF_NODE_GRAPH) != g) continue;   /* 见下：有效性校验 */
-        cls_name(nd, cb, sizeof(cb));
-        if (strcmp(cb, "StoryScenarioNode") != 0) continue;
-        void* sk = *(void**)((char*)nd + OFF_SSN_SCENARIOKEY);
-        if ((uintptr_t)sk < 0x10000) continue;
-        char kb[96];
-        str_to_buf(sk, kb, sizeof(kb));
-        if (!start && strcmp(kb, FLAT_START_KEY) == 0) start = nd;
-        for (int e = 0; e < FLAT_CHAIN_N; ++e)
-            if (!chain[e] && strcmp(kb, k_chain_keys[e]) == 0) chain[e] = nd;
-    }
-
-    if (!start) {
-        /* 不 mark：图可能还没加载完，下次 hook 再试。日志节流。 */
-        if (g_flat_log < 4) {
-            g_flat_log++;
-            LOGI("[flat] 图 %s 里暂时没找到起点 %s（共 %d 个节点），稍后重试", gb, FLAT_START_KEY, n);
+    if (!flat_build(g)) {
+        flat_mark_done(g);
+        if (g_log_graph < FLAT_LOG_GRAPH) {
+            g_log_graph++;
+            LOGI("[flat] 图 %s 结构异常（节点 %d），跳过",
+                 unity_name(g, gb, sizeof(gb)), g_nnodes);
         }
         return;
     }
 
-    /* 顺带把「入口节点出边取不到」这件事记清楚（v67 走链 0/5 的原因待定） */
-    {
-        void* o1 = node_port(start, "OutPort", 1);
-        void* o0 = node_port(start, "OutPort", 0);
-        LOGI("[flat] 入口 %s：OutPort(仅输出)=%s 连接数=%d；任意方向=%s 连接数=%d",
-             FLAT_START_KEY, o1 ? "有" : "无", port_conn_count(o1),
-             o0 ? "有" : "无", port_conn_count(o0));
+    /* ---------------- ① 找互补门对 ---------------- */
+    g_npairs = 0;
+    for (int i = 0; i < g_nnodes && g_npairs < FLAT_MAX_PAIRS; ++i) {
+        if (g_ec[i] != 2) continue;                    /* 只认「一个端口两条连接」 */
+        int a = g_edge[g_e0[i]].tgt;
+        int b = g_edge[g_e0[i] + 1].tgt;
+        if (a == b) continue;
+
+        void* ca = g_cond[a];
+        void* cb = g_cond[b];
+        if ((uintptr_t)ca < 0x10000 || (uintptr_t)cb < 0x10000) continue;
+
+        int pa = *(int*)((char*)ca + OFF_HP_PARTNER_ID);
+        int pb = *(int*)((char*)cb + OFF_HP_PARTNER_ID);
+        if (pa <= 0 || pa != pb) continue;             /* partnerID<=0 不是「需要伙伴」 */
+
+        int na = (*(unsigned char*)((char*)ca + OFF_HP_NEGATE) != 0);
+        int nb = (*(unsigned char*)((char*)cb + OFF_HP_NEGATE) != 0);
+        if (na == nb) continue;                        /* 必须互补 */
+
+        int g0 = na ? b : a;                           /* Negate=0 = 在队侧 */
+        int g1 = na ? a : b;
+
+        int s0 = story_exit(g0), s1 = story_exit(g1);
+        if (!s0 && !s1) continue;                      /* X 类不动 */
+
+        int dup = 0;
+        for (int k = 0; k < g_npairs; ++k)
+            if (g_pair[k].g0 == g0 && g_pair[k].g1 == g1) { dup = 1; break; }
+        if (dup) continue;
+
+        FLAT_PAIR* p = &g_pair[g_npairs++];
+        p->g0 = g0; p->g1 = g1; p->pid = pa;
+        p->both_story = (s0 && s1);
+        p->reg_n = 0; p->ex_start = 0; p->ex_n = 0;
     }
 
-    /* ---- 第二遍：找「最后的 Negate=1 门」（门17） ----
-     * v67 试过「从 _2_1 沿 OutPort.connections[1] 连走 5 步」，实测 0/5 步 ——
-     * 第一步就取不到 _2_1 的出边（虽然 _2_2.._2_6 的 OutPort 都取得到）。
-     * 所以改成不依赖入口节点、也不依赖类名的**条件扫描**：
-     *   遍历所有节点 → GetPort(nd,"conditionPort") 非空 → 其 connections[0] 就是条件节点
-     *   → 条件节点的 partnerID==10008 且 Negate==1 的那一个门就是门17。
-     * 为了不误判，再加一条结构判据：条件节点必须还有 "stateIn" 端口（需要伙伴 的特征端口名）。 */
-    void* gate_last = nullptr;
-    {
-        char cb2[64], nm2[96];
-        int logged = 0;
-        for (int i = 0; i < n && !gate_last; ++i) {
-            void* nd = litem(nodes, i);
-            if (!nd) continue;
-            /* 有效性校验：图里的每个节点的 Node.graph(0x18) 都指回这张图。
-             * 万一数组读偏了拿到别的东西，这一条能把它挡掉，不至于把垃圾当节点用。 */
-            if (*(void**)((char*)nd + OFF_NODE_GRAPH) != g) continue;
-            void* cp = node_port(nd, "conditionPort", 0);
-            if (!cp) continue;
-            void* cond = port_conn_node(cp, 0);
-            if (!cond) continue;
-            int pid = *(int*)((char*)cond + OFF_HP_PARTNER_ID);
-            int neg = (int)*(unsigned char*)((char*)cond + OFF_HP_NEGATE);
-            int has_statein = (node_port(cond, "stateIn", 0) != nullptr);
-            if (logged < 14) {
-                logged++;
-                cls_name(nd, cb2, sizeof(cb2));
-                unity_name(cond, nm2, sizeof(nm2));
-                LOGI("[flat] 带 conditionPort 的节点 类=%s  条件类/名=%s/%s pid=%d neg=%d stateIn=%s",
-                     cb2, cls_name(cond, cb2, sizeof(cb2)), nm2, pid, neg, has_statein ? "有" : "无");
+    if (g_npairs == 0) { flat_mark_done(g); return; }
+
+    /* ---------------- ② 每对算独占 region 与对外出口 ---------------- */
+    for (int k = 0; k < g_npairs; ++k) {
+        FLAT_PAIR* p = &g_pair[k];
+        p->reg_n = flat_region(k);
+        p->ex_start = g_nexit;
+        p->ex_n = 0;
+        if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION) continue;
+
+        unsigned char* reg = g_reg[k];
+        for (int i = 0; i < g_nnodes && g_nexit < FLAT_MAX_EDGES; ++i) {
+            if (reg[i] != 1) continue;
+            for (int e = 0; e < g_ec[i]; ++e) {
+                int ei = g_e0[i] + e;
+                if (reg[g_edge[ei].tgt] == 1) continue;      /* 内部边 */
+                if (g_edge[ei].tgt == p->g1) continue;       /* 已经接过去了 */
+                if (g_nexit >= FLAT_MAX_EDGES) break;
+                g_exit[g_nexit++] = ei;
+                p->ex_n++;
             }
-            if (pid == 10008 && neg == 1 && has_statein) gate_last = nd;
-            /* 讲解链上的条件 → 登记为「恒真」，不改字段（见文件头注释） */
-            for (int k2 = 0; k2 < FLAT_NEUTRAL_PIDS_N; ++k2)
-                if (pid == k_neutral_pids[k2]) { flat_add_cond(cond); break; }
         }
     }
 
-    /* 兜底：条件扫描没找到时，再试一次结构走链（v67 的方式） */
-    int walked = 0;
-    if (!gate_last) {
-        void* p = start;
-        for (int i = 0; i < FLAT_WALK_STEPS; ++i) {
-            void* op = node_port(p, "OutPort", 1);
-            int cc = port_conn_count(op);
-            void* nxt = port_conn_node(op, (cc >= 2) ? 1 : 0);
-            if (!nxt) break;
-            p = nxt;
-            walked++;
+    /* ---------------- ③ 逐对落地（先判冲突，再动手） ---------------- */
+    int expanded = 0, redirected = 0, skipped = 0;
+    for (int k = 0; k < g_npairs; ++k) {
+        FLAT_PAIR* p = &g_pair[k];
+        if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION || p->ex_n == 0) { skipped++; continue; }
+
+        /* 冲突：与另一对的 region 相交 → 这一对不动（另一对会在它自己那轮判） */
+        int clash = 0;
+        for (int q = 0; q < g_npairs && !clash; ++q) {
+            if (q == k) continue;
+            FLAT_PAIR* o = &g_pair[q];
+            if (o->reg_n == 0 || o->reg_n > FLAT_MAX_REGION) continue;
+            const unsigned char* ra = g_reg[k];
+            const unsigned char* rb = g_reg[q];
+            for (int i = 0; i < g_nnodes; ++i)
+                if (ra[i] == 1 && rb[i] == 1) { clash = 1; break; }
         }
-        if (walked == FLAT_WALK_STEPS) gate_last = p;
-        LOGI("[flat] 条件扫描没找到门17，改试结构走链：%d/%d 步", walked, FLAT_WALK_STEPS);
+        if (clash) { skipped++; continue; }
+
+        int ok = 0, bad = 0;
+        for (int e = 0; e < p->ex_n; ++e) {
+            FLAT_EDGE* ed = &g_edge[g_exit[p->ex_start + e]];
+            if (port_set_conn_node(ed->port, ed->slot, g_nd[p->g1])) ok++;
+            else bad++;
+        }
+        redirected += ok;
+
+        flat_add_cond(g_cond[p->g0]);
+        flat_add_cond(g_cond[p->g1]);
+
+        /* 只登记姓名窗口（改名的时机由播放状态驱动，见 story_play_begin/end） */
+        if (F_STORY) relax_name_open(p->pid, g);
+
+        expanded++;
+        if (g_log_pair < 60) {
+            g_log_pair++;
+            LOGI("[flat]   pid=%d (%s) 内容 %d 节点，改线 %d 条%s",
+                 p->pid, p->both_story ? "B 类" : "A 类", p->reg_n, ok,
+                 bad ? " ⚠部分失败" : "");
+        }
     }
 
-    /* ---- 第三遍：改连接 ---- */
-    int ok = 0, miss = 0;
-    for (int e = 0; e < FLAT_CHAIN_N; ++e) {
-        void* from = (e == 0) ? chain[0] : chain[e];
-        void* to;
-        if (e + 1 < FLAT_CHAIN_N) to = chain[e + 1];
-        else                      to = gate_last;
-        if (!from || !to) {
-            miss++;
-            if (g_flat_log < 12)
-                LOGI("[flat] 缺项 %s（源=%s 目标=%s）", k_chain_keys[e],
-                     from ? "有" : "无", to ? "有" : "无");
-            continue;
-        }
-        void* op = node_port(from, "OutPort", 1);
-        if (port_set_conn_node(op, 0, to)) ok++;
-        else {
-            miss++;
-            if (g_flat_log < 12)
-                LOGI("[flat] 缺项 %s 取不到 OutPort（连接数=%d）", k_chain_keys[e], port_conn_count(op));
-        }
+    flat_mark_done(g);
+
+    if (g_log_graph < FLAT_LOG_GRAPH) {
+        g_log_graph++;
+        LOGI("[flat] 图 %s：节点 %d，门对 %d，展开 %d（跳过 %d），改线 %d 条，接管条件 %d 个（累计）",
+             unity_name(g, gb, sizeof(gb)), g_nnodes, g_npairs, expanded, skipped,
+             redirected, g_flat_cond_n);
     }
-
-    /* ---- 第四遍：兜底门也必须恒真 ----
-     * 不改它的话：放宽关闭 + 凌梦蝶在队 → 门17 判假，而 _2_6 的出口已经指到它、
-     * 没有兄弟可回退 → 剧情永久卡死。
-     * v70 起不再改 partnerID/Negate 字段（那会破坏姓名显示），
-     * 改成把它的条件节点登记进「恒真」表。 */
-    int neu = 0;
-    if (gate_last) {
-        void* cp = node_port(gate_last, "conditionPort", 0);
-        void* cond = port_conn_node(cp, 0);
-        if (cond) { flat_add_cond(cond); neu = 1; }
-    }
-
-    flat_mark(g);
-    g_flat_log++;
-    LOGI("[flat] 图 %s 展开完成：改连 %d/%d，结构走链 %d/%d 步，兜底门=%s，接管条件 %d 个，缺 %d（共 %d 节点）",
-         gb, ok, FLAT_CHAIN_N, walked, FLAT_WALK_STEPS,
-         gate_last ? "有" : "无", g_flat_cond_n, miss, n);
-
-    /* v77：趁这个时机（很早，日志额度还没被刷屏的门对吃掉）把讲解链 5 个角色的
-     * 模板内容做一次只读体检 —— 直接回答「模板找得到吗 / 里面有没有真名」。 */
-    for (int i = 0; i < FLAT_NEUTRAL_PIDS_N; ++i) relax_name_probe(k_neutral_pids[i]);
-    /* 顺便把这 5 个名字窗口一起打开：后几位在剧情开始时可能没有实例，
-     * 等轮到各自的门才开窗口就晚了。 */
-    for (int i = 0; i < FLAT_NEUTRAL_PIDS_N; ++i) relax_name_open(k_neutral_pids[i], g);
 }

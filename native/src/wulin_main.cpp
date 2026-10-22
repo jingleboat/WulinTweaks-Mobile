@@ -940,10 +940,15 @@ void relax_name_probe(int uid) {
  * 窗口期间还要求「窗口是从同一张图记下来的」，所以只影响正在播的那条剧情里的角色，
  * 不会把全城被重判放宽的 NPC 都改名。 */
 static void*    g_play_graph = nullptr;   /* 正在播放的剧情图 */
+static char     g_play_name[96] = {0};    /* 它的图名（给 StoryCloseNode 比对用） */
 static uint64_t g_play_until = 0;
 static int      g_play_state = 0;
 static int      g_play_log = 0;
 #define PLAY_HARD_CAP_MS 180000ull        /* 单段 scenario 的上限兜底（防止 Continue 没来） */
+/* v80：节点之间的空档实测能到 1.8~19 秒（玩家读字 / 选项 / Hold 等待），
+ * 所以 Continue 只**续期**、不缩短窗口。缩到 400ms 会在空档里把名字还原掉，
+ * 屏幕上的气泡随即被刷成陌生名，下一段开始再改回来 —— 就是"先闪一下陌生名"。 */
+#define PLAY_IDLE_MS     30000ull
 
 static int playing_now(void) { return rn_now_ms() <= g_play_until; }
 
@@ -990,6 +995,12 @@ void story_play_begin(void* playNode) {
     void* g = *(void**)((char*)playNode + OFF_NODE_GRAPH);
     if ((uintptr_t)g < 0x10000) return;
     g_play_graph = g;
+    {
+        typedef void* (*fn_getname)(void*);
+        void* s = ((fn_getname)(g_base + RVA_GET_NAME))(g);
+        if ((uintptr_t)s > 0x10000) str_to_buf(s, g_play_name, sizeof(g_play_name));
+        else g_play_name[0] = 0;
+    }
     g_play_until = rn_now_ms() + PLAY_HARD_CAP_MS;
     g_play_state = 1;
     g_sync_last = rn_now_ms();
@@ -1000,7 +1011,17 @@ void story_play_begin(void* playNode) {
 void story_play_end(void) {
     if (!F_STORY) return;
     if (!playing_now()) return;
-    g_play_until = rn_now_ms() + 400;    /* 400ms 宽限：紧接着的节点可能还要读一次名字 */
+    /* v80：只续期、不缩短 —— 缩短会在段间空档里把名字还原掉（见 PLAY_IDLE_MS 注释） */
+    g_play_until = rn_now_ms() + PLAY_IDLE_MS;
+}
+
+/* v80：剧情**真正收尾**时立刻还原（StoryCloseNode.OnResult）。
+ * 没有它只能靠 PLAY_IDLE_MS 的空闲超时兜底，名字会多留几十秒。 */
+void story_play_end_now(void) {
+    if (!F_STORY) return;
+    g_play_until = 0;
+    g_play_state = 0;
+    rn_sync();
 }
 
 /* ---- v77：按 uid 提前登记 ----------------------------------------------
@@ -1088,8 +1109,9 @@ static void      (*orig_ssn_continue)(void* self, void* port) = nullptr;
 static int g_play_hook_log = 0;
 
 static void* hook_ssn_onactive(void* self) {
-    void* r = orig_ssn_onactive ? orig_ssn_onactive(self) : nullptr;
+    /* v80：先改名再调原函数 —— 气泡是在 OnActive 里生成的，放到之后就会先渲染一遍陌生名 */
     story_play_begin(self);
+    void* r = orig_ssn_onactive ? orig_ssn_onactive(self) : nullptr;
     if (g_play_hook_log++ < 15) {
         char kb[64] = {0};
         void* sk = ((uintptr_t)self > 0x10000) ? *(void**)((char*)self + 0x60) : nullptr;
@@ -1102,6 +1124,22 @@ static void* hook_ssn_onactive(void* self) {
 static void hook_ssn_continue(void* self, void* port) {
     if (orig_ssn_continue) orig_ssn_continue(self, port);
     story_play_end();
+}
+
+/* v80：剧情收尾（StoryCloseNode.OnResult）→ 立刻还原姓名。
+ * 只处理「图名与正在播的那张一致」的收尾，别让别的剧情收尾把当前窗口关掉。 */
+static void (*orig_scn_onresult)(void* self) = nullptr;
+static int g_close_log = 0;
+
+static void hook_scn_onresult(void* self) {
+    if (orig_scn_onresult) orig_scn_onresult(self);
+    if (!F_STORY || (uintptr_t)self < 0x10000) return;
+    char nb[96] = {0};
+    void* gn = *(void**)((char*)self + OFF_SCN_GRAPHNAME);
+    if ((uintptr_t)gn > 0x10000) str_to_buf(gn, nb, sizeof(nb));
+    if (!nb[0] || !g_play_name[0] || strcmp(nb, g_play_name) != 0) return;
+    if (g_close_log++ < 15) LOGI("[name] 剧情收尾（%s）→ 还原姓名", nb);
+    story_play_end_now();
 }
 
 static bool hook_check_joined(void* self, int io, void* line) {
@@ -1909,6 +1947,10 @@ static void install_tweaks() {
     if (hook_install("名字.播放结束", (void*)(g_base + RVA_SSN_CONTINUE),
                      (void*)hook_ssn_continue, (void**)&orig_ssn_continue)) {
         LOGI("名字: StoryScenarioNode.Continue 已挂 @ 0x%X", RVA_SSN_CONTINUE);
+    }
+    if (hook_install("名字.剧情收尾", (void*)(g_base + RVA_SCN_ONRESULT),
+                     (void*)hook_scn_onresult, (void**)&orig_scn_onresult)) {
+        LOGI("名字: StoryCloseNode.OnResult 已挂 @ 0x%X", RVA_SCN_ONRESULT);
     }
 
     /* v73：气泡入口直接改名 —— 这是唯一确认能把「熟悉后姓名」显示出来的位置 */
