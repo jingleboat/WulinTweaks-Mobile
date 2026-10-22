@@ -50,6 +50,7 @@ volatile int F_TRADE_TAKEALL = 1;
 volatile int F_MAP = 1;
 volatile int F_CAB = 1;
 volatile int F_STORY = 1;   /* v44 起默认开（此前是 0，每次启动要手动点） */
+volatile int F_FLAT = 1;    /* v65 剧情分支展开，默认开 */
 volatile int F_WATER = 1;
 
 fn_i2c_get A_domain_get = nullptr;
@@ -455,7 +456,14 @@ static void* g_char_mgr = nullptr;
 static uint64_t g_char_mgr_t = 0;
 #define CHAR_MGR_TTL_MS 60000
 
-static void char_mgr_reset(void) { g_char_mgr = nullptr; g_char_mgr_t = 0; }
+static void clear_relax_name_state(void);   /* 定义在「姓名」那一节 */
+static void char_mgr_reset(void) {
+    g_char_mgr = nullptr;
+    g_char_mgr_t = 0;
+    /* v63：换档/读档后旧的角色实例与它持有的字符串全部作废，名字缓存必须一起清，
+     * 否则 g_relax_stranger / g_relax_real 变悬空指针，而 90 秒窗口可能还开着。 */
+    clear_relax_name_state();
+}
 
 static void* char_mgr() {
     uint64_t now = rule_now_ms();
@@ -567,16 +575,61 @@ static int keep_original_for_uncached(void* condNode) {
  * 没碰就说明这个 Hold 与放宽无关，不该被压制 —— 否则会打断游戏设计的可重复剧情。 */
 static __thread int g_team_cond_hits = 0;
 
-/* ---- 剧情期间显示「熟悉后姓名」（v61） ----------------------------------
+/* ---- 剧情期间显示「熟悉后姓名」（v61 → v72 改多槽） ---------------------
  * 放宽之后剧情触发并不算"互动过一次"，所以那些角色仍是陌生名（@冷峻严肃的中年人），
- * 光看立绘分不清是谁的彩蛋。做法：放宽命中时记下「放过了谁」并开一个窗口，
- * 窗口内把这个角色的 FullName 换成 RealFullName —— 后者在陌生状态下会从模板
- * CharacterPoolData 拼 SurName + GivenName；若模板里也是空，再兜底回 NameAsStranger。 */
-static volatile int g_relax_uid = 0;
-static volatile uint64_t g_relax_until = 0;
-#define RELAX_NAME_WIN_MS 90000ull     /* 一场对话足够；每次放宽命中都会刷新 */
+ * 光看立绘分不清是谁的彩蛋。做法：放宽命中时记下「放过了谁」并开窗口，
+ * 窗口内把这个角色的姓名换成「熟悉后姓名」。
+ *
+ * ⚠️ v72 重写：原来是「单个全局 uid + 90 秒窗口」，实测被一个反复判定的门对钉死：
+ *      [name] 放宽命中登记 uid=10075 neg=0   ×30
+ *      [name] 放宽命中登记 uid=10033 neg=1   ×30
+ *      [name] getter uid=42155 窗口 uid=10075 → 跳过
+ *    某个 Hold 每帧重判一次，`uid=10075` 就每帧续命 → 窗口永远不换人 →
+ *    洛千雪之后所有讲解的姓名都换不出来。
+ *    v63 之所以看着能用，是那时只测了「只有一个放宽角色」的场景，单槽碰巧没撞车。
+ *
+ * 现在每个 uid 一个独立槽位 + 独立到期时间，刷屏的门对只能污染它自己那一格。 */
+#define RN_SLOTS 24
+typedef struct {
+    int      uid;
+    void*    stranger;   /* 该角色当前的陌生名（m_givenName，形如 @冷峻严肃的中年人） */
+    void*    real;       /* 要换成的「熟悉后姓名」 */
+    uint64_t until;      /* 到期时刻（ms） */
+    /* v75：数据层改名用 —— 直接把实例的 m_surName/m_givenName 换成真名，
+     * 这样**任何 UI 路径**读到的都是真名，不用再猜谁是显示 sink。 */
+    void*    renamed_inst;   /* 被改过名的角色实例（换档后指针失效，恢复时必须比对） */
+    void*    orig_sur;
+    void*    orig_given;
+    int      renamed;
+    /* v76：模板改名 —— 没有实例的角色（不在队/不在场景）只能从 CharacterPoolData 读名字，
+     * 直接改它的 NameAsStranger(0x20) 才是覆盖到位的做法。 */
+    void*    tpl;
+    void*    orig_tpl_stranger;
+    int      tpl_patched;
+    /* v79：这个窗口是从哪张剧情图记下来的。播放期间只改「同一张图」的角色，
+     * 避免把全城被重判放宽的 NPC 都改名。 */
+    void*    graph;
+} RN_SLOT;
+static RN_SLOT g_rn[RN_SLOTS];
+#define RELAX_NAME_WIN_MS 90000ull     /* 一场对话足够；每次放宽命中都会刷新那一格 */
 
-static void refresh_relax_names(void);   /* 定义在后面（需要 orig_realfullname） */
+static void refresh_rn_slot(int i);      /* 定义在后面（需要 orig_realfullname） */
+static void rn_apply_rename(int i);
+static void rn_patch_tpl(int i);
+static void rn_restore_tpl(int i);
+static void rn_restore_rename(int i);
+/* 长度合理性检查：il2cpp 字符串的 +0x10 是 int32 长度。
+ * 悬空/野指针读到的长度通常离谱，先挡掉，避免后面 memcmp 按巨大长度读越界。 */
+#define IL2STR_MAX_LEN 4096
+static int il2str_len_ok(void* s) {
+    if ((uintptr_t)s < 0x10000) return 0;
+    int l = *(int*)((char*)s + OFF_IL2STR_LEN);
+    return l >= 0 && l <= IL2STR_MAX_LEN;
+}
+static __thread int g_rn_busy = 0;       /* 防重入：见 story_real_name 的注释 */
+
+/* 兼容旧代码：最近一次命中放宽的 uid（只用于日志/调试） */
+static volatile int g_relax_uid = 0;
 
 static uint64_t rn_now_ms(void) {
     struct timespec ts;
@@ -584,49 +637,433 @@ static uint64_t rn_now_ms(void) {
     return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
+static int rn_find(int uid) {
+    if (uid <= 0) return -1;
+    for (int i = 0; i < RN_SLOTS; ++i)
+        if (g_rn[i].uid == uid) return i;
+    return -1;
+}
+
+static int rn_alloc(int uid) {
+    for (int i = 0; i < RN_SLOTS; ++i)
+        if (g_rn[i].uid == uid) return i;
+    for (int i = 0; i < RN_SLOTS; ++i)
+        if (g_rn[i].uid == 0) { g_rn[i].uid = uid; return i; }
+    /* 满了：踢掉最早到期的 */
+    int worst = 0;
+    for (int i = 1; i < RN_SLOTS; ++i)
+        if (g_rn[i].until < g_rn[worst].until) worst = i;
+    g_rn[worst].uid = uid;
+    g_rn[worst].stranger = nullptr;
+    g_rn[worst].real = nullptr;
+    g_rn[worst].until = 0;
+    return worst;
+}
+
 /* 条件节点里记下"这次放宽放过了谁"。条件节点自身的 partnerID 偏移与角色实例不同：
- * ConditionNode(IsJoinedTeam/HavePartner).partnerID = +0x58（见 OFF_PARTNER_ID）。 */
+ * ConditionNode(IsJoinedTeam/HavePartner).partnerID = +0x58（见 OFF_PARTNER_ID）。
+ *
+ * v79：**只登记，不改名**。改名改由「剧情真正播放」驱动（见 story_play_begin/end）——
+ * 因为游戏会按几十上百次/秒重判所有开启事件的 Hold 条件，如果在登记时就直接改名，
+ * 全城被放宽的 NPC 都会顶着真名，远超出「剧情播放期间」的语义。 */
 static void mark_relaxed(void* condNode) {
     if ((uintptr_t)condNode < 0x10000) return;
     int pid = *(int*)((char*)condNode + OFF_PARTNER_ID);
-    int neg = *(int*)((char*)condNode + OFF_PARTNER_NEGATE);
+    int neg = (int)*(unsigned char*)((char*)condNode + OFF_PARTNER_NEGATE);
     if (pid <= 0 || neg) return;            /* 只记「要求某人在队」这一侧被放宽的 */
-    if (pid != g_relax_uid) refresh_relax_names();   /* 换了人 → 重新取陌生名/真名 */
+    int i = rn_alloc(pid);
+    if (i < 0) return;
+    void* g = *(void**)((char*)condNode + OFF_NODE_GRAPH);
+    if ((uintptr_t)g > 0x10000) g_rn[i].graph = g;
+    g_rn[i].until = rn_now_ms() + RELAX_NAME_WIN_MS;
     g_relax_uid = pid;
-    g_relax_until = rn_now_ms() + RELAX_NAME_WIN_MS;
 }
 
 static void* (*orig_fullname)(void* self) = nullptr;
 static void* (*orig_fullname_title)(void* self) = nullptr;
 static void* (*orig_realfullname)(void* self) = nullptr;
 static int g_rn_log = 0;
+/* v77：分类独立额度。v76 的教训：共用 60 条额度被「每帧重判的门对」吃光，
+ * 后面真正关心的日志全被吞掉，看起来像"没生效"。 */
+static int g_log_rename = 0;
+static int g_log_tpl = 0;
+static int g_log_ready = 0;
+static int g_rn_skip = 0;   /* v71 诊断：getter 被调但不在窗口里的次数 */
 
 static int str_empty(void* s) {
     return ((uintptr_t)s < 0x10000) || *(int*)((char*)s + OFF_IL2STR_LEN) == 0;
 }
 
-/* 剧情窗口内，被放宽的那个角色返回"熟悉后姓名" */
-static void* story_real_name(void* self) {
-    if (!F_STORY || !g_relax_uid || rn_now_ms() > g_relax_until) return nullptr;
-    if ((uintptr_t)self < 0x10000) return nullptr;
-    if (*(int*)((char*)self + OFF_GCI_TPL_UID) != g_relax_uid) return nullptr;
-    if (!orig_realfullname) return nullptr;
+/* 取「熟悉后姓名」的分层兜底，全部基于传入的角色实例 self（不查管理器、不依赖缓存）：
+ *   ① get_RealFullName —— 陌生状态下会从模板拼 SurName + GivenName
+ *   ② 模板正式名 CharacterPoolData.name(+0x18)
+ *   ③ 陌生名本身（宁可显示 @xxx 也不要空）
+ * v71：补了 ② —— 老版本 ① 空就直接退 ③，等于什么都没换。 */
+static void* real_name_of(void* self, const char** how) {
+    if ((uintptr_t)self < 0x10000) { if (how) *how = "无实例"; return nullptr; }
 
-    void* real = orig_realfullname(self);
-    if (!str_empty(real)) {
-        if (g_rn_log++ < 20) LOGI("[name] uid=%d 剧情期间显示熟悉后姓名", g_relax_uid);
-        return real;
+    if (orig_realfullname && !g_rn_busy) {
+        g_rn_busy = 1;
+        void* real = orig_realfullname(self);
+        g_rn_busy = 0;
+        if (!str_empty(real)) { if (how) *how = "RealFullName"; return real; }
     }
-    /* 模板里姓/名也空 → 兜底用陌生名（宁可显示 @xxx 也不要空） */
     void* tpl = *(void**)((char*)self + OFF_GCI_TEMPLATE);
     if ((uintptr_t)tpl > 0x10000) {
+        void* nm = *(void**)((char*)tpl + OFF_CPD_NAME);
+        if (!str_empty(nm)) { if (how) *how = "模板正式名"; return nm; }
         void* s = *(void**)((char*)tpl + OFF_CPD_NAME_STRANGER);
-        if (!str_empty(s)) {
-            if (g_rn_log++ < 20) LOGI("[name] uid=%d 真名为空 → 回退陌生名", g_relax_uid);
-            return s;
+        if (!str_empty(s)) { if (how) *how = "回退陌生名"; return s; }
+    }
+    if (how) *how = "模板为空";
+    return nullptr;
+}
+
+/* 刷新第 i 个槽位缓存的陌生名/真名（供 swap_if_stranger 的字符串比对用） */
+static void refresh_rn_slot(int i) {
+    if (i < 0 || i >= RN_SLOTS) return;
+    g_rn[i].stranger = nullptr;
+    g_rn[i].real = nullptr;
+    int uid = g_rn[i].uid;
+    if (uid <= 0) return;
+
+    void* m = char_mgr();
+    if ((uintptr_t)m < 0x10000) return;
+    typedef void* (*fn_getchar)(void*, int);
+    void* c = ((fn_getchar)(g_base + RVA_GET_CHARACTER))(m, uid);
+    if ((uintptr_t)c < 0x10000) return;
+
+    void* stranger = *(void**)((char*)c + OFF_GCI_GIVENNAME);      /* 陌生名 = @xxx */
+    const char* how = "?";
+    void* real = real_name_of(c, &how);
+    if (str_empty(stranger) || str_empty(real)) return;
+    g_rn[i].stranger = stranger;
+    g_rn[i].real = real;
+    if (g_log_ready < 20) {
+        g_log_ready++;
+        char rb[64];
+        str_to_buf(real, rb, sizeof(rb));
+        LOGI("[name] uid=%d 已就绪：熟悉后姓名=\"%s\"（%s）", uid, rb, how);
+    }
+}
+
+/* ---- v75：数据层改名 ----------------------------------------------------
+ * v74 的否证：TalkMessageNode.GetNpcNameRuntime 与 NpcTalkingBubble.Init 各 0 次调用，
+ * 但 get_FullName 被调 30 次且已返回真名 —— 说明显示走的是第三条路。
+ * 与其继续猜 sink，直接把角色实例身上的 m_surName(0xA8) / m_givenName(0xB0)
+ * 换成真名的姓/名。改成之后 get_IsUsingStangerName 会判为「不是陌生名」，
+ * 任何 UI（头顶名、对话框、名册、关系面板…）都只能读到真名。
+ * 到期时按记录的原始指针还原；实例指针变了（换档）就不还原，避免写已释放对象。 */
+static void rn_apply_rename(int i) {
+    if (i < 0 || i >= RN_SLOTS) return;
+    int uid = g_rn[i].uid;
+    if (uid <= 0) return;
+
+    void* m = char_mgr();
+    if ((uintptr_t)m < 0x10000) return;
+    typedef void* (*fn_getchar)(void*, int);
+    void* c = ((fn_getchar)(g_base + RVA_GET_CHARACTER))(m, uid);
+    if ((uintptr_t)c < 0x10000) return;
+
+    void* tpl = *(void**)((char*)c + OFF_GCI_TEMPLATE);
+    if ((uintptr_t)tpl < 0x10000) return;
+
+    /* v78 快路径：已经改过名、而且给定的名字确实不再是陌生名（不带 @ 前缀）→ 直接返回。
+     * 游戏会按几十上百次/秒的节奏重判 Hold 条件，每次都走完整流程纯属浪费。 */
+    if (g_rn[i].renamed && g_rn[i].renamed_inst == c) {
+        void* g0 = *(void**)((char*)c + OFF_GCI_GIVENNAME);
+        if (il2str_len_ok(g0)) {
+            int L0 = *(int*)((char*)g0 + OFF_IL2STR_LEN);
+            const unsigned short* p0 = (const unsigned short*)((char*)g0 + OFF_IL2STR_CHARS);
+            if (L0 > 0 && p0[0] != 0x40) return;
         }
     }
+
+    void* sur = *(void**)((char*)tpl + OFF_CPD_SURNAME);
+    void* giv = *(void**)((char*)tpl + OFF_CPD_GIVENNAME);
+    if (str_empty(sur) && str_empty(giv)) {
+        /* 模板里姓/名都空 → 用正式全名充当名（SurName 置空串，FullName 拼接不会炸） */
+        void* nm = *(void**)((char*)tpl + OFF_CPD_NAME);
+        if (str_empty(nm)) return;
+        giv = nm;
+    }
+    if (str_empty(giv)) return;
+    /* 模板的 GivenName 若本身还是陌生名（以 @ 开头），不动 */
+    if (il2str_len_ok(giv)) {
+        int L = *(int*)((char*)giv + OFF_IL2STR_LEN);
+        const unsigned short* p = (const unsigned short*)((char*)giv + OFF_IL2STR_CHARS);
+        if (L > 0 && p[0] == 0x40) return;
+    }
+
+    /* 第一次动这个实例：记下原始值 */
+    int was_renamed = (g_rn[i].renamed && g_rn[i].renamed_inst == c);
+    if (!was_renamed) {
+        g_rn[i].renamed_inst = c;
+        g_rn[i].orig_sur = *(void**)((char*)c + OFF_GCI_SURNAME);
+        g_rn[i].orig_given = *(void**)((char*)c + OFF_GCI_GIVENNAME);
+        g_rn[i].renamed = 1;
+    }
+
+    void* empty = A_string_new ? A_string_new("") : nullptr;
+    *(void**)((char*)c + OFF_GCI_SURNAME) = str_empty(sur) ? empty : sur;
+    *(void**)((char*)c + OFF_GCI_GIVENNAME) = giv;
+
+    /* v77：只在「首次改名」时记一条 —— 刷屏的门对每帧都会走到这里，
+     * 共用计数器会被它吃光（v76 就是这么把后面所有日志吞掉的）。 */
+    if (!was_renamed && g_log_rename < 12) {
+        g_log_rename++;
+        char sb[32], gb2[48];
+        str_to_buf(*(void**)((char*)c + OFF_GCI_SURNAME), sb, sizeof(sb));
+        str_to_buf(giv, gb2, sizeof(gb2));
+        LOGI("[name] uid=%d 已把实例姓名改成 \"%s%s\"（数据层）", uid, sb, gb2);
+    }
+}
+
+/* ---- v76：按 uid 找角色模板 CharacterPoolData --------------------------
+ * 关键认识（用户实测给出）：多人链里洛天雄/裘之墨/凌梦蝶 **没有角色实例**（不在队也不在场景），
+ * 所以 GetCharacter(uid) 返回 null，改实例字段全部落空；游戏只能从模板上取名字，
+ * 而模板的 NameAsStranger(0x20) 正是「@冷峻严肃的中年人」。
+ * 用 Resources.FindObjectsOfTypeAll(Type) 枚举全部模板，按 Uid(0x10) 匹配 —— 不改任何游戏状态。 */
+static void* tpl_by_uid(int uid) {
+    if (uid <= 0) return nullptr;
+    /* v78：类指针缓存。mark_relaxed 会被游戏的重判节奏反复调用（每秒几十上百次），
+     * 以前每次都 find_class → 136 个程序集逐个 il2cpp_class_from_name，纯浪费。
+     * 而且实测这类模板不是 UnityEngine.Object，Resources.FindObjectsOfTypeAll 找不到它，
+     * 所以查不到就记下「不可用」，之后一次指针比较就返回。 */
+    static void* k_cpd = nullptr;
+    static int k_cpd_state = 0;          /* 0=未查 1=可用 2=不可用 */
+    if (k_cpd_state == 2) return nullptr;
+    if (k_cpd_state == 0) {
+        k_cpd = find_class("GameData", "CharacterPoolData");   /* ⚠️ 是 GameData，不是 WuLin */
+        k_cpd_state = k_cpd ? 1 : 2;
+    }
+    if (!k_cpd) return nullptr;
+    void* t = class_type(k_cpd);
+    if (!t) return nullptr;
+    typedef void* (*fn_all)(void*, void*);
+    void* arr = ((fn_all)(g_base + RVA_FIND_OBJECTS_ALL))(t, nullptr);
+    if ((uintptr_t)arr < 0x10000) return nullptr;
+    int n = *(int*)((char*)arr + 0x18);             /* il2cpp 数组 max_length */
+    if (n <= 0 || n > 200000) return nullptr;
+    for (int i = 0; i < n; ++i) {
+        void* o = *(void**)((char*)arr + OFF_ARRAY_DATA + (size_t)i * 8);
+        if ((uintptr_t)o < 0x10000) continue;
+        if (*(int*)((char*)o + OFF_CPD_UID) == uid) return o;
+    }
     return nullptr;
+}
+
+/* 把模板的 NameAsStranger 换成「真姓 + 真名」 */
+static void rn_patch_tpl(int i) {
+    if (i < 0 || i >= RN_SLOTS) return;
+    int uid = g_rn[i].uid;
+    if (uid <= 0) return;
+
+    void* tpl = (g_rn[i].tpl_patched) ? g_rn[i].tpl : tpl_by_uid(uid);
+    if ((uintptr_t)tpl < 0x10000) return;
+
+    if (!g_rn[i].tpl_patched) {
+        g_rn[i].tpl = tpl;
+        g_rn[i].orig_tpl_stranger = *(void**)((char*)tpl + OFF_CPD_NAME_STRANGER);
+        g_rn[i].tpl_patched = 1;
+    }
+
+    char sb[64] = {0}, nb[64] = {0}, full[160];
+    str_to_buf(*(void**)((char*)tpl + OFF_CPD_SURNAME), sb, sizeof(sb));
+    str_to_buf(*(void**)((char*)tpl + OFF_CPD_GIVENNAME), nb, sizeof(nb));
+    if (!sb[0] && !nb[0]) str_to_buf(*(void**)((char*)tpl + OFF_CPD_UNAME), nb, sizeof(nb));
+    if (!sb[0] && !nb[0]) {
+        if (g_log_tpl < 20) { g_log_tpl++; LOGI("[name] uid=%d 模板无姓无名，跳过", uid); }
+        return;
+    }
+    int o = 0;
+    for (const char* p = sb; *p && o < (int)sizeof(full) - 1; ++p) full[o++] = *p;
+    for (const char* p = nb; *p && o < (int)sizeof(full) - 1; ++p) full[o++] = *p;
+    full[o] = 0;
+
+    void* ns = A_string_new ? A_string_new(full) : nullptr;
+    if ((uintptr_t)ns < 0x10000) return;
+    *(void**)((char*)tpl + OFF_CPD_NAME_STRANGER) = ns;
+
+    if (g_log_tpl < 20) {
+        g_log_tpl++;
+        char ob[64] = {0};
+        str_to_buf(g_rn[i].orig_tpl_stranger, ob, sizeof(ob));
+        LOGI("[name] uid=%d 模板陌生名 \"%s\" -> \"%s\"", uid, ob, full);
+    }
+}
+
+static void rn_restore_tpl(int i) {
+    if (i < 0 || i >= RN_SLOTS) return;
+    if (!g_rn[i].tpl_patched) return;
+    if ((uintptr_t)g_rn[i].tpl > 0x10000)
+        *(void**)((char*)g_rn[i].tpl + OFF_CPD_NAME_STRANGER) = g_rn[i].orig_tpl_stranger;
+    g_rn[i].tpl_patched = 0;
+    g_rn[i].tpl = nullptr;
+}
+
+/* ---- v77：只读体检（不改任何东西）-------------------------------------
+ * 在「分支展开」打补丁的那一刻，把讲解链 5 个角色的模板内容全打出来。
+ * 这个时机很早、日志额度还没被刷屏的门对吃掉，所以结论可信：
+ *   模板有没有找到 / 姓什么 / 名什么 / 陌生时姓名是什么 / 实例存不存在
+ * v76 的教训：find_class 命名空间写错（CharacterPoolData 在 GameData 下），
+ * 导致 tpl_by_uid 恒为 null，而日志上限又被 10075 吃光，看起来像"没生效"。 */
+static int g_probe_log = 0;
+void relax_name_probe(int uid) {
+    if (uid <= 0) return;
+    if (g_probe_log >= 20) return;
+    g_probe_log++;
+
+    void* tpl = tpl_by_uid(uid);
+    char sb[48] = {0}, nb[48] = {0}, xb[64] = {0}, ub[64] = {0};
+    if ((uintptr_t)tpl > 0x10000) {
+        str_to_buf(*(void**)((char*)tpl + OFF_CPD_SURNAME), sb, sizeof(sb));
+        str_to_buf(*(void**)((char*)tpl + OFF_CPD_GIVENNAME), nb, sizeof(nb));
+        str_to_buf(*(void**)((char*)tpl + OFF_CPD_NAME_STRANGER), xb, sizeof(xb));
+        str_to_buf(*(void**)((char*)tpl + OFF_CPD_UNAME), ub, sizeof(ub));
+    }
+    void* inst = nullptr;
+    void* m = char_mgr();
+    if ((uintptr_t)m > 0x10000) {
+        typedef void* (*fn_getchar)(void*, int);
+        inst = ((fn_getchar)(g_base + RVA_GET_CHARACTER))(m, uid);
+    }
+    LOGI("[probe] uid=%d 模板=%s 实例=%s 姓=\"%s\" 名=\"%s\" 陌生名=\"%s\" UName=\"%s\"",
+         uid, ((uintptr_t)tpl > 0x10000) ? "有" : "无",
+         ((uintptr_t)inst > 0x10000) ? "有" : "无", sb, nb, xb, ub);
+}
+
+/* ---- v79：只在「剧情真正播放」期间改名 ----------------------------------
+ * 起止点用 StoryScenarioNode（剧情图里的「播放剧情」节点）：
+ *     OnActive()            0x3DA0730  开始播
+ *     Continue(string)      0x3DA0798  播完
+ * 窗口期间还要求「窗口是从同一张图记下来的」，所以只影响正在播的那条剧情里的角色，
+ * 不会把全城被重判放宽的 NPC 都改名。 */
+static void*    g_play_graph = nullptr;   /* 正在播放的剧情图 */
+static uint64_t g_play_until = 0;
+static int      g_play_state = 0;
+static int      g_play_log = 0;
+#define PLAY_HARD_CAP_MS 180000ull        /* 单段 scenario 的上限兜底（防止 Continue 没来） */
+
+static int playing_now(void) { return rn_now_ms() <= g_play_until; }
+
+/* 窗口有效 且 属于当前正在播的图 */
+static int rn_live_playing(int uid) {
+    if (!playing_now()) return 0;
+    int i = rn_find(uid);
+    if (i < 0 || rn_now_ms() > g_rn[i].until) return 0;
+    if (!g_rn[i].graph || g_rn[i].graph != g_play_graph) return 0;
+    return 1;
+}
+
+/* 按「播放状态」同步改名：该改的改、该还原的还原 */
+static void rn_sync(void) {
+    int playing = playing_now();
+    for (int i = 0; i < RN_SLOTS; ++i) {
+        if (g_rn[i].uid <= 0) continue;
+        int want = playing && rn_now_ms() <= g_rn[i].until &&
+                   g_rn[i].graph && g_rn[i].graph == g_play_graph;
+        if (want) {
+            if (!g_rn[i].stranger || !g_rn[i].real) refresh_rn_slot(i);
+            rn_apply_rename(i);
+            rn_patch_tpl(i);
+        } else if (g_rn[i].renamed || g_rn[i].tpl_patched) {
+            rn_restore_rename(i);
+            rn_restore_tpl(i);
+        }
+    }
+}
+
+/* 播放状态变化检测（挂在很热的 hook 上，250ms 节流 + 只在状态真的变了才做事） */
+static uint64_t g_sync_last = 0;
+static void rn_maybe_sync(void) {
+    if (!F_STORY) return;
+    uint64_t now = rn_now_ms();
+    if (now - g_sync_last < 250) return;
+    g_sync_last = now;
+    int playing = playing_now();
+    if (playing != g_play_state) { g_play_state = playing; rn_sync(); }
+}
+
+void story_play_begin(void* playNode) {
+    if (!F_STORY || (uintptr_t)playNode < 0x10000) return;
+    void* g = *(void**)((char*)playNode + OFF_NODE_GRAPH);
+    if ((uintptr_t)g < 0x10000) return;
+    g_play_graph = g;
+    g_play_until = rn_now_ms() + PLAY_HARD_CAP_MS;
+    g_play_state = 1;
+    g_sync_last = rn_now_ms();
+    if (g_play_log++ < 20) LOGI("[name] 开始播放剧情，名字切换只作用于这张图");
+    rn_sync();
+}
+
+void story_play_end(void) {
+    if (!F_STORY) return;
+    if (!playing_now()) return;
+    g_play_until = rn_now_ms() + 400;    /* 400ms 宽限：紧接着的节点可能还要读一次名字 */
+}
+
+/* ---- v77：按 uid 提前登记 ----------------------------------------------
+ * 由 flatten.cpp 在给剧情图打补丁时调用（很早）。v79 起这里**只登记不改名**，
+ * 改名完全交给播放状态驱动。 */
+#define PRE_OPEN_WIN_MS 300000ull
+void relax_name_open(int uid, void* graph) {
+    if (!F_STORY || uid <= 0) return;
+    int i = rn_alloc(uid);
+    if (i < 0) return;
+    if ((uintptr_t)graph > 0x10000) g_rn[i].graph = graph;
+    g_rn[i].until = rn_now_ms() + PRE_OPEN_WIN_MS;
+}
+
+static void rn_restore_rename(int i) {
+    if (i < 0 || i >= RN_SLOTS) return;
+    if (!g_rn[i].renamed || (uintptr_t)g_rn[i].renamed_inst < 0x10000) return;
+    int uid = g_rn[i].uid;
+
+    /* 只还原「同一个实例」：换档后旧实例已释放，写它就是 use-after-free */
+    void* m = char_mgr();
+    if ((uintptr_t)m < 0x10000) return;
+    typedef void* (*fn_getchar)(void*, int);
+    void* c = ((fn_getchar)(g_base + RVA_GET_CHARACTER))(m, uid);
+    if (c != g_rn[i].renamed_inst) { g_rn[i].renamed = 0; return; }
+
+    *(void**)((char*)c + OFF_GCI_SURNAME) = g_rn[i].orig_sur;
+    *(void**)((char*)c + OFF_GCI_GIVENNAME) = g_rn[i].orig_given;
+    g_rn[i].renamed = 0;
+    if (g_rn_log < 60) { g_rn_log++; LOGI("[name] uid=%d 姓名已还原", uid); }
+}
+
+/* 剧情窗口内，被放宽的那个角色返回"熟悉后姓名"。
+ *
+ * ⚠️ 必须防重入（v63）：get_RealFullName 在「没有用陌生名」时会**尾调 get_FullNameWithTitle**，
+ * 而后者被 hook_fullname_title 拦着 —— 于是
+ *     hook_fullname_title → story_real_name → get_RealFullName → get_FullNameWithTitle
+ *       → hook_fullname_title → … 无限递归，栈溢出直接崩（跟 v62 那个 TMP 崩溃是同一类死法）。
+ * 线程局部标志一置，内层立刻返回，原版正常拼名字返回。 */
+
+static void* story_real_name(void* self) {
+    if (!F_STORY || (uintptr_t)self < 0x10000) return nullptr;
+    int uid = *(int*)((char*)self + OFF_GCI_TPL_UID);
+    if (uid <= 0) return nullptr;
+
+    /* v79：只在「剧情真正播放中」且该角色属于正在播的那张图时才替换 */
+    if (!rn_live_playing(uid)) {
+        if (g_rn_skip < 24) {
+            g_rn_skip++;
+            LOGI("[name] getter uid=%d 不在播放窗口里 → 跳过", uid);
+        }
+        return nullptr;
+    }
+
+    const char* how = "?";
+    void* real = real_name_of(self, &how);
+    if (!real) { if (g_rn_log++ < 60) LOGI("[name] uid=%d 无可用真名（%s）", uid, how); return nullptr; }
+    if (g_rn_log++ < 60) {
+        char rb[64];
+        str_to_buf(real, rb, sizeof(rb));
+        LOGI("[name] uid=%d 显示 \"%s\"（%s）", uid, rb, how);
+    }
+    return real;
 }
 
 static void* hook_fullname(void* self) {
@@ -641,8 +1078,42 @@ static void* hook_fullname_title(void* self) {
     return orig_fullname_title ? orig_fullname_title(self) : nullptr;
 }
 
+/* ---- v79：剧情播放的起止钩子 --------------------------------------------
+ * StoryScenarioNode 就是剧情图里的「播放剧情」节点：
+ *   OnActive()            0x3DA0730  开始播这段 scenario → 打开「播放中」状态
+ *   Continue(string)      0x3DA0798  播完走向下一个节点 → 400ms 后关闭
+ * 只有「播放中」且窗口来自同一张图时，才把角色姓名换成熟悉后姓名。 */
+static void* (*orig_ssn_onactive)(void* self) = nullptr;
+static void      (*orig_ssn_continue)(void* self, void* port) = nullptr;
+static int g_play_hook_log = 0;
+
+static void* hook_ssn_onactive(void* self) {
+    void* r = orig_ssn_onactive ? orig_ssn_onactive(self) : nullptr;
+    story_play_begin(self);
+    if (g_play_hook_log++ < 15) {
+        char kb[64] = {0};
+        void* sk = ((uintptr_t)self > 0x10000) ? *(void**)((char*)self + 0x60) : nullptr;
+        if ((uintptr_t)sk > 0x10000) str_to_buf(sk, kb, sizeof(kb));
+        LOGI("[name] 播放开始 ScenarioKey=%s", kb);
+    }
+    return r;
+}
+
+static void hook_ssn_continue(void* self, void* port) {
+    if (orig_ssn_continue) orig_ssn_continue(self, port);
+    story_play_end();
+}
+
 static bool hook_check_joined(void* self, int io, void* line) {
     g_team_cond_hits++;
+    flatten_try(self);                      /* v65：顺手把「分支展开」补丁套到这张图上（只做一次） */
+    /* v70：被「分支展开」接管的条件恒真。用基类实现 = 丢掉这一个条件，
+     * 但 partnerID/Negate 原值仍在，下面 mark_relaxed 才能继续为「姓名替换」开窗口。 */
+    if (flatten_cond_always_true(self)) {
+        mark_relaxed(self);
+        if (base_check_all) return base_check_all(self, io, line);
+        return true;
+    }
     if (F_STORY && base_check_all && !keep_original_for(self)) {
         mark_relaxed(self);                 /* v61：记下"这次放宽放过了谁"，用于显示真名 */
         return base_check_all(self, io, line);
@@ -652,6 +1123,12 @@ static bool hook_check_joined(void* self, int io, void* line) {
 
 static bool hook_check_partner(void* self, int io, void* line) {
     g_team_cond_hits++;
+    flatten_try(self);
+    if (flatten_cond_always_true(self)) {
+        mark_relaxed(self);
+        if (base_check_all) return base_check_all(self, io, line);
+        return true;
+    }
     if (F_STORY && base_check_all && !keep_original_for(self)) {
         mark_relaxed(self);
         return base_check_all(self, io, line);
@@ -691,7 +1168,14 @@ static void* ptm_quick(void) {
     return g_ptm_q;
 }
 
-/* 把队伍里的角色 id 拷进 out，返回人数；拿不到返回 -1（此时一律走原版，不做干预） */
+/* 把队伍里的角色 id 拷进 out，返回人数；拿不到返回 -1（此时一律走原版，不做干预）
+ *
+ * ⚠️ v70 修正：`_items` 指向的是 il2cpp **数组对象**，元素从 +0x20 开始
+ * （klass 0x00 | monitor 0x08 | bounds 0x10 | max_length 0x18 | 元素 0x20）。
+ * 老代码直接 `int* arr = (int*)items` 从对象头读，读到的是 bounds 指针的高低半字
+ * 和 max_length，只有从 [3] 起才勉强对上元素 —— 于是 team_has() 一直在和垃圾比对，
+ * 几乎总返回「不在队」。之前「离队容错」看似正常，是因为那两次角色本来就不在队。
+ */
 static int team_ids(int* out, int cap) {
     void* m = ptm_quick();
     if ((uintptr_t)m < 0x10000) return -1;
@@ -704,7 +1188,7 @@ static int team_ids(int* out, int cap) {
     int n = *(int*)((char*)lst + OFF_LIST_SIZE);
     void* items = *(void**)((char*)lst + OFF_LIST_ITEMS);
     if ((uintptr_t)items < 0x10000 || n < 0 || n > 32) return -1;
-    int* arr = (int*)items;
+    int* arr = (int*)((char*)items + OFF_ARRAY_DATA);
     int k = 0;
     for (int i = 0; i < n && k < cap; ++i) out[k++] = arr[i];
     return n;
@@ -760,56 +1244,83 @@ static void hook_change_partner(void* self) {
     if (orig_change_partner) orig_change_partner(self);
 }
 
-/* ---- 主界面「鸣谢」按钮改字（v59） --------------------------------------
- * v58 只 hook 了 set_text，实测一次都没命中 —— 说明那按钮的文字是**预制体里写死的**，
- * 创建时直接赋 m_Text(+0xE0)，根本不过 setter。所以改在 get_text（渲染时读）上：
- * 读到「鳴謝 / 鸣谢」就换成 "mod"。get_text 只是 ldr [x0+0xE0]; ret，hook 成本很低，
- * 且只按长度先挡掉，99% 的调用就一次内存读。
- * set_text 那一路保留着（万一别处确实走 setter）。 */
-static void (*orig_text_set)(void* self, void* str) = nullptr;
-static void* (*orig_text_get)(void* self) = nullptr;
+/* ---- 主界面「鸣谢」按钮改字（v59/v60，v63 收口） -------------------------
+ * 历史：v58 hook UGUI Text.set_text —— 一次没命中；v59 加 get_text —— 还是没命中；
+ * v60 才确认那按钮是 TMPro.TMP_Text。
+ *
+ * v63 实测日志：`[ui] 鸣谢按钮文字 -> mod（TMP set_text）` —— 干活的一直是 TMP set_text。
+ *
+ * 于是把两条 UGUI Text 的 hook 全撤了，原因不只是「没用」：
+ *   UnityEngine.UI.Text.get_text  0x4B9A414   ← 只有 8 字节
+ *   UnityEngine.UI.Text.set_text  0x4B9A41C   ← 紧挨着，相距 8 字节
+ * 补丁固定 16 字节，装 get 时把 set_text 开头写成自己的字面量（目标地址），
+ * 再装 set 又把那个字面量覆盖成指令字节 → 一旦有人调 get_text 就 br 到
+ * 0xD63F020058000070，必崩。游戏全程只用 TMP，所以这颗雷一直没响。
+ * 留着没有任何收益，只有风险，删掉。 */
 static void* g_mod_str = nullptr;
 static int g_thx_log = 0;
 
 /* ---- v62：文本层替换「陌生名 → 熟悉后姓名」 ----------------------------
- * 不去猜对话框到底调 FullName 还是 GivenName：名字最终一定进 Text/TMP 的 set_text，
+ * 不去猜对话框到底调 FullName 还是 GivenName：名字最终一定进 TMP 的 set_text，
  * 所以在 set_text 入口按字符串比对替换，最稳。
  * 只替换「被放宽的那个角色」的陌生名（m_givenName，形如 @冷峻严肃的中年人），
  * 其它文本一律原样放行。 */
-static void* g_relax_stranger = nullptr;   /* 该角色的陌生名字符串 */
-static void* g_relax_real = nullptr;       /* 该角色的熟悉后姓名字符串 */
 
 static int il2str_eq(void* a, void* b) {
     if (a == b) return 1;
-    if ((uintptr_t)a < 0x10000 || (uintptr_t)b < 0x10000) return 0;
+    if (!il2str_len_ok(a) || !il2str_len_ok(b)) return 0;
     int la = *(int*)((char*)a + OFF_IL2STR_LEN);
     int lb = *(int*)((char*)b + OFF_IL2STR_LEN);
     if (la != lb) return 0;
     return memcmp((char*)a + OFF_IL2STR_CHARS, (char*)b + OFF_IL2STR_CHARS, (size_t)la * 2) == 0;
 }
 
-static void refresh_relax_names(void) {
-    g_relax_stranger = nullptr;
-    g_relax_real = nullptr;
-    if (g_relax_uid <= 0) return;
-    void* m = char_mgr();
-    if ((uintptr_t)m < 0x10000) return;
-    typedef void* (*fn_getchar)(void*, int);
-    void* c = ((fn_getchar)(g_base + RVA_GET_CHARACTER))(m, g_relax_uid);
-    if ((uintptr_t)c < 0x10000) return;
-    g_relax_stranger = *(void**)((char*)c + OFF_GCI_GIVENNAME);   /* 陌生名 = @xxx */
-    if (orig_realfullname) g_relax_real = orig_realfullname(c);
-    if (str_empty(g_relax_real)) g_relax_real = nullptr;
-    if (g_rn_log < 20 && g_relax_stranger && g_relax_real)
-        LOGI("[name] uid=%d 陌生名/真名已就绪", g_relax_uid);
+static void* swap_if_stranger(void* str) {
+    if (!F_STORY || (uintptr_t)str < 0x10000) return str;
+    if (!il2str_len_ok(str)) return str;
+
+    /* v72：遍历所有「最近放宽命中」的槽位，命中谁的陌生名就换成谁的真名。
+     * 老版本只比对最近那一个 uid —— 被刷屏的门对钉住后就再也换不了别人。 */
+    uint64_t now = rn_now_ms();
+    /* v79：文本层也一样，只在剧情播放期间、且只认当前图里的角色 */
+    if (rn_now_ms() > g_play_until) return str;
+    for (int i = 0; i < RN_SLOTS; ++i) {
+        if (g_rn[i].uid <= 0) continue;
+        if (g_rn[i].graph != g_play_graph) continue;
+        if (now > g_rn[i].until) continue;
+        /* 放宽命中那一刻角色实例可能还没创建（尤其读档后刚进场景），缓存是空的。
+         * 按 500ms 节流补取一次，避免整段对话都换不到名字。 */
+        if (!g_rn[i].stranger || !g_rn[i].real) {
+            static uint64_t last_try = 0;
+            if (now - last_try < 500) continue;
+            last_try = now;
+            refresh_rn_slot(i);
+            if (!g_rn[i].stranger || !g_rn[i].real) continue;
+        }
+        if (!il2str_eq(str, g_rn[i].stranger)) continue;
+        if (g_rn_log++ < 60) LOGI("[name] 文本层替换：陌生名 -> 熟悉后姓名 (uid=%d)", g_rn[i].uid);
+        return g_rn[i].real;
+    }
+    return str;
 }
 
-static void* swap_if_stranger(void* str) {
-    if (!F_STORY || g_relax_uid <= 0 || rn_now_ms() > g_relax_until) return str;
-    if (!g_relax_stranger || !g_relax_real) return str;
-    if (!il2str_eq(str, g_relax_stranger)) return str;
-    if (g_rn_log++ < 20) LOGI("[name] 文本层替换：陌生名 -> 熟悉后姓名 (uid=%d)", g_relax_uid);
-    return g_relax_real;
+/* 清掉「放宽命中窗口」的全部状态。
+ * 读档、换档都要调 —— stranger/real 是裸指针，
+ * 指向旧存档里角色实例持有的字符串，实例一销毁就是悬空指针。 */
+static void clear_relax_name_state(void) {
+    g_relax_uid = 0;
+    g_play_graph = nullptr;
+    g_play_until = 0;
+    g_play_state = 0;
+    for (int i = 0; i < RN_SLOTS; ++i) { rn_restore_rename(i); rn_restore_tpl(i); }   /* 还原实例姓名与模板陌生名 */
+    for (int i = 0; i < RN_SLOTS; ++i) {
+        g_rn[i].uid = 0;
+        g_rn[i].stranger = nullptr;
+        g_rn[i].real = nullptr;
+        g_rn[i].until = 0;
+        g_rn[i].renamed = 0;
+        g_rn[i].renamed_inst = nullptr;
+    }
 }
 
 static int is_credits_text(void* s) {
@@ -821,33 +1332,13 @@ static int is_credits_text(void* s) {
     return 0;
 }
 
+/* 每次都新建一个 "mod" 字符串。
+ * il2cpp 的 string 是托管对象，只被我们静态变量指着的实例 GC 看不到（我们的 .data 不在
+ * GC 根集合里），跨一次 GC 就是悬空指针。这里干脆不缓存 —— 调用频率极低（只在命中
+ * 「鸣谢」时），新建一个 3 字符的字符串的代价可以忽略，换来的是永不悬空。 */
 static void* mod_string(void) {
-    if ((uintptr_t)g_mod_str < 0x10000 && A_string_new) g_mod_str = A_string_new("mod");
+    if (A_string_new) g_mod_str = A_string_new("mod");
     return g_mod_str;
-}
-
-static void* hook_text_get(void* self) {
-    void* s = orig_text_get ? orig_text_get(self) : nullptr;
-    if (is_credits_text(s)) {
-        void* m = mod_string();
-        if ((uintptr_t)m > 0x10000) {
-            if (g_thx_log++ < 3) LOGI("[ui] 鸣谢按钮显示 -> mod（get_text 拦截）");
-            return m;
-        }
-    }
-    return s;
-}
-
-static void hook_text_set(void* self, void* str) {
-    if (orig_text_set && is_credits_text(str)) {
-        void* m = mod_string();
-        if ((uintptr_t)m > 0x10000) {
-            if (g_thx_log++ < 3) LOGI("[ui] 鸣谢按钮文字 -> mod（set_text 拦截）");
-            orig_text_set(self, m);
-            return;
-        }
-    }
-    if (orig_text_set) orig_text_set(self, swap_if_stranger(str));
 }
 
 /* v60：主界面那个按钮实测不是 UGUI Text（v58 拦 set_text、v59 拦 get_text 全都没命中），
@@ -880,6 +1371,86 @@ static void hook_tmp_set(void* self, void* str) {
     if (orig_tmp_set) orig_tmp_set(self, swap_if_stranger(str));
 }
 
+/* ---- v73：在气泡入口直接改名字 ------------------------------------------
+ * v72 的日志给出了否证：
+ *     [name] uid=10084 显示 "洛千雪"（RealFullName / 模板正式名）   ← getter 已经返回真名
+ *     文本层替换: 0                                              ← 文本比对一次没命中
+ * 但画面上仍是陌生名 ⇒ 对话框的名字既不是 get_FullName 的返回值，也不是 m_givenName 那段文本。
+ * 它走的是 NpcTalkingBubble：Init(adaptor, content) 创建气泡时自己决定 nameText(+0x48) 的内容。
+ * 所以这里在 Init 之后直接把 nameText 改成「熟悉后姓名」—— 唯一确定能显示出来的地方。 */
+static void (*orig_bubble_init)(void* self, void* adaptor, void* content) = nullptr;
+static int g_bn_log = 0;
+
+static int rn_live(int uid) {
+    int i = rn_find(uid);
+    return (i >= 0 && rn_now_ms() <= g_rn[i].until) ? 1 : 0;
+}
+
+static void hook_bubble_init(void* self, void* adaptor, void* content) {
+    if (orig_bubble_init) orig_bubble_init(self, adaptor, content);
+    if (!F_STORY) return;
+    if ((uintptr_t)self < 0x10000 || (uintptr_t)content < 0x10000) return;
+
+    void* ch = *(void**)((char*)content + OFF_TC_CHARACTER);
+    if ((uintptr_t)ch < 0x10000) return;
+    int uid = *(int*)((char*)ch + OFF_GCI_TPL_UID);
+    if (!rn_live(uid)) return;
+
+    void* nm = real_name_of(ch, nullptr);
+    if (!nm) return;
+
+    void* nameText = *(void**)((char*)self + OFF_BUBBLE_NAMETEXT);
+    if ((uintptr_t)nameText < 0x10000) return;
+    if (!orig_tmp_set) return;
+
+    orig_tmp_set(nameText, nm);      /* 直接调原版 set_text，绕开我们自己的 hook */
+
+    if (g_bn_log++ < 40) {
+        char rb[64];
+        str_to_buf(nm, rb, sizeof(rb));
+        LOGI("[name] 气泡改名 uid=%d → \"%s\"", uid, rb);
+    }
+}
+
+/* ---- v74：钩「对话节点」的说话人姓名产出函数 -----------------------------
+ * v72 的否证：getter 已返回真名、文本比对零命中，画面却仍是陌生名。
+ * 于是往回一层找到真正产出「对话框中说话人姓名」的函数：
+ *   TalkMessageNode.GetNpcNameRuntime()     0x3D865D0
+ *   SlgTalkMessageNode.GetNpcNameRuntime()  0x26B117C   （SLG 版，同一语义）
+ * 两个都挂，谁生效看安装日志。Postfix 里按 NpcID 查窗口，命中就换成熟悉后姓名。 */
+static void* (*orig_tmn_name)(void* self) = nullptr;
+static void* (*orig_slgtmn_name)(void* self) = nullptr;
+static int g_nn_log = 0;
+
+static void* npc_name_common(void* self, void* (*orig)(void*), const char* tag) {
+    void* r = orig ? orig(self) : nullptr;
+    if (!F_STORY || (uintptr_t)self < 0x10000) return r;
+
+    int uid = *(int*)((char*)self + OFF_TMN_NPCID);
+    if (g_nn_log < 40) {
+        g_nn_log++;
+        char ob[64] = {0};
+        if ((uintptr_t)r > 0x10000) str_to_buf(r, ob, sizeof(ob));
+        LOGI("[name] %s uid=%d 原本=\"%s\"", tag, uid, ob);
+    }
+
+    int i = rn_find(uid);
+    if (i < 0 || rn_now_ms() > g_rn[i].until) return r;
+    if (!g_rn[i].real) refresh_rn_slot(i);
+    if (!g_rn[i].real) return r;
+
+    if (g_nn_log < 60) {
+        g_nn_log++;
+        char nb[64];
+        str_to_buf(g_rn[i].real, nb, sizeof(nb));
+        LOGI("[name] %s uid=%d 替换 -> \"%s\"", tag, uid, nb);
+    }
+    return g_rn[i].real;
+}
+
+static void* hook_tmn_name(void* self) { return npc_name_common(self, orig_tmn_name, "对话名"); }
+static void* hook_slgtmn_name(void* self) { return npc_name_common(self, orig_slgtmn_name, "SLG对话名"); }
+
 /* ---- 诊断（v51）：进场区域条件 ------------------------------------------
  * EnterAreaCondition 的判定（反汇编 0x268DAD0）：
  *     ok = (self.TotalMapID == <某单例的 +0x94>) ;
@@ -890,6 +1461,7 @@ static bool (*orig_enter_area)(void* self) = nullptr;
 static int g_ea_log = 0;
 
 static bool hook_enter_area(void* self) {    bool r = orig_enter_area ? orig_enter_area(self) : false;
+    flatten_try(self);                      /* v65：进场区域条件是最早能拿到图对象的点，先套补丁 */
     if (!F_STORY || (uintptr_t)self < 0x10000) return r;
     if (g_ea_log >= 200) return r;
 
@@ -1031,6 +1603,10 @@ static int story_blacklisted(const char* g) {
 }
 
 static bool hook_hold_check(void* self) {
+    rn_maybe_sync();   /* v79：检测「剧情播放中」状态变化，过渡时统一改名/还原 */
+    /* v65：HoldNode 就是「流程判断」，这是最靠近执行点的地方 —— 在判定前把展开补丁套上，
+     * 保证引擎读 OutPort 时用的已经是改过的连接。 */
+    flatten_try(self);
     /* 判据不再看"图名像不像角色剧情"，而是看**这次判定到底有没有碰队友条件**：
      *   - 没碰（计数没变）→ 这个 Hold 与放宽无关，一行都不碰；
      *   - 碰过 + times!=0 + 这次仍然通过 → 是放宽把"一次性"变成了"可重复"→ 压回 false。 */
@@ -1085,12 +1661,29 @@ static unsigned int hook_get_crc(void* self) {
 
 /* get_Crc 常被 IL2CPP 内联，真正兜底的是这里：
  * AssetBundle.LoadFromFileAsync_Internal(string path, uint crc, ulong offset)
- * 把 crc 参数改成 0 = 不校验。 */
+ * 把 crc 参数改成 0 = 不校验。
+ *
+ * v64：顺便把 path 原文打出来（每个 bundle 只打一次，最多若干条），
+ * 用来确认剧情 bundle 的加载路径形态 —— 「分支展开」要在这之前把字节改掉：
+ *   · 若是 jar:file:///…/base.apk!/assets/…  → 得自己读 APK 里的 zip 条目
+ *   · 若是普通文件路径（已解到缓存）        → 直接 open/read 即可 */
 static void* (*orig_load_file_async)(void* path, unsigned int crc, unsigned long long offset) = nullptr;
+static int g_ab_log = 0;
+static int g_ab_story_log = 0;
 
 static void* hook_load_file_async(void* path, unsigned int crc, unsigned long long offset) {
+    char pb[320];
+    pb[0] = 0;
+    str_to_buf(path, pb, sizeof(pb));
+
+    int is_story = (strstr(pb, "story_assets") != nullptr);
+    if (is_story ? (g_ab_story_log++ < 8) : (g_ab_log++ < 25)) {
+        LOGI("[ab] LoadFromFileAsync%s crc=%08x off=%llu path=%s",
+             is_story ? "(剧情)" : "", crc, offset, pb);
+    }
+
     if (crc) {
-        LOGI("[mod] LoadFromFileAsync crc=%08x -> 0（跳过 CRC 校验）", crc);
+        if (g_ab_log < 25) LOGI("[mod] LoadFromFileAsync crc=%08x -> 0（跳过 CRC 校验）", crc);
         crc = 0;
     }
     return orig_load_file_async ? orig_load_file_async(path, crc, offset) : nullptr;
@@ -1279,18 +1872,14 @@ static void install_tweaks() {
         LOGI("诊断: 进场区域条件 已挂 @ 0x%X", RVA_ENTER_AREA_CC);
     }
 
-    /* v58/v59：主界面「鸣谢」按钮文字改成 mod
-     * set_text 那条实测没命中（文字是预制体写死的），所以真正起作用的是 get_text。 */
-    if (hook_install("界面.鸣谢get", (void*)(g_base + RVA_TEXT_GET),
-                     (void*)hook_text_get, (void**)&orig_text_get)) {
-        LOGI("界面: 鸣谢 get_text 改 mod 已挂 @ 0x%X", RVA_TEXT_GET);
-    }
-    if (hook_install("界面.鸣谢set", (void*)(g_base + RVA_TEXT_SET),
-                     (void*)hook_text_set, (void**)&orig_text_set)) {
-        LOGI("界面: 鸣谢 set_text 改 mod 已挂 @ 0x%X", RVA_TEXT_SET);
-    }
+    /* v63：UGUI Text 的 get/set 两条 hook 已撤（详见文件里「鸣谢」那一节的注释）。
+     * 实测干活的是下面 TMP 的 set_text；而那两个函数相距只有 8 字节、补丁要 16 字节，
+     * 装在一起会互相踩掉字面量池 → 一旦有人调用就跳到垃圾地址。 */
+    LOGI("界面: UGUI Text get/set hook 已弃用（改走 TMP）");
 
-    /* v60：TMPro 那套（主界面按钮实测走这个） */
+    /* v60：TMPro 那套（主界面按钮实测走这个）
+     * v63：get_text 保留 —— 它在 v62 之前的崩溃就是这段代码的跳板重定位 bug 引起的，
+     * 已在 hook.cpp 里修好（内部 cbz 分支现在会绝对化到跳板槽位）。 */
     if (hook_install("界面.鸣谢TMPget", (void*)(g_base + RVA_TMP_TEXT_GET),
                      (void*)hook_tmp_get, (void**)&orig_tmp_get)) {
         LOGI("界面: TMP get_text 已挂 @ 0x%X", RVA_TMP_TEXT_GET);
@@ -1311,6 +1900,30 @@ static void install_tweaks() {
     if (hook_install("名字.get_FullNameWithTitle", (void*)(g_base + RVA_GCI_FULLNAME_TITLE),
                      (void*)hook_fullname_title, (void**)&orig_fullname_title)) {
         LOGI("名字: get_FullNameWithTitle 已挂 @ 0x%X", RVA_GCI_FULLNAME_TITLE);
+    }
+    /* v79：剧情播放起止（名字切换只在播放期间生效） */
+    if (hook_install("名字.播放开始", (void*)(g_base + RVA_SSN_ONACTIVE),
+                     (void*)hook_ssn_onactive, (void**)&orig_ssn_onactive)) {
+        LOGI("名字: StoryScenarioNode.OnActive 已挂 @ 0x%X", RVA_SSN_ONACTIVE);
+    }
+    if (hook_install("名字.播放结束", (void*)(g_base + RVA_SSN_CONTINUE),
+                     (void*)hook_ssn_continue, (void**)&orig_ssn_continue)) {
+        LOGI("名字: StoryScenarioNode.Continue 已挂 @ 0x%X", RVA_SSN_CONTINUE);
+    }
+
+    /* v73：气泡入口直接改名 —— 这是唯一确认能把「熟悉后姓名」显示出来的位置 */
+    if (hook_install("名字.气泡Init", (void*)(g_base + RVA_BUBBLE_INIT),
+                     (void*)hook_bubble_init, (void**)&orig_bubble_init)) {
+        LOGI("名字: NpcTalkingBubble.Init 已挂 @ 0x%X", RVA_BUBBLE_INIT);
+    }
+    /* v74：对话框说话人姓名的产出函数（两个版本都挂） */
+    if (hook_install("名字.对话名Runtime", (void*)(g_base + RVA_TMN_NPCNAME_RUNTIME),
+                     (void*)hook_tmn_name, (void**)&orig_tmn_name)) {
+        LOGI("名字: TalkMessageNode.GetNpcNameRuntime 已挂 @ 0x%X", RVA_TMN_NPCNAME_RUNTIME);
+    }
+    if (hook_install("名字.SLG对话名Runtime", (void*)(g_base + RVA_SLGTMN_NPCNAME_RUNTIME),
+                     (void*)hook_slgtmn_name, (void**)&orig_slgtmn_name)) {
+        LOGI("名字: SlgTalkMessageNode.GetNpcNameRuntime 已挂 @ 0x%X", RVA_SLGTMN_NPCNAME_RUNTIME);
     }
 
 #if WULIN_PROBE

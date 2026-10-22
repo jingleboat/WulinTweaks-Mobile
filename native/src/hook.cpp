@@ -57,6 +57,25 @@ static int emit_far(uint32_t* o, int n, uintptr_t target, bool is_call) {
     return n + 2;
 }
 
+/* 「内部跳转」回填表。
+ *
+ * 原函数前 16 字节里的 PC 相对分支，如果目标是**这 16 字节内部的另一条指令**，
+ * 就绝对不能原样复制进跳板 —— 相对偏移一旦换了位置，跳到的完全是别的地址。
+ *
+ * 老实现正是 `o[n++] = w; continue;`（原样复制）。结果：
+ *   TMPro.TMP_Text.get_text (0x4A422D4)
+ *     4a422d4  ldrb w8,[x0,#0xe8]
+ *     4a422d8  cbz  w8, 0x4a422e0      ← 目标落在自己被打补丁的 16 字节里
+ *     4a422dc  b    0x4a422e8
+ *   复制到跳板后 cbz 的相对偏移指向跳板里别的地方 → 跳到垃圾地址，
+ *   实测反复落回 hook_tmp_get 本身 → 无限递归 → 栈溢出（512 帧，SEGV_MAPERR）。
+ *   这就是 v62「读档闪退」的根因。
+ *
+ * 正确做法：先占位，等 4 条指令都排好、每个原始地址在跳板里的槽位确定了，
+ * 再把「跳板里对应槽位的绝对地址」填进占位字面量。
+ */
+#define MAX_FIX 8
+
 static void* build_trampoline(uintptr_t target, int* nout) {
     uint32_t saved[4];
     memcpy(saved, (void*)target, PATCH_LEN);
@@ -67,9 +86,15 @@ static void* build_trampoline(uintptr_t target, int* nout) {
 
     uint32_t* o = (uint32_t*)mem;
     int n = 0;
+    int slot[4];              /* slot[i] = 原 target+i*4 的代码在跳板里的 word 下标 */
+    int fix_q[MAX_FIX];       /* 占位字面量在 o[] 里的下标 */
+    int fix_i[MAX_FIX];       /* 要跳到原始第几条指令 */
+    int nfix = 0;
+
     for (int i = 0; i < 4; ++i) {
         uint32_t w = saved[i];
         uintptr_t pc = target + (uintptr_t)i * 4;
+        slot[i] = n;
 
         if ((w & 0x1F000000) == 0x10000000) {
             /* adr/adrp：原指令算的是「PC 相对页」，搬到跳板后 PC 变了。
@@ -97,11 +122,17 @@ static void* build_trampoline(uintptr_t target, int* nout) {
             int64_t imm = (int64_t)((w >> 5) & 0x7FFFF);
             if (imm & (1 << 18)) imm -= (1 << 19);
             uintptr_t tgt = pc + (uintptr_t)(imm * 4);
-            if (tgt >= target && tgt < target + PATCH_LEN) { o[n++] = w; continue; }
             uint32_t cond = w & 0xF;
             int ci = n;
             o[n++] = (w & ~0x00FFFFE0u) | (cond ^ 1u);   /* b.!cond（偏移稍后回填） */
-            n = emit_far(o, n, tgt, false);
+            bool inner = (tgt >= target && tgt < target + PATCH_LEN);
+            if (inner && nfix < MAX_FIX) {
+                int q = n + 3;
+                n = emit_far(o, n, 0, false);
+                fix_q[nfix] = q; fix_i[nfix] = (int)((tgt - target) / 4); nfix++;
+            } else {
+                n = emit_far(o, n, tgt, false);
+            }
             o[ci] = (o[ci] & ~0x00FFFFE0u) | ((uint32_t)(n - ci) << 5);
             continue;
         }
@@ -110,10 +141,16 @@ static void* build_trampoline(uintptr_t target, int* nout) {
             int64_t imm = (int64_t)((w >> 5) & 0x7FFFF);
             if (imm & (1 << 18)) imm -= (1 << 19);
             uintptr_t tgt = pc + (uintptr_t)(imm * 4);
-            if (tgt >= target && tgt < target + PATCH_LEN) { o[n++] = w; continue; }
             int ci = n;
             o[n++] = (w ^ 0x01000000u) & ~0x00FFFFE0u;   /* 取反 opcode，偏移稍后回填 */
-            n = emit_far(o, n, tgt, false);
+            bool inner = (tgt >= target && tgt < target + PATCH_LEN);
+            if (inner && nfix < MAX_FIX) {
+                int q = n + 3;
+                n = emit_far(o, n, 0, false);
+                fix_q[nfix] = q; fix_i[nfix] = (int)((tgt - target) / 4); nfix++;
+            } else {
+                n = emit_far(o, n, tgt, false);
+            }
             o[ci] = (o[ci] & ~0x00FFFFE0u) | ((uint32_t)(n - ci) << 5);
             continue;
         }
@@ -122,10 +159,24 @@ static void* build_trampoline(uintptr_t target, int* nout) {
             int64_t imm = (int64_t)(w & 0x3FFFFFF);
             if (imm & (1 << 25)) imm -= (1 << 26);
             uintptr_t tgt = pc + (uintptr_t)(imm * 4);
-            n = emit_far(o, n, tgt, (w & 0x80000000u) != 0);
+            bool inner = (tgt >= target && tgt < target + PATCH_LEN);
+            if (inner && nfix < MAX_FIX) {
+                int q = n + 3;
+                n = emit_far(o, n, 0, false);           /* bl 到本段内部：按 br 处理（不压 LR） */
+                fix_q[nfix] = q; fix_i[nfix] = (int)((tgt - target) / 4); nfix++;
+            } else {
+                n = emit_far(o, n, tgt, (w & 0x80000000u) != 0);
+            }
             continue;
         }
         o[n++] = w;
+    }
+
+    /* 内部跳转回填：目标是「跳板里对应槽位的绝对地址」 */
+    for (int k = 0; k < nfix; ++k) {
+        int s = slot[fix_i[k]];
+        *(uintptr_t*)&o[fix_q[k]] = (uintptr_t)(o + s);
+        LOGI("tramp: 内部跳转 %d → 跳板槽位 %d（绝对化）", fix_i[k], s);
     }
 
     n = emit_far(o, n, target + PATCH_LEN, false);   /* 跳回原函数 +16 */
@@ -147,6 +198,20 @@ fail:
 
 bool hook_install(const char* name, void* target, void* replace, void** orig_out) {
     if (!target || !replace) return false;
+
+    /* 补丁固定 16 字节。若目标函数本身不足 16 字节（前 3 条里就有 ret），
+     * 多出来的部分会盖住**紧邻的下一个函数**（例：UnityEngine.UI.Text.get_text 只有
+     * 8 字节，紧随其后的就是 set_text）。两个都 hook 时会互相踩掉对方的字面量池。
+     * 这里只告警不拒绝 —— 拒绝会让现有可用的 hook 全部掉线。 */
+    {
+        const uint32_t* p = (const uint32_t*)target;
+        for (int i = 0; i < 3; ++i) {
+            if ((p[i] & 0xFFFFFC1Fu) == 0xD65F0000u) {   /* ret */
+                LOGE("hook %s: 目标函数只有 %d 字节，16 字节补丁会盖住相邻函数！", name, (i + 1) * 4);
+                break;
+            }
+        }
+    }
 
     int ncode = 0;
     void* tramp = build_trampoline((uintptr_t)target, &ncode);

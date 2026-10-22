@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v62-realname-textswap"   /* 本 mod 自己的版本号，只用来对日志 */
+#define MOD_VER "v79-playonly"           /* 本 mod 自己的版本号，只用来对日志 */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
@@ -36,12 +36,54 @@ extern volatile int F_MAP;          /* 大地图解锁 */
 extern volatile int F_CAB;          /* 马车地图解锁 */
 extern volatile int F_STORY;        /* 剧情/队伍条件放宽 */
 extern volatile int F_WATER;        /* 水面可走（进水池 + 触发入水状态） */
+extern volatile int F_FLAT;         /* 剧情分支展开（Branch Flattener） */
+
+/* 剧情分支展开：在已加载的图对象上套用补丁（node 传图上任意节点即可，内部按 graph 去重）。
+ * 定义在 flatten.cpp。 */
+void flatten_try(void* any_node);
+/* 该条件节点是否已被「分支展开」接管（= 恒真）。传 HavePartnerCondition / IsJoinedTeamCondition 实例。 */
+int flatten_cond_always_true(void* cond);
+/* 只读体检：打印某 uid 的角色模板内容（姓/名/陌生时姓名/UName）与实例是否存在。 */
+void relax_name_probe(int uid);
+/* 提前打开某 uid 的「熟悉后姓名」窗口（由分支展开在 patch 图时调用）。 */
+void relax_name_open(int uid, void* graph);
+/* 剧情播放起止（由 StoryScenarioNode.OnActive / Continue 钩子驱动）。 */
+void story_play_begin(void* playNode);
+void story_play_end(void);
 
 /* ================================================================== RVA */
 /* ---- il2cpp 通用 ---- */
+#define RVA_FIND_OBJECTS_ALL 0x4AD117C  /* Resources.FindObjectsOfTypeAll(Type) -> Object[] —— 用来枚举 CharacterPoolData 模板 */
 #define RVA_FIND_OBJECT_TYPE 0x4AD9BF0   /* Object.FindObjectOfType(Type) —— 真货，参数必须是 System.Type 对象 */
 #define RVA_SINGLETON_GET 0x3A2C090      /* MonoSingleton<object>.get_Instance —— 参数按 MethodInfo 传（传元数据槽里的
                                           * 泛型方法用法槽，就能拿到对应单例）。resolve_save 一直用它，别改成别的。 */
+/* XNode：按端口名取 NodePort（走 Dictionary 的托管 API，不依赖 keys/values 序列化数组）。
+ * v66 实测：ports 字典的 keys/values 两个 List 在运行期可能是空的，
+ * 直接按平行数组下标读书不到端口 —— 必须用这两个方法。 */
+#define RVA_NODE_GET_OUTPUTPORT 0x4BDA820  /* Node.GetOutputPort(string) -> NodePort */
+#define RVA_NODE_GET_PORT       0x4BDA70C  /* Node.GetPort(string)       -> NodePort */
+/* NpcTalkingBubble（角色头顶/对话框气泡）
+ *   Init(ActorViewElemenetAdapator, NpcTalkingContent)  —— 气泡创建时调，拿到「谁在说话 + 说什么」
+ *   nameText +0x48 (TextMeshProUGUI)  talkingText +0x50
+ * NpcTalkingContent: characterInstance +0x10  content +0x18  nameOverride +0x20
+ * 实测（v72 日志）：对话框名字既不来自 get_FullName 的返回值，也不等于 m_givenName 的 set_text，
+ * 所以只能在气泡 Init 之后直接把 nameText 改成「熟悉后姓名」。 */
+#define RVA_BUBBLE_INIT 0x2429F60
+#define OFF_BUBBLE_NAMETEXT 0x48
+#define OFF_TC_CHARACTER    0x10
+#define OFF_TC_NAMEOVERRIDE 0x20
+/* TalkMessageNode（scenario 里的「对话」节点）—— 对话框中说话人姓名的真正产出点
+ *   NpcID 0x50  NpcName 0x58  showName 0x64  showNpcName 0x68  showImage 0x70  text 0x80
+ * GetNpcNameRuntime() 返回运行时显示的说话人姓名；SlgTalkMessageNode 是 SLG 版同名方法。 */
+#define RVA_TMN_NPCNAME_RUNTIME     0x3D865D0
+#define RVA_SLGTMN_NPCNAME_RUNTIME  0x26B117C
+#define OFF_TMN_NPCID 0x50
+/* StoryScenarioNode（剧情图里的「播放剧情」节点）—— 剧情真正播放的唯一可靠起止点
+ *   OnActive()              开始播这段 scenario
+ *   Continue(string port)   播完，走向下一个节点
+ * 用来把「显示熟悉后姓名」收窄到播放期间（而不是被 Hold 重判一直续命）。 */
+#define RVA_SSN_ONACTIVE  0x3DA0730
+#define RVA_SSN_CONTINUE  0x3DA0798
 #define RVA_GET_NAME 0x4AD8B9C           /* Object.get_name() */
 #define RVA_GO_CHILD_OBJ 0x4AD34C8       /* Component.get_transform()（拿子节点 Transform 时也用它） */
 #define RVA_COMP_GET_GO 0x4AD3504        /* Component.get_gameObject() */
@@ -151,6 +193,9 @@ extern volatile int F_WATER;        /* 水面可走（进水池 + 触发入水�
 #define OFF_GCI_TPL_UID 0xA0
 #define OFF_GCI_SURNAME 0xA8
 #define OFF_GCI_GIVENNAME 0xB0
+#define OFF_CPD_UID 0x10                 /* BaseDataStorageClass.Uid（= 角色 uid） */
+#define OFF_CPD_UNAME 0x18               /* BaseDataStorageClass.UName */
+#define OFF_CPD_NAME 0x18                /* CharacterPoolData.name —— 角色正式全名（未结识时也是真名） */
 #define OFF_CPD_NAME_STRANGER 0x20
 #define OFF_CPD_SURNAME 0x28
 #define OFF_CPD_GIVENNAME 0x30
@@ -165,7 +210,8 @@ extern volatile int F_WATER;        /* 水面可走（进水池 + 触发入水�
 #define OFF_PTM_CONTAINER 0x60           /* PlayerTeamManager.dataContainer */
 #define OFF_SOC_DATA 0x20                /* SaveObjectContainer<T>.data -> SaveObjectPlayerTeam */
 #define OFF_SOPT_LIST 0x90               /* SaveObjectPlayerTeam.playerTeam (List<int>) */
-#define OFF_LIST_ITEMS 0x10              /* List<T>._items */
+#define OFF_LIST_ITEMS 0x10              /* List<T>._items（指向 il2cpp 数组对象） */
+#define OFF_ARRAY_DATA 0x20              /* il2cpp 数组的元素起始偏移：klass 0x00 | monitor 0x08 | bounds 0x10 | max_length 0x18 | 元素 0x20 */
 #define OFF_LIST_SIZE 0x18               /* List<T>._size */
 
 /* ---- 剧情里的「地图图标」条件（v48）

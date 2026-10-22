@@ -29,7 +29,7 @@
 
 /* ------------------------------------------------------------------ 布局 */
 #define PW 520
-#define PH 500
+#define PH 560
 #define HDR 68
 #define ROW 60
 #define PAD 10
@@ -49,6 +49,7 @@ static volatile int* row_flag_ptr(int i) {
         case 4: return &F_CAB;
         case 5: return &F_STORY;
         case 6: return &F_WATER;
+        case 7: return &F_FLAT;
         default: return nullptr;
     }
 }
