@@ -1,11 +1,13 @@
 /*
- * WulinTweaks · 易物三件套（手机端，纯 native 实现）
- * ================================================
+ * WulinTweaks · 易物（手机端，纯 native 实现）
+ * ============================================
  * ① 作价恒占优   GameItemPack.GetTotalValue / TradingWithNpcManager.ValueOffset
  *                → 成交两道门槛都过（PC 版行为照搬）
+ *                **并且包含「确认搬空」**（见 ③）—— v83 起两者是同一个开关。
  * ② 显示池子     StartTrading 之后，把 NPC 的「击杀必掉 / 暗取池」内容**复制副本**
  *                塞进 NPC 背包，只给易物面板看；池子原件一个字节都不动。
  * ③ 确认搬空     ConfirmTrading 之后，把交易区残留 + NPC 背包剩余全部搬进队伍背包。
+ *                v83 起跟随 F_TRADE_WIN（不再是独立开关）。
  *
  * 铁律（PC 版验证过，照搬）：
  *   · 搬运一律「新建实例 → 加进目标包 → 删原件」。
@@ -725,7 +727,8 @@ static void trade_after_start(void* npcArg) {
 }
 
 static void trade_after_confirm() {
-    if (!F_TRADE_TAKEALL) { LOGI("易物: 搬空已关闭"); cleanup_copies(); return; }
+    /* v83：搬空跟随「作价恒占优」，不再有自己的开关 */
+    if (!F_TRADE_WIN) { LOGI("易物: 搬空已关闭（作价恒占优未开）"); cleanup_copies(); return; }
 
     void* inv = team_inventory();
     if (!okptr(inv)) { LOGE("易物: 找不到队伍背包，跳过搬空"); cleanup_copies(); return; }

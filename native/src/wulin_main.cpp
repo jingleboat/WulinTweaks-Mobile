@@ -1,11 +1,11 @@
 /*
- * WulinTweaks · Android 原生插件（v4：易物三件套 + 游戏内面板）
+ * WulinTweaks · Android 原生插件（v4：易物强化 + 游戏内面板）
  * ==============================================================
  * 通道：il2cpp_init 首指令被静态改成 B 到插页里的引导桩，桩 dlopen 本库。
  * 本文件负责：
  *   1) 等 libil2cpp.so / il2cpp 运行时就绪，解析出全部 RVA 与 il2cpp C API
  *   2) 装 hook：
- *        易物三件套（trade.cpp）
+ *        易物强化（trade.cpp：作价恒占优含搬空 + 池子）
  *        大地图 / 马车地图（IsMapEnable / IsPassIcon / HashSet.Contains / initIcon / cabIcon）
  *        剧情条件放宽（两个 CheckAllConnectNode）
  *        游戏内面板（ui.cpp，每帧 tick 挂在 MainThreadSynchronizationContext.Update）
@@ -44,9 +44,8 @@
 uintptr_t g_base = 0;
 void* g_i2cpp = nullptr;
 
-volatile int F_TRADE_WIN = 1;
+volatile int F_TRADE_WIN = 1;      /* 易物作价恒占优（含确认搬空） */
 volatile int F_TRADE_POOLS = 1;
-volatile int F_TRADE_TAKEALL = 1;
 volatile int F_MAP = 1;
 volatile int F_CAB = 1;
 volatile int F_STORY = 1;   /* v44 起默认开（此前是 0，每次启动要手动点） */
@@ -435,6 +434,11 @@ static const char* k_fixed_original[] = {
     "R10112-2",                      /* 2026-10-21 追加：烈酒与故事。图里 8 条「需要伙伴」全是别人的
                                       * 角色（10008/10009/10005/10015），按彩蛋规则会被放宽 → 剧情提前播出。
                                       * 用户要求压回原版：那些角色不在队就不该演。 */
+    /* ---- 2026-10-23 追加（用户点名）---- */
+    "R20004-6",                      /* 伙伴的故事 / 包打听(20004)。图里对花四娘(20025)的「需要伙伴」
+                                      * 属于「别的角色」→ 按彩蛋规则必放宽；而图里有 3 个
+                                      * ChangePartnerNode(state=1, partnerID=20004) = 把包打听踢出队。
+                                      * 放宽后这段在不该播的时候播了（结缘花四娘 + 同队时"包打听离队"）。*/
 };
 
 /* R10005-11 -> 10005；不是 "R数字-" 形式返回 -1 */
@@ -688,17 +692,19 @@ static int g_rn_log = 0;
 static int g_log_rename = 0;
 static int g_log_tpl = 0;
 static int g_log_ready = 0;
-static int g_rn_skip = 0;   /* v71 诊断：getter 被调但不在窗口里的次数 */
+static int g_log_name_sink = 0;   /* 文本层 / 气泡改名 的日志上限 */
+
 
 static int str_empty(void* s) {
     return ((uintptr_t)s < 0x10000) || *(int*)((char*)s + OFF_IL2STR_LEN) == 0;
 }
 
 /* 取「熟悉后姓名」的分层兜底，全部基于传入的角色实例 self（不查管理器、不依赖缓存）：
- *   ① get_RealFullName —— 陌生状态下会从模板拼 SurName + GivenName
+ *   ① get_RealFullName —— 陌生状态下从模板拼 SurName + GivenName（「姓+名」，不带称号）
  *   ② 模板正式名 CharacterPoolData.name(+0x18)
  *   ③ 陌生名本身（宁可显示 @xxx 也不要空）
- * v71：补了 ② —— 老版本 ① 空就直接退 ③，等于什么都没换。 */
+ * v71：补了 ② —— 老版本 ① 空就直接退 ③，等于什么都没换。
+ * v86：「称号·姓名」已回退，这里恢复成 RealFullName。 */
 static void* real_name_of(void* self, const char** how) {
     if ((uintptr_t)self < 0x10000) { if (how) *how = "无实例"; return nullptr; }
 
@@ -804,6 +810,11 @@ static void rn_apply_rename(int i) {
         g_rn[i].renamed = 1;
     }
 
+    /* v86 回退：不再拼「称号·姓名」。
+     * 原因（实测）：字段里写 "总捕头·洛天雄" 后，画面仍然只显示「洛天雄」——
+     * 该 UI 既不走 m_givenName/m_surName，也不走气泡 Init 与 TMP set_text，
+     * 说明它读的是剧情节点自己的 NpcName 数据；而 PC 端又会给「知府」这类
+     * 没有 GivenName 的角色拼出重复串。留着只有副作用，故回退成「姓+名」（= 真名）。 */
     void* empty = A_string_new ? A_string_new("") : nullptr;
     *(void**)((char*)c + OFF_GCI_SURNAME) = str_empty(sur) ? empty : sur;
     *(void**)((char*)c + OFF_GCI_GIVENNAME) = giv;
@@ -812,7 +823,7 @@ static void rn_apply_rename(int i) {
      * 共用计数器会被它吃光（v76 就是这么把后面所有日志吞掉的）。 */
     if (!was_renamed && g_log_rename < 12) {
         g_log_rename++;
-        char sb[32], gb2[48];
+        char sb[32], gb2[64];
         str_to_buf(*(void**)((char*)c + OFF_GCI_SURNAME), sb, sizeof(sb));
         str_to_buf(giv, gb2, sizeof(gb2));
         LOGI("[name] uid=%d 已把实例姓名改成 \"%s%s\"（数据层）", uid, sb, gb2);
@@ -881,6 +892,7 @@ static void rn_patch_tpl(int i) {
     for (const char* p = nb; *p && o < (int)sizeof(full) - 1; ++p) full[o++] = *p;
     full[o] = 0;
 
+    /* v86 回退：模板侧也恢复成「姓+名」（称号功能已整体回退）。 */
     void* ns = A_string_new ? A_string_new(full) : nullptr;
     if ((uintptr_t)ns < 0x10000) return;
     *(void**)((char*)tpl + OFF_CPD_NAME_STRANGER) = ns;
@@ -1054,11 +1066,11 @@ static void rn_restore_rename(int i) {
     if (g_rn_log < 60) { g_rn_log++; LOGI("[name] uid=%d 姓名已还原", uid); }
 }
 
-/* 剧情窗口内，被放宽的那个角色返回"熟悉后姓名"。
+/* 剧情窗口内，被放宽的那个角色返回「称号·姓名」。
  *
- * ⚠️ 必须防重入（v63）：get_RealFullName 在「没有用陌生名」时会**尾调 get_FullNameWithTitle**，
- * 而后者被 hook_fullname_title 拦着 —— 于是
- *     hook_fullname_title → story_real_name → get_RealFullName → get_FullNameWithTitle
+ * ⚠️ 必须防重入（v63）：get_RealFullName / get_RealFullNameWithTitle 在「没有用陌生名」时
+ * 会**尾调 get_FullNameWithTitle**，而后者被 hook_fullname_title 拦着 —— 于是
+ *     hook_fullname_title → story_real_name → get_RealFullNameWithTitle → get_FullNameWithTitle
  *       → hook_fullname_title → … 无限递归，栈溢出直接崩（跟 v62 那个 TMP 崩溃是同一类死法）。
  * 线程局部标志一置，内层立刻返回，原版正常拼名字返回。 */
 
@@ -1068,22 +1080,11 @@ static void* story_real_name(void* self) {
     if (uid <= 0) return nullptr;
 
     /* v79：只在「剧情真正播放中」且该角色属于正在播的那张图时才替换 */
-    if (!rn_live_playing(uid)) {
-        if (g_rn_skip < 24) {
-            g_rn_skip++;
-            LOGI("[name] getter uid=%d 不在播放窗口里 → 跳过", uid);
-        }
-        return nullptr;
-    }
+    if (!rn_live_playing(uid)) return nullptr;
 
     const char* how = "?";
     void* real = real_name_of(self, &how);
-    if (!real) { if (g_rn_log++ < 60) LOGI("[name] uid=%d 无可用真名（%s）", uid, how); return nullptr; }
-    if (g_rn_log++ < 60) {
-        char rb[64];
-        str_to_buf(real, rb, sizeof(rb));
-        LOGI("[name] uid=%d 显示 \"%s\"（%s）", uid, rb, how);
-    }
+    if (!real) { if (g_rn_log++ < 20) LOGI("[name] uid=%d 无可用真名（%s）", uid, how); return nullptr; }
     return real;
 }
 
@@ -1336,7 +1337,7 @@ static void* swap_if_stranger(void* str) {
             if (!g_rn[i].stranger || !g_rn[i].real) continue;
         }
         if (!il2str_eq(str, g_rn[i].stranger)) continue;
-        if (g_rn_log++ < 60) LOGI("[name] 文本层替换：陌生名 -> 熟悉后姓名 (uid=%d)", g_rn[i].uid);
+        if (g_rn_log++ < 8) LOGI("[name] 文本层替换：陌生名 -> 熟悉后姓名 (uid=%d)", g_rn[i].uid);
         return g_rn[i].real;
     }
     return str;
@@ -1411,7 +1412,7 @@ static void hook_tmp_set(void* self, void* str) {
 
 /* ---- v73：在气泡入口直接改名字 ------------------------------------------
  * v72 的日志给出了否证：
- *     [name] uid=10084 显示 "洛千雪"（RealFullName / 模板正式名）   ← getter 已经返回真名
+ *     [name] uid=10084 显示 "称号·姓名"（称号·姓名 / 模板正式名）   ← getter 已经返回真名
  *     文本层替换: 0                                              ← 文本比对一次没命中
  * 但画面上仍是陌生名 ⇒ 对话框的名字既不是 get_FullName 的返回值，也不是 m_givenName 那段文本。
  * 它走的是 NpcTalkingBubble：Init(adaptor, content) 创建气泡时自己决定 nameText(+0x48) 的内容。
@@ -1446,7 +1447,7 @@ static void hook_bubble_init(void* self, void* adaptor, void* content) {
     if (g_bn_log++ < 40) {
         char rb[64];
         str_to_buf(nm, rb, sizeof(rb));
-        LOGI("[name] 气泡改名 uid=%d → \"%s\"", uid, rb);
+        if (g_log_name_sink++ < 8) LOGI("[name] 气泡改名 uid=%d → \"%s\"", uid, rb);
     }
 }
 
@@ -1640,7 +1641,7 @@ static int story_blacklisted(const char* g) {
     return 0;
 }
 
-static bool hook_hold_check(void* self) {
+static bool hold_check_core(void* self) {
     rn_maybe_sync();   /* v79：检测「剧情播放中」状态变化，过渡时统一改名/还原 */
     /* v65：HoldNode 就是「流程判断」，这是最靠近执行点的地方 —— 在判定前把展开补丁套上，
      * 保证引擎读 OutPort 时用的已经是改过的连接。 */
@@ -1677,6 +1678,22 @@ static bool hook_hold_check(void* self) {
              gn, obj_name(self, nb, sizeof(nb)), times);
     }
     return false;
+}
+
+/* v87：与 PC 的 Patch_FlattenGate 对齐 —— 被「分支展开」接管的门整门判真。
+ *
+ * 为什么要在门这一层补一刀：手机原来只在 IsJoinedTeamCondition / HavePartnerCondition
+ * 的 CheckAllConnectNode 里绕过条件，门的条件若不是这两类就接管不到 —— 于是
+ * 「出口已经改指 G1、门却按原版判假」，队里没人时在队侧内容根本不播，看起来像没展开。
+ * PC 从 1.10.0 起就是在 HoldNode.CheckCondition 上整门判真，与条件类型无关。
+ *
+ * 优先级：**高于**上面「Hold 只放行一次」的压制。PC 端两个 Postfix 的生效顺序也是
+ * Patch_FlattenGate 盖住 HoldOnceGuard（注册顺序决定），这里用「先核心、后强制」显式对齐。
+ * 另外 flatten_gate_forced 故意不看 F_FLAT —— 线已改指，门必须继续放行，否则卡死。 */
+static bool hook_hold_check(void* self) {
+    bool r = hold_check_core(self);
+    if (!r && flatten_gate_forced(self)) return true;
+    return r;
 }
 
 /* ---- AssetBundle CRC 放行 ----
@@ -1846,7 +1863,7 @@ static void install_tweaks() {
                  (void*)hook_get_modifier, (void**)&orig_get_modifier);
 #endif
 
-    /* ---- 易物三件套 ---- */
+    /* ---- 易物强化（作价恒占优含搬空 + 池子） ---- */
     trade_install();
 
     /* ---- 暗取面板诊断（看清暗取面板显示的是 backPack 还是 stealBackPack） ---- */
@@ -1928,7 +1945,9 @@ static void install_tweaks() {
     }
 
     /* v61：剧情期间显示「熟悉后姓名」
-     * 只需要 get_RealFullName 的地址（直接调），不需要 hook 它。 */
+     * 只需要名字 getter 的地址（直接调），不需要 hook 它。
+     * v86：回退成 get_RealFullName（「姓+名」）；v84/v85 试过带称号的版本，
+     *      实测手机端显示层不认，见 rn_apply_rename 的注释。 */
     orig_realfullname = (void* (*)(void*))(g_base + RVA_GCI_REALFULLNAME);
     LOGI("名字: get_RealFullName = %p（直接调用，不 hook）", (void*)orig_realfullname);
     if (hook_install("名字.get_FullName", (void*)(g_base + RVA_GCI_FULLNAME),

@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v82-mergecopy"        /* 本 mod 自己的版本号，只用来对日志 */
+#define MOD_VER "v89-release"          /* 本 mod 自己的版本号，只用来对日志 */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
@@ -28,10 +28,10 @@ void glog(const char* fmt, ...);
 extern uintptr_t g_base;   /* libil2cpp.so 加载基址 */
 extern void* g_i2cpp;      /* libil2cpp.so 句柄（dlsym 用） */
 
-/* 运行时开关：1 = 开。面板点一下就变，hook 里实时读。 */
-extern volatile int F_TRADE_WIN;    /* 易物作价恒占优 */
+/* 运行时开关：1 = 开。面板点一下就变，hook 里实时读。
+ * 易物只有两个开关：「确认搬空」跟随 F_TRADE_WIN（v83 起不再是独立开关）。 */
+extern volatile int F_TRADE_WIN;    /* 易物作价恒占优（含确认搬空、空手也能成交） */
 extern volatile int F_TRADE_POOLS;  /* 易物显示池子 */
-extern volatile int F_TRADE_TAKEALL;/* 易物确认搬空 */
 extern volatile int F_MAP;          /* 大地图解锁 */
 extern volatile int F_CAB;          /* 马车地图解锁 */
 extern volatile int F_STORY;        /* 剧情/队伍条件放宽 */
@@ -43,6 +43,9 @@ extern volatile int F_FLAT;         /* 剧情分支展开（Branch Flattener） 
 void flatten_try(void* any_node);
 /* 该条件节点是否已被「分支展开」接管（= 恒真）。传 HavePartnerCondition / IsJoinedTeamCondition 实例。 */
 int flatten_cond_always_true(void* cond);
+/* v87：该**门**（HoldNode）是否已被接管 —— 由 hook_hold_check 整门判真，与 PC 的
+ * BranchFlatten.IsGateForced 同一语义（故意不看开关）。 */
+int flatten_gate_forced(void* gate);
 /* 只读体检：打印某 uid 的角色模板内容（姓/名/陌生时姓名/UName）与实例是否存在。 */
 void relax_name_probe(int uid);
 /* 提前打开某 uid 的「熟悉后姓名」窗口（由分支展开在 patch 图时调用）。 */
@@ -192,9 +195,16 @@ void story_play_end_now(void);   /* v80：剧情收尾时立刻还原（StoryClo
  *                          +0xA8 = m_surName          +0xB0 = m_givenName
  *   CharacterPoolData:     +0x20 = NameAsStranger     +0x28 = SurName  +0x30 = GivenName
  */
-#define RVA_GCI_FULLNAME 0x223B75C        /* GameCharacterInstance.get_FullName */
-#define RVA_GCI_FULLNAME_TITLE 0x223B828  /* get_FullNameWithTitle */
-#define RVA_GCI_REALFULLNAME 0x223B920    /* get_RealFullName（陌生时从模板拼真名） */
+#define RVA_GCI_FULLNAME 0x223B75C        /* GameCharacterInstance.get_FullName —— 姓+名，无称号 */
+#define RVA_GCI_FULLNAME_TITLE 0x223B828  /* get_FullNameWithTitle = Title 空 ? FullName : Concat(Title,"·",FullName) */
+#define RVA_GCI_REALFULLNAME 0x223B920    /* get_RealFullName —— 熟悉 ? FullNameWithTitle : GetLocFullName(模板)【无称号】 */
+#define RVA_GCI_REALFULLNAME_TITLE 0x223B998 /* get_RealFullNameWithTitle —— 熟悉 ? FullNameWithTitle
+                                              * : GetLocFullNameWithTitle(模板) = Concat(GetLocTitle,"·",GetLocFullName)
+                                              * 也就是原版「称号·姓名」（总捕头·洛天雄）。v84 起名字统一走这条。 */
+#define RVA_GCI_TITLE 0x223B22C           /* get_Title —— 实例称号（内部走 GetLocTitle 本地化） */
+#define RVA_GCI_TITLE_TPL 0x258D3B0       /* static GetLocTitle(CharacterPoolData) —— 称号本地化（读 PersonalTitle） */
+#define RVA_GCI_REALFULLNAME_TPL 0x258D0CC   /* static GetLocFullName(CharacterPoolData) —— 姓名，无称号 */
+#define RVA_GCI_REALFULLNAME_TITLE_TPL 0x258D4A8 /* static GetLocFullNameWithTitle(CharacterPoolData) —— 称号·姓名 */
 #define OFF_GCI_TEMPLATE 0x98
 #define OFF_GCI_TPL_UID 0xA0
 #define OFF_GCI_SURNAME 0xA8
@@ -205,6 +215,7 @@ void story_play_end_now(void);   /* v80：剧情收尾时立刻还原（StoryClo
 #define OFF_CPD_NAME_STRANGER 0x20
 #define OFF_CPD_SURNAME 0x28
 #define OFF_CPD_GIVENNAME 0x30
+#define OFF_CPD_PERSONAL_TITLE 0x38       /* CharacterPoolData.PersonalTitle（本地化 key） */
 
 /* ChangePartnerNode 字段（dump: WuLin.StateMachine.ChangePartnerNode） */
 #define OFF_CP_MODE 0x60                 /* SelectionMode: ID=0 / 队中位置=1 */

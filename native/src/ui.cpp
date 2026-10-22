@@ -3,6 +3,11 @@
  * ===============================================================
  * 手机端没有快捷键，所以面板「默认展开」，点标题栏折叠成一条 tab，再点展开。
  *
+ * 面板布局跟 PC 版对齐：分「标题行（[1] 角色游泳 / [2] 地图 / [3] 剧情 / [4] 易物）+
+ * 开关行」两层 —— 标题行只有文字（不可点），开关行右侧是药丸。行表见 ROW_FLAG，
+ * 行高由 row_h() 给，面板高度 layout_height() 现算（不再写死 560）。
+ * 手机比 PC 多一组「角色游泳」，所以它排在最前，其余分组顺序与 PC 一致。
+ *
  * 为什么不走 Java 层：给游戏加窗口必须上 Android UI 线程，而那需要一个 Runnable
  * —— 没有自己的 dex 就造不出来。所以整块面板走 Unity 侧最小 UGUI 链路：
  *
@@ -29,29 +34,44 @@
 
 /* ------------------------------------------------------------------ 布局 */
 #define PW 520
-#define PH 560
-#define HDR 68
-#define ROW 60
+#define HDR 68            /* 标题栏高 */
+#define SEC 44            /* 分组标题行高 */
+#define ROW 60            /* 开关行高 */
 #define PAD 10
 #define PILL_W 84
 #define PILL_H 38
 #define TAB_W 220
+#define BOTPAD 10
+#define PH_MAX 900        /* 纹理缓冲上限；真实面板高 g_ph 由行表算出（见 layout_height） */
 #define OFF_R 252.0f      /* 距屏幕右边缘（让开右侧竖排按钮，屏幕像素）—— v56 顶部居中后已不用于定位 */
 #define OFF_T 12.0f       /* 距屏幕上边缘（屏幕像素）。v57：100 -> 12，面板贴着屏幕最上方 */
 
-/* 第 i 行对应的运行时开关 */
-static volatile int* row_flag_ptr(int i) {
-    switch (i) {
-        case 0: return &F_TRADE_WIN;
-        case 1: return &F_TRADE_POOLS;
-        case 2: return &F_TRADE_TAKEALL;
-        case 3: return &F_MAP;
-        case 4: return &F_CAB;
-        case 5: return &F_STORY;
-        case 6: return &F_WATER;
-        case 7: return &F_FLAT;
-        default: return nullptr;
-    }
+/* 面板行表：按显示顺序排，分组和 PC 版一致（手机多一组「角色游泳」放在最前）。
+ * 标签串在 glyphs.h 的 G_ROWS 里，顺序必须一一对应（改面板要同时改 gen_glyphs.py）；
+ * flag == nullptr ⇒ 这一行是分组标题：淡入背景 + 琥珀色字，没有药丸、点了不动。 */
+static volatile int* const ROW_FLAG[] = {
+    /* [1] 角色游泳        */ nullptr,
+    /*   角色可入水游泳    */ &F_WATER,
+    /* [2] 地图            */ nullptr,
+    /*   大地图地区全解锁  */ &F_MAP,
+    /*   马车地图全解锁    */ &F_CAB,
+    /* [3] 剧情            */ nullptr,
+    /*   忽略队伍角色条件  */ &F_STORY,
+    /*   剧情分支展开      */ &F_FLAT,
+    /* [4] 易物            */ nullptr,
+    /*   作价恒占优·确认搬空 */ &F_TRADE_WIN,
+    /*   列出必掉物＋暗取池 */ &F_TRADE_POOLS,
+};
+static_assert(sizeof(ROW_FLAG) / sizeof(ROW_FLAG[0]) == G_ROW_COUNT,
+              "ROW_FLAG 与 glyphs.h 的 G_ROWS 行数不一致（同时改 gen_glyphs.py 再重新生成）");
+
+static inline int row_h(int i) { return ROW_FLAG[i] ? ROW : SEC; }
+
+/* 面板总高 = 标题栏 + 各行高 + 底部留白 */
+static int layout_height(void) {
+    int h = HDR;
+    for (int i = 0; i < G_ROW_COUNT; ++i) h += row_h(i);
+    return h + BOTPAD;
 }
 
 #define RGBA(r, g, b, a) ((uint32_t)(r) | ((uint32_t)(g) << 8) | ((uint32_t)(b) << 16) | ((uint32_t)(a) << 24))
@@ -64,9 +84,12 @@ static volatile int* row_flag_ptr(int i) {
 #define C_OFF RGBA(76, 78, 94, 255)
 #define C_PILLTXT RGBA(255, 255, 255, 255)
 #define C_HINT RGBA(150, 156, 176, 255)
+#define C_SEC RGBA(255, 212, 102, 255)   /* 分组标题字色（与 PC 面板同色系） */
+#define C_SECBAR RGBA(255, 212, 102, 200) /* 分组标题左侧色条 */
 
 /* ------------------------------------------------------------------ 状态 */
-static uint8_t g_buf[PW * PH * 4];
+static uint8_t g_buf[PW * PH_MAX * 4];
+static int g_ph = 0;                 /* 当前面板高度（纹理像素），由行表算出 */
 static void* g_canvas = nullptr;
 static void* g_img = nullptr;
 static void* g_tex = nullptr;
@@ -86,10 +109,10 @@ static void (*orig_mtsc_update)(void*) = nullptr;
 
 /* ================================================================ 软件光栅 */
 static inline void blend(int x, int ytop, uint32_t col, float cov) {
-    if (x < 0 || x >= PW || ytop < 0 || ytop >= PH) return;
+    if (x < 0 || x >= PW || ytop < 0 || ytop >= g_ph) return;
     float a = ((col >> 24) & 0xFF) / 255.0f * cov;
     if (a <= 0.0f) return;
-    uint8_t* p = &g_buf[((PH - 1 - ytop) * PW + x) * 4];
+    uint8_t* p = &g_buf[((g_ph - 1 - ytop) * PW + x) * 4];
     float sr = (float)(col & 0xFF), sg = (float)((col >> 8) & 0xFF), sb = (float)((col >> 16) & 0xFF);
     p[0] = (uint8_t)(p[0] * (1 - a) + sr * a);
     p[1] = (uint8_t)(p[1] * (1 - a) + sg * a);
@@ -179,10 +202,10 @@ static void draw_text(int x, int ytop, const char* s, uint32_t col) {
 
 /* ================================================================== 重绘 */
 static void redraw() {
-    memset(g_buf, 0, sizeof(g_buf));
+    memset(g_buf, 0, (size_t)PW * g_ph * 4);
 
     int w = g_collapsed ? TAB_W : PW;
-    int h = g_collapsed ? HDR : PH;
+    int h = g_collapsed ? HDR : g_ph;
 
     round_rect(0, 0, w, h, PAD, C_BG);
     round_rect(0, 0, w, HDR, PAD, C_HDR);
@@ -208,26 +231,38 @@ static void redraw() {
     }
     if (g_collapsed) return;
 
+    int y = HDR;
     for (int i = 0; i < G_ROW_COUNT; ++i) {
-        int rt = HDR + i * ROW;
-        if (i > 0) fill_rect(PAD + 12, rt, PW - (PAD + 12) * 2, 1, RGBA(52, 56, 72, 200));
-        draw_text(PAD + 12, rt + (ROW - GLYPH_H) / 2, G_ROWS[i], C_TEXT);
+        int rh = row_h(i);
+        volatile int* f = ROW_FLAG[i];
 
-        volatile int* f = row_flag_ptr(i);
-        int on = f ? *f : 0;
+        if (!f) {
+            /* 分组标题行：上面一条分隔线 + 左侧色条 + 琥珀色标题 */
+            if (i > 0) fill_rect(PAD + 12, y, PW - (PAD + 12) * 2, 1, RGBA(52, 56, 72, 200));
+            fill_rect(PAD + 4, y + 11, 4, rh - 22, C_SECBAR);
+            draw_text(PAD + 16, y + (rh - GLYPH_H) / 2, G_ROWS[i], C_SEC);
+            y += rh;
+            continue;
+        }
+
+        draw_text(PAD + 12, y + (rh - GLYPH_H) / 2, G_ROWS[i], C_TEXT);
+
+        int on = *f;
         int px = PW - PAD - 12 - PILL_W;
-        int py = rt + (ROW - PILL_H) / 2;
+        int py = y + (rh - PILL_H) / 2;
         round_rect(px, py, PILL_W, PILL_H, PILL_H / 2, on ? C_ON : C_OFF);
         const char* t = on ? G_ON : G_OFF;
         int lw = text_width(t);
         draw_text(px + (PILL_W - lw) / 2, py + (PILL_H - GLYPH_H) / 2, t, C_PILLTXT);
+
+        y += rh;
     }
 }
 
 /* ============================================================== UGUI 构建 */
 static void upload() {
     if (!g_tex) return;
-    F(void, RVA_TEX_LOAD_RAW, void*, void*, int)(g_tex, (void*)g_buf, PW * PH * 4, nullptr);
+    F(void, RVA_TEX_LOAD_RAW, void*, void*, int)(g_tex, (void*)g_buf, PW * g_ph * 4, nullptr);
     F(void, RVA_TEX_APPLY, void*)(g_tex, nullptr);
 }
 
@@ -240,7 +275,7 @@ static int screen_w() { return F0(int, RVA_SCREEN_WIDTH)(nullptr); }
 static void panel_px(float* left, float* bottom, float* w, float* h) {
     float sw = (float)screen_w(), sh = (float)screen_h();
     *w = (float)(g_collapsed ? TAB_W : PW);
-    *h = (float)(g_collapsed ? HDR : PH);
+    *h = (float)(g_collapsed ? HDR : g_ph);
     *left = (sw - *w) * 0.5f;              /* 水平居中 */
     *bottom = sh - OFF_T - *h;             /* 距屏幕顶端 OFF_T */
 }
@@ -262,9 +297,9 @@ static void apply_layout() {
 
     Rect4 uv;
     uv.x = 0.0f;
-    uv.y = g_collapsed ? (float)(PH - HDR) / (float)PH : 0.0f;
+    uv.y = g_collapsed ? (float)(g_ph - HDR) / (float)g_ph : 0.0f;
     uv.w = g_collapsed ? (float)TAB_W / (float)PW : 1.0f;
-    uv.h = g_collapsed ? (float)HDR / (float)PH : 1.0f;
+    uv.h = g_collapsed ? (float)HDR / (float)g_ph : 1.0f;
     F(void, RVA_RAWIMG_SET_UVRECT, void*, Rect4)(g_img, uv, nullptr);
 }
 
@@ -289,6 +324,12 @@ static void* find_parent_canvas(void* kCanvas) {
 static int ui_init() {
     if (g_ready) return 1;
     if (!g_base || !A_domain_get || !A_object_new) return 0;
+
+    g_ph = layout_height();
+    if (g_ph > PH_MAX) {
+        LOGE("面板: 行表算出高度 %d 超过缓冲上限 %d，已截断", g_ph, PH_MAX);
+        g_ph = PH_MAX;
+    }
 
     void* kGo = find_class("UnityEngine", "GameObject");
     void* kCanvas = find_class("UnityEngine", "Canvas");
@@ -348,7 +389,7 @@ static int ui_init() {
     /* ---- 3) 纹理 ---- */
     void* tex = A_object_new(kTex);
     if (!tex) { LOGE("面板: 建纹理失败"); return 0; }
-    F(void, RVA_TEX_CTOR, void*, int, int, int, int, int)(tex, PW, PH, 4, 1, 0, nullptr);
+    F(void, RVA_TEX_CTOR, void*, int, int, int, int, int)(tex, PW, g_ph, 4, 1, 0, nullptr);
     F(void, RVA_TEX_SET_FILTER, void*, int)(tex, 0, nullptr);   /* Point */
     F(void, RVA_TEX_SET_WRAP, void*, int)(tex, 0, nullptr);    /* Clamp */
 
@@ -362,7 +403,7 @@ static int ui_init() {
     upload();
     F(void, RVA_RAWIMG_SET_TEX, void*, void*)(raw, tex, nullptr);
     apply_layout();
-    LOGI("面板: 初始化完成 %dx%d，比 1:%.2f（默认展开）", PW, PH, sc);
+    LOGI("面板: 初始化完成 %dx%d，比 1:%.2f（默认展开）", PW, g_ph, sc);
     g_ready = 1;
     return 1;
 }
@@ -378,12 +419,13 @@ static void set_collapsed(int c) {
 }
 
 static void toggle_row(int i) {
-    volatile int* f = row_flag_ptr(i);
-    if (!f) return;
+    if (i < 0 || i >= G_ROW_COUNT) return;
+    volatile int* f = ROW_FLAG[i];
+    if (!f) return;                       /* 分组标题行不可点 */
     *f = *f ? 0 : 1;
     redraw();
     upload();
-    LOGI("面板: 第 %d 行 -> %s", i, *f ? "开" : "关");
+    LOGI("面板: 第 %d 行(%s) -> %s", i, G_ROWS[i], *f ? "开" : "关");
 }
 
 static void on_tap(float sx, float sy) {
@@ -394,11 +436,16 @@ static void on_tap(float sx, float sy) {
     panel_px(&left, &bottom, &w, &h);
     left /= sc; bottom /= sc; w /= sc; h /= sc;
     if (cx < left || cx > left + w || cy < bottom || cy > bottom + h) return;
-    float ly = (bottom + h) - cy;          /* 距离面板上沿 */
+    float lyp = ((bottom + h) - cy) * sc;  /* 距离面板上沿（纹理像素） */
     if (g_collapsed) { set_collapsed(0); return; }
-    if (ly * sc <= (float)HDR) { set_collapsed(1); return; }
-    int row = (int)((ly * sc - (float)HDR) / (float)ROW);
-    if (row >= 0 && row < G_ROW_COUNT) toggle_row(row);
+    if (lyp <= (float)HDR) { set_collapsed(1); return; }
+
+    int ytop = HDR;
+    for (int i = 0; i < G_ROW_COUNT; ++i) {
+        int rh = row_h(i);
+        if (lyp < (float)(ytop + rh)) { toggle_row(i); return; }
+        ytop += rh;
+    }
 }
 
 int ui_hit_test_screen(float sx, float sy) {

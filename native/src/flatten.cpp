@@ -26,8 +26,12 @@
  *   · 与另一对门的 region 相交（嵌套门对）→ 两对都跳过，留给人工
  *   · partnerID <= 0 的伪条件；两侧都不是「单节点剧情」的 X 类
  *
- * 接管方式：把两道门的**条件节点**登记进 g_flat_cond，由 wulin_main.cpp 的
- * hook_check_partner / hook_check_joined 在判定入口直接走基类实现（= 丢掉这一个条件）。
+ * 接管方式（v87 起与 PC 完全对齐）：
+ *   ① 条件层：把两道门的**条件节点**登记进 g_flat_cond，由 hook_check_partner /
+ *      hook_check_joined 在判定入口直接走基类实现（= 丢掉这一个条件）。
+ *   ② 门层（v87 补的，PC 一直是这么做的）：把两道**门**（HoldNode）本身登记进 g_flat_gate，
+ *      由 hook_hold_check 在 HoldNode.CheckCondition 之后整门判真。手机原来只有 ①，
+ *      于是「门挂的不是伙伴/在队条件」时就不生效（改线与判定不一致）。
  * ⚠️ 仍然**不写 partnerID / Negate 字段** —— 那两个字段被「显示熟悉后姓名」用来
  *    记录"放宽放过了谁"，抹掉姓名功能就失效（v69 的教训）。
  *
@@ -60,6 +64,7 @@ extern volatile int F_STORY;     /* 剧情条件放宽（姓名窗口也受它�
 #define FLAT_MAX_EDGES   8200
 #define FLAT_MAX_PAIRS   48
 #define FLAT_MAX_CONDS   128
+#define FLAT_MAX_GATES   512         /* v87：被接管的门（HoldNode）指针表，与 PC 的 HashSet 对齐 */
 #define FLAT_MAX_REGION  512         /* region 节点上限 */
 #define FLAT_DONE_MAX    96          /* 处理过的图指针（环形） */
 #define FLAT_LOG_GRAPH   40
@@ -157,8 +162,34 @@ static void flat_add_cond(void* cond) {
     if (g_flat_cond_n < FLAT_MAX_CONDS) g_flat_cond[g_flat_cond_n++] = cond;
 }
 
+/* v87：被接管的**门**（HoldNode）本身 —— 与 PC 的 BranchFlatten._gateForced 对齐。
+ * 为什么需要它：手机上条件层只能在 IsJoinedTeamCondition / HavePartnerCondition 两个
+ * CheckAllConnectNode 里绕过条件，覆盖面比 PC 窄。PC 是在 HoldNode.CheckCondition 上
+ * 整门判真，与条件类型无关。这里把门指针也记一份，由 hook_hold_check 兜底整门判真。
+ * ⚠️ 故意**不看 F_FLAT**（与 PC 的 IsGateForced 一致）：线已经改指 G1，
+ *    若中途关开关导致门又判假，就会「出口指向别处 + 门不放行」→ 剧情卡死。 */
+static void* g_flat_gate[FLAT_MAX_GATES];
+static int g_flat_gate_n = 0;
+
+static void flat_add_gate(void* gate) {
+    if ((uintptr_t)gate < 0x10000) return;
+    for (int i = 0; i < g_flat_gate_n; ++i)
+        if (g_flat_gate[i] == gate) return;
+    if (g_flat_gate_n < FLAT_MAX_GATES) g_flat_gate[g_flat_gate_n++] = gate;
+}
+
+/* 这道门是否已被「分支展开」接管（= 无条件判真）。由 hook_hold_check 调用。 */
+int flatten_gate_forced(void* gate) {
+    if ((uintptr_t)gate < 0x10000) return 0;
+    for (int i = 0; i < g_flat_gate_n; ++i)
+        if (g_flat_gate[i] == gate) return 1;
+    return 0;
+}
+
+/* 这个条件节点是否已被接管。v87：去掉 F_FLAT 判据（同 PC），
+ * 只用来给条件层做快速旁路，开关只决定「新图还要不要打补丁」。 */
 int flatten_cond_always_true(void* cond) {
-    if (!F_FLAT || (uintptr_t)cond < 0x10000) return 0;
+    if ((uintptr_t)cond < 0x10000) return 0;
     for (int i = 0; i < g_flat_cond_n; ++i)
         if (g_flat_cond[i] == cond) return 1;
     return 0;
@@ -421,12 +452,13 @@ void flatten_try(void* any_node) {
         FLAT_PAIR* p = &g_pair[k];
         if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION || p->ex_n == 0) { skipped++; continue; }
 
-        /* 冲突：与另一对的 region 相交 → 这一对不动（另一对会在它自己那轮判） */
+        /* 冲突：与另一对的 region 相交 → 这一对不动（另一对会在它自己那轮判）。
+         * v87 与 PC 对齐：region 超上限的对**也参与**冲突判定（PC 只跳过 reg_n==0 的）。 */
         int clash = 0;
         for (int q = 0; q < g_npairs && !clash; ++q) {
             if (q == k) continue;
             FLAT_PAIR* o = &g_pair[q];
-            if (o->reg_n == 0 || o->reg_n > FLAT_MAX_REGION) continue;
+            if (o->reg_n == 0) continue;
             const unsigned char* ra = g_reg[k];
             const unsigned char* rb = g_reg[q];
             for (int i = 0; i < g_nnodes; ++i)
@@ -444,6 +476,9 @@ void flatten_try(void* any_node) {
 
         flat_add_cond(g_cond[p->g0]);
         flat_add_cond(g_cond[p->g1]);
+        /* v87：门指针也记一份 —— hook_hold_check 用它整门判真（对齐 PC） */
+        flat_add_gate(g_nd[p->g0]);
+        flat_add_gate(g_nd[p->g1]);
 
         /* 只登记姓名窗口（改名的时机由播放状态驱动，见 story_play_begin/end） */
         if (F_STORY) relax_name_open(p->pid, g);
