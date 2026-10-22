@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v80-generic"           /* 本 mod 自己的版本号，只用来对日志 */
+#define MOD_VER "v82-mergecopy"        /* 本 mod 自己的版本号，只用来对日志 */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
@@ -106,11 +106,14 @@ void story_play_end_now(void);   /* v80：剧情收尾时立刻还原（StoryClo
 
 /* ---- 背包 / 物品 ---- */
 #define RVA_PACK_GET_TOTAL 0x227F70C     /* long GameItemPack.GetTotalValue(float) */
-#define RVA_PACK_ADD_INDEP 0x227DF18     /* bool AddItemAsIndependent(GameItemInstance) */
+#define RVA_PACK_ADD_MERGE 0x227DD64     /* bool AddItem(GameItemInstance,bool) —— 可堆叠物品会合并进同类堆 */
+#define RVA_PACK_ADD_INDEP 0x227DF18     /* bool AddItemAsIndependent(GameItemInstance) —— 只 contents.Add，绝不合并 */
 #define RVA_PACK_REMOVE 0x2273A98        /* bool RemoveItem(GameItemInstance,int) */
 #define RVA_ITEM_CTOR_ID 0x227C714       /* GameItemInstance..ctor(int id,int stack,int craftLevel) */
 #define RVA_ITEM_CTOR_KEY 0x227C514      /* GameItemInstance..ctor(string key,int stack,int craftLevel) */
 #define RVA_ITEM_ISVALID 0x227C328       /* bool get_IsValid() */
+#define RVA_ITEM_STACKABLE 0x227C4CC     /* bool get_IsStackable() = Templete.IsStackable && modifyData==null */
+#define RVA_ITEM_CHANGESTACK 0x227C86C   /* bool ChangeStack(int amount) —— m_stack += amount，无回调 */
 
 /* ---- 角色 / 池子 ---- */
 #define RVA_CHAR_BACKPACK 0x223C098      /* GameItemPack get_BackPack() */
@@ -265,6 +268,7 @@ void story_play_end_now(void);   /* v80：剧情收尾时立刻还原（StoryClo
 #define OFF_PACK_CONTENTS 0x48   /* GameItemPack.contents (List<GameItemInstance>) */
 #define OFF_ITEM_STACK 0x20      /* GameItemInstance.m_stack */
 #define OFF_ITEM_TID 0x1C        /* GameItemInstance.m_templeteId */
+#define OFF_ITEM_MODIFY 0x28     /* GameItemInstance.modifyData（非 null ⇒ IsStackable 恒 false） */
 #define OFF_CPL_DROP 0x188       /* CharacterPoolData.ItemsDropOnKill (KeyWithValues[]) */
 #define OFF_CPL_STEAL 0x190      /* CharacterPoolData.StealPool */
 #define OFF_KWV_KEY 0x10         /* KeyWithValues.key (string) */
