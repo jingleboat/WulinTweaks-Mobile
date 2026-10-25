@@ -127,6 +127,20 @@ $env:JAVA_HOME="<jdk>"
 | **v86** | 回退称号功能，名字恢复成模板「姓+名」（与 PC 1.11.8 同步） |
 | **v87** | 剧情展开**接管层对齐 PC**：新增「门级接管」—— 被展开的门在 `HoldNode.CheckCondition` 之后整门判真（`flat_add_gate` / `flatten_gate_forced`），不再依赖「门挂的是伙伴/在队条件」；恒真表去掉 `F_FLAT` 判据（中途关开关不会出现「线已改、门不判真」）；冲突判定把超上限 region 也算进来（与 PC 一致） |
 | **v88** | 固定名单（不放宽）追加 `R20004-6`（伙伴的故事，包打听离队那段）；与 PC 1.11.9 同步 |
+| **v111** | 固定图加回 `R20004-6`（用户要求） |
+| **v110** | 固定图改正则（`Guide10099-` 整族 + `Fame-2`）；**结缘图判定提到放宽链最前**（修月老祠不生效） |
+| **v109** | 放宽改为「每图只放宽一次」；移除固定名单 |
+| **v108** | times 压制去掉 R 图整族豁免 |
+| **v107** | join 的 `leaveTeamMap` 缺省填 -1 |
+| **v106** | join 补「可入家园」（CouldBackToFief + leaveTeamMap + UnlockInviting） |
+| **v105** | join 去掉名字查找、修“已在队”闪退、新增解除陌生 |
+| **v104** | join 开启结缘（SetBond + 情缘武功 + buff） |
+| **v103** | join 改走游戏自身 `HasCharacterAsMember`/`AddCharacter` |
+| **v102** | 名字查找前校验角色池是数组（修闪退） |
+| **v100–v101** | join 查重实验（会崩）→ 回退 |
+| **v99** | join 最小版：只入队（走已验证的队伍 List 链） |
+| **v98** | join 全链路加类名校验 |
+| **v97** | join 兼 hook `InvokeCommandInternal`（Enter 键） |
 | **v96** | 控制台指令 `join <人物ID\|人物名> [1]`（**静默**，命中即吞、不打印任何文字）：入队 + 解除陌生（`初次见面=1`、双向好感 100、清 `m_surName/m_givenName`）+ 可入家园（`CouldBackToFief` + 队友状态 `leaveTeamMap` + `StoryManager.WriteString("UnlockInviting-<uid>")`）+ `1` 追加结缘（`SetBond` + 情缘武功 + 85xx/89xx/88xx buff）；死亡先 `SetAlive(true)`。挂 `ConsoleUI.InvokeCommand(string)` @0x244FA1C，与 PC 1.11.21 对齐 |
 | **v95** | 放宽规则新增一条：**含「结缘界面」（`ShowUIBondsNode`）的图跳过放宽**，走原版「必须在队」。判定方式：扫 `graph.nodes` 逐节点问 IL2CPP 类名（按图指针缓存 64 槽），扫不到就退回 12 张已知结缘图名表；与 PC 1.11.19 同步 |
 | **v89** | 撤销 `Fame-6`（楚襄兵祸）的固定名单条目（实测不需要）；清掉测试期日志：称号诊断 `[probe]`、「getter 不在窗口」逐次日志、门强制放行日志；文本层/气泡改名日志各限 8 条（与 PC 1.11.10 同步） |
