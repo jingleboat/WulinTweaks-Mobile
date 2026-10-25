@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v103"         /* v103：join 走游戏自己的 HasCharacterAsMember/AddCharacter（同 PC）*/
+#define MOD_VER "v104"         /* v104：开启结缘（SetBond+武功+buff），角色池改用运行期方法 */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */

@@ -313,6 +313,58 @@ static int team_add2(void* inst, int uid)
     return -1;
 }
 
+/* v104：结缘 —— 与 PC 同一条路（SetBond + 情缘武功 + 三件 buff），全部运行期取方法 */
+static int bond_kungfu_of(int uid)
+{
+    switch (uid) {
+    case 20025: return 300001; case 10092: return 300002; case 10084: return 300003;
+    case 10064: return 300005; case 10056: return 300006; case 10009: return 300007;
+    case 10081: return 300008; case 10008: return 300009; case 20063: return 300011;
+    case 10052: return 300013; case 10108: return 300021; case 10039: return 300022;
+    case 10021: return 300010;
+    default: return 0;
+    }
+}
+
+static void set_bond(void* inst, int uid)
+{
+    void* m = ptm();
+    if (!m || !inst) return;
+    void* f_me = method_of(m, "get_PlayerDataInstance", 0);
+    void* me = f_me ? ((void* (*)(void*, void*))f_me)(m, nullptr) : nullptr;
+    if ((uintptr_t)me < 0x10000) { LOGI("[join] 取不到主角实例，结缘跳过"); return; }
+    void* f_iid = method_of(me, "get_InstanceId", 0);
+    int meId = f_iid ? ((int (*)(void*, void*))f_iid)(me, nullptr) : 0;
+    if (meId <= 0) { LOGI("[join] 取不到主角 InstanceId，结缘跳过"); return; }
+
+    int sex = -1;
+    void* f_tpl = method_of(inst, "get_Templete", 0);
+    void* tpl = f_tpl ? ((void* (*)(void*, void*))f_tpl)(inst, nullptr) : nullptr;
+    if ((uintptr_t)tpl > 0x10000) sex = *(int*)((char*)tpl + 0x40);     /* CharacterPoolData.Sex */
+
+    int type = (sex == 0) ? 1 : 2;      /* 她那一侧：女 → Husband(1)，其余 Wife(2) */
+    void* f_bond = method_of(inst, "SetBond", 3);
+    if (f_bond) {
+        ((void (*)(void*, int, int, bool, void*))f_bond)(inst, meId, type, true, nullptr);
+        LOGI("[join] 结缘 SetBond(uid=%d, me=%d, type=%d, sex=%d)", uid, meId, type, sex);
+    } else LOGI("[join] 取不到 SetBond");
+
+    int kf = bond_kungfu_of(uid);
+    if (kf <= 0) { LOGI("[join] uid=%d 无对应情缘武功", uid); return; }
+    void* f_kf = method_of(inst, "InstantLearnKungfu", 3);
+    if (f_kf) {
+        ((void* (*)(void*, int, int, bool, void*))f_kf)(inst, kf, 1, false, nullptr);
+        LOGI("[join] 学会情缘武功 %d", kf);
+    }
+    int xx = kf % 100;
+    void* f_buff = method_of(inst, "ApplyBuff", 4);
+    if (f_buff) {
+        ((void* (*)(void*, int, int, int, void*, void*))f_buff)(inst, 8500 + xx, 0, 1, nullptr, nullptr);
+        ((void* (*)(void*, int, int, int, void*, void*))f_buff)(inst, 8900 + xx, 0, 1, nullptr, nullptr);
+        ((void* (*)(void*, int, int, int, void*, void*))f_buff)(me, 8800 + xx, 0, 1, nullptr, nullptr);
+        LOGI("[join] 心情/情缘 buff %d/%d/%d", 8500 + xx, 8900 + xx, 8800 + xx);
+    }
+}
 static int team_add(int uid)
 {
     void* lst = team_list();
@@ -361,7 +413,8 @@ static int resolve(const char* token)
 
     void* c = cfg();
     if (!c) { LOGI("[join] GameConfig 实例无效"); return 0; }
-    void* pool = CALL(void*, RVA_CFG_POOL_DATA, void*)(c, nullptr);
+    void* f_pool = method_of(c, "get_CharacterPoolDataScriptObject", 0);
+    void* pool = f_pool ? ((void* (*)(void*, void*))f_pool)(c, nullptr) : nullptr;
     if (!is_cls(pool, "CharacterPoolDataScriptObject")) { LOGI("[join] 角色池对象无效"); return 0; }
     void* arr = *(void**)((char*)pool + OFF_POOL_ARRAY);
     if ((uintptr_t)arr <= 0x10000) return 0;
@@ -430,7 +483,7 @@ static int join_handle(const char* text)
     LOGI("[join] uid=%d 实例=%p，开始入队", uid, inst);
     int joined = team_add2(inst, uid);
     if (joined < 0) joined = team_add(uid);
-    if (bond) LOGI("[join] 结缘参数本版未启用");
+    if (bond) set_bond(inst, uid);
     LOGI("[join] %s → uid=%d，本次入队=%d", text, uid, joined);
     return 1;
 }
