@@ -2011,7 +2011,7 @@ static bool hold_check_core(void* self) {
     char gb[128];
     void* g = *(void**)((char*)self + OFF_NODE_GRAPH);
     const char* gn = ((uintptr_t)g > 0x10000) ? obj_name(g, gb, sizeof(gb)) : "?";
-    if (parse_r_id(gn) > 0) return true;
+    /* v108：去掉「R{角色id}- 整族豁免」——苗彩蝶(10005) 的 R10005-* 就是因此循环触发。 */
     for (size_t i = 0; i < sizeof(k_fixed_original) / sizeof(k_fixed_original[0]); ++i)
         if (strcmp(gn, k_fixed_original[i]) == 0) return true;
     if (story_blacklisted(gn)) return true;
