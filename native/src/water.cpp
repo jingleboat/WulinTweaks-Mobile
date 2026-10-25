@@ -169,16 +169,13 @@ static bool hook_mm_isswim(void* self, uint64_t xy, uint32_t z) {
     return false;
 }
 
-/* 任意一张烤表里有没有这一格（MapEntity 层拿不到 mapid，用坐标反查即可：
-   504/2160/2169 三张表的水域格不重叠） */
-static int mask_any(int x, int y, int* which) {
-    for (int i = 0; i < WATER_MASK_COUNT; ++i) {
-        if (mask_has(&WATER_MASKS[i], x, y)) {
-            if (which) *which = WATER_MASKS[i].mapid;
-            return 1;
-        }
-    }
-    return 0;
+/* 取当前地图的烤表。
+ * ⚠️ v119 修 bug：以前 MapEntity 层用「任意表命中就算」（mask_any），
+ * 结果在 2160 里，504 池子的坐标（如 (26,34)）也被当成了水域 —— 2160 凭空多出一大片水域。
+ * 现在统一按 g_cur_map（从 MapManager 钩子缓存的当前图 id）取表。 */
+static const WaterMaskEntry* cur_mask(void) {
+    if (g_cur_map <= 0) return nullptr;
+    return mask_for(g_cur_map);
 }
 
 /* ---- MapEntity.IsBlock（真正查格子的那一层，v112 新挂） ---- */
@@ -187,11 +184,11 @@ static bool hook_me_isblock(void* self, uint64_t xy, uint32_t z) {
     g_n_me_block++;
     if (!self) return r;
     int x = vec_x(xy), y = vec_y(xy);
-    int which = -1;
-    int hit = mask_any(x, y, &which);
+    const WaterMaskEntry* e = cur_mask();
+    int hit = (e && mask_has(e, x, y)) ? 1 : 0;
     if (g_dbg && g_log_me_block < 40) {
         g_log_me_block++;
-        LOGI("[water] ME.IsBlock(%d,%d) 原值=%d 烤表命中=%d(map=%d)%s", x, y, (int)r, hit, which,
+        LOGI("[water] ME.IsBlock(%d,%d) map=%d 原值=%d 烤表命中=%d%s", x, y, g_cur_map, (int)r, hit,
              (!r && hit) ? "  ← 原本就能走" : "");
     }
     if (hit && r) { g_hit_me_block++; return false; }
@@ -205,11 +202,11 @@ static bool hook_me_isswim(void* self, uint64_t xy, uint32_t z) {
     g_n_me_swim++;
     if (!self) return r;
     int x = vec_x(xy), y = vec_y(xy);
-    int which = -1;
-    int hit = mask_any(x, y, &which);
+    const WaterMaskEntry* e = cur_mask();
+    int hit = (e && mask_has(e, x, y)) ? 1 : 0;
     if (g_dbg && g_log_me_swim < 40) {
         g_log_me_swim++;
-        LOGI("[water] ME.IsSwimGrid(%d,%d) 原值=%d 烤表命中=%d(map=%d)", x, y, (int)r, hit, which);
+        LOGI("[water] ME.IsSwimGrid(%d,%d) map=%d 原值=%d 烤表命中=%d", x, y, g_cur_map, (int)r, hit);
     }
     if (hit) { g_hit_me_swim++; return true; }
     return r;
@@ -249,6 +246,67 @@ static void hook_ciw(void* self, uint64_t xy, uint32_t zh) {
         LOGI("[water] CheckInBathWater uid=%d", uid);
     }
     if (orig_ciw) orig_ciw(self, xy, zh);
+}
+
+/* 名单解析：逗号/空格分隔的 uid */
+static int uid_in_force_list(int uid) {
+    if (!FORCE_SWIM_IDS[0] || uid <= 0) return 0;
+    const char* p = FORCE_SWIM_IDS;
+    while (*p) {
+        while (*p == ',' || *p == ' ') ++p;
+        if (!*p) break;
+        int v = 0, neg = 0;
+        if (*p == '-') { neg = 1; ++p; }
+        while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); ++p; }
+        if (neg) v = -v;
+        if (v == uid) return 1;
+    }
+    return 0;
+}
+
+/* 在烤表里找离 (x,y) 最近的水域格（曼哈顿距离） */
+static int pick_water_cell(const WaterMaskEntry* e, int x, int y, int* ox, int* oy) {
+    if (!e || e->count <= 0) return 0;
+    int best = 0x7fffffff, bx = 0, by = 0;
+    for (int i = 0; i < e->count; ++i) {
+        int64_t k = e->keys[i];
+        int cx = (int)(uint32_t)(k & 0xffffffffu);
+        int cy = (int)(uint32_t)(k >> 32);
+        int d = abs(cx - x) + abs(cy - y);
+        if (d < best) { best = d; bx = cx; by = cy; }
+    }
+    *ox = bx; *oy = by;
+    return 1;
+}
+
+/* ---- v119：名单内角色 SetPos 时，把坐标换成当前地图烤表里最近的水域格 ----
+ * 手机端不读 ForceNPCSwim（v113 实测零调用），CreateNpc 的参数表又太长（v115 因此闪退），
+ * 所以改钩这个签名最简单的：GameCharacterInstance.SetPos(Vector3Int pos, bool alsoChangeTarget)。
+ */
+#define RVA_GCI_SETPOS 0x2245B58
+typedef void (*fn_setpos)(void*, uint64_t, uint32_t, int);
+static fn_setpos orig_setpos = nullptr;
+static int g_pos_hits = 0;
+
+static void hook_setpos(void* self, uint64_t xy, uint32_t z, int also) {
+    if (FORCE_SWIM_IDS[0] && (uintptr_t)self > 0x10000) {
+        int uid = *(int*)((char*)self + OFF_GCI_TPL_UID);
+        if (uid_in_force_list(uid)) {
+            const WaterMaskEntry* e = mask_for(g_cur_map);
+            int x = vec_x(xy), y = vec_y(xy);
+            if (e && !mask_has(e, x, y)) {
+                int ox = 0, oy = 0;
+                if (pick_water_cell(e, x, y, &ox, &oy)) {
+                    xy = ((uint64_t)(uint32_t)ox) | ((uint64_t)(uint32_t)oy << 32);
+                    z = 0;
+                    if (g_pos_hits++ < 12)
+                        LOGI("[water] SetPos 强制定位 uid=%d map=%d (%d,%d) -> 水域 (%d,%d)",
+                             uid, g_cur_map, x, y, ox, oy);
+                }
+            }
+        }
+    }
+    if (orig_setpos) orig_setpos(self, xy, z, also);
 }
 
 void water_install() {
@@ -291,6 +349,13 @@ void water_install() {
 
     /* v116：CreateRoleMar.CreateNpc 的钩子已摘除 —— 0x234EAD4 那个重载实际用到 w7（第 8 个参数），
        我们的转调只保留到 x6，丢参会把垃圾指针传进游戏 → 加载存档闪退。等确认参数表再挂。 */
+
+    /* v119：SetPos 强制定位（名单内角色一被定位就换到最近水域格） */
+    if (hook_install("GameCharacterInstance.SetPos", (void*)(g_base + RVA_GCI_SETPOS),
+                     (void*)hook_setpos, (void**)&orig_setpos))
+        LOGI("[water] 已挂 GameCharacterInstance.SetPos（强制定位）");
+    else
+        LOGE("[water] 挂 GameCharacterInstance.SetPos 失败");
 
     /* v113：覆写 ForceNPCSwim（PC 端有效；手机端实测没被调用过，保留作对照） */
     if (hook_install("GameConfig.GetConfigStr", (void*)(g_base + RVA_GC_GETCONFIGSTR),
