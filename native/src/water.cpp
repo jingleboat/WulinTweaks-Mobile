@@ -35,6 +35,19 @@
 
 #include <dlfcn.h>
 #include <time.h>
+#include <string.h>
+
+/* ---- v113：让指定 NPC 的落点被放进水域格 ----------------------------------
+ * 依据（PC 端实测）：游戏进入水域图时会用 `GameConfig.GetConfigStr("ForceNPCSwim")`
+ * 读这个环境常量字符串；把 NPC id 填进去，该 NPC 的落点会被安排到水域格里
+ * （实测 10033 从陆地 (36,17) → 水域 (21,32)）。官方值为空 = 一个都不强制。
+ *
+ * 这里就是把这个「读」的结果换掉：名单写在下面一行，逗号分隔；留空 = 完全不干预。
+ * 名单里的 id 必须是「角色池 uid」（例如 10033 叶云）。
+ */
+#define FORCE_SWIM_IDS "10033"
+
+#define RVA_GC_GETCONFIGSTR 0x2271D50 /* string GameConfig.GetConfigStr(string) */
 
 /* ---- RVA（国际版 V1.2.0820B131） ---- */
 #define RVA_MM_ISBLOCK 0x2395B74 /* bool MapManager.IsBlock(Vector3Int)        —— 转调 MapEntity */
@@ -196,6 +209,29 @@ static bool hook_me_isswim(void* self, uint64_t xy, uint32_t z) {
     return r;
 }
 
+/* ---- GameConfig.GetConfigStr：把 ForceNPCSwim 换成我们的名单 ---- */
+typedef void* (*fn_getstr)(void*, void*);
+static fn_getstr orig_getstr = nullptr;
+static int g_force_hits = 0;
+
+static void* hook_getconfigstr(void* self, void* key) {
+    void* r = orig_getstr ? orig_getstr(self, key) : nullptr;
+    if (!FORCE_SWIM_IDS[0]) return r;
+    if ((uintptr_t)key < 0x10000) return r;
+    char buf[64];
+    if (!str_to_buf(key, buf, sizeof(buf))) return r;
+    if (strcmp(buf, "ForceNPCSwim") != 0) return r;
+
+    void* s = A_string_new ? A_string_new(FORCE_SWIM_IDS) : nullptr;
+    if (g_force_hits < 8) {
+        g_force_hits++;
+        char old[64] = {0};
+        if ((uintptr_t)r > 0x10000) str_to_buf(r, old, sizeof(old));
+        LOGI("[water] ForceNPCSwim 覆写：\"%s\" -> \"%s\"", old, FORCE_SWIM_IDS);
+    }
+    return ((uintptr_t)s > 0x10000) ? s : r;
+}
+
 /* ---- Role.CheckInBathWater（只观察，不干预） ---- */
 static void hook_ciw(void* self, uint64_t xy, uint32_t zh) {
     g_n_ciw++;
@@ -220,6 +256,7 @@ void water_install() {
     for (int i = 0; i < WATER_MASK_COUNT; ++i) {
         LOGI("[water] 烤表 map=%d 水面格=%d（其它地图不干预）", WATER_MASKS[i].mapid, WATER_MASKS[i].count);
     }
+    if (FORCE_SWIM_IDS[0]) LOGI("[water] ForceNPCSwim 名单 = \"%s\"（进入水域图时覆写配置读取）", FORCE_SWIM_IDS);
 
     if (hook_install("MapManager.IsBlock", (void*)(g_base + RVA_MM_ISBLOCK),
                      (void*)hook_mm_isblock, (void**)&orig_mm_block))
@@ -251,4 +288,11 @@ void water_install() {
         LOGI("[water] 已挂 Role.CheckInBathWater（只观察）");
     else
         LOGE("[water] 挂 CheckInBathWater 失败");
+
+    /* v113：覆写 ForceNPCSwim，让名单里的 NPC 落进水域格 */
+    if (hook_install("GameConfig.GetConfigStr", (void*)(g_base + RVA_GC_GETCONFIGSTR),
+                     (void*)hook_getconfigstr, (void**)&orig_getstr))
+        LOGI("[water] 已挂 GameConfig.GetConfigStr（ForceNPCSwim 覆写）");
+    else
+        LOGE("[water] 挂 GameConfig.GetConfigStr 失败");
 }

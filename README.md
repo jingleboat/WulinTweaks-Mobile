@@ -127,6 +127,7 @@ $env:JAVA_HOME="<jdk>"
 | **v86** | 回退称号功能，名字恢复成模板「姓+名」（与 PC 1.11.8 同步） |
 | **v87** | 剧情展开**接管层对齐 PC**：新增「门级接管」—— 被展开的门在 `HoldNode.CheckCondition` 之后整门判真（`flat_add_gate` / `flatten_gate_forced`），不再依赖「门挂的是伙伴/在队条件」；恒真表去掉 `F_FLAT` 判据（中途关开关不会出现「线已改、门不判真」）；冲突判定把超上限 region 也算进来（与 PC 一致） |
 | **v88** | 固定名单（不放宽）追加 `R20004-6`（伙伴的故事，包打听离队那段）；与 PC 1.11.9 同步 |
+| **v113** | 方案A：覆写 `GameConfig.GetConfigStr("ForceNPCSwim")`，让名单里的 NPC 落点被放进水域格（id 列表写在 `native/src/water.cpp` 的 `FORCE_SWIM_IDS`） |
 | **v112** | 水面排查诊断包：`MapEntity.IsBlock/IsSwimGrid` 双挂 + 四个钩子与 `Role.CheckInBathWater` 打点（只在烤表地图、每条前 40 次）+ 每秒状态行。为查「手机端角色走不到水面上」 |
 | **v111** | 固定图加回 `R20004-6`（用户要求） |
 | **v110** | 固定图改正则（`Guide10099-` 整族 + `Fame-2`）；**结缘图判定提到放宽链最前**（修月老祠不生效） |
