@@ -397,6 +397,66 @@ static void unstranger_m(void* inst)
         }
     }
 }
+/* v106：可入家园 —— 按 PC 思路三件套：
+ *   ① CharacterTeamMemberExtendData.CouldBackToFief = true（偏移 0x50）
+ *   ② m_TeamMemberState 的 leaveTeamMap 有值（没有就填当前地图）
+ *   ③ StoryManager.WriteString("UnlockInviting-<uid>")  ← 家园提示「未完成相关事件」的判据
+ */
+#define OFF_CTMED_FIEF 0x50
+
+static void* find_class_any(const char* name)
+{
+    const char* nss[] = { "", "WuLin", "GameData" };
+    for (int i = 0; i < 3; ++i) {
+        void* k = find_class(nss[i], name);
+        if ((uintptr_t)k > 0x10000) return k;
+    }
+    return nullptr;
+}
+
+static void fief_ready(void* inst, int uid)
+{
+    if (!inst || uid <= 0) return;
+
+    void* k_so = find_class_any("CharacterTeamMemberExtendDataScriptObject");
+    void* so = k_so ? find_object_of_type(k_so) : nullptr;
+    if ((uintptr_t)so > 0x10000) {
+        void* f_get = method_of(so, "GetData", 1);
+        void* rec = f_get ? ((void* (*)(void*, int, void*))f_get)(so, uid, nullptr) : nullptr;
+        if ((uintptr_t)rec > 0x10000) {
+            *(bool*)((char*)rec + OFF_CTMED_FIEF) = true;
+            LOGI("[join] 家园：CouldBackToFief=true (uid=%d)", uid);
+        } else {
+            LOGI("[join] 家园：数据表没有 uid=%d 的记录（手机端不新建行）", uid);
+        }
+    } else LOGI("[join] 家园：取不到 CharacterTeamMemberExtendDataScriptObject");
+
+    void* tms = *(void**)((char*)inst + OFF_TEAM_STATE);
+    if ((uintptr_t)tms > 0x10000) {
+        if (*(int*)((char*)tms + OFF_TMS_LEAVE_MAP) <= 0) {
+            void* m = ptm();
+            void* f_map = m ? method_of(m, "get_CurMapId", 0) : nullptr;
+            int mp = f_map ? ((int (*)(void*, void*))f_map)(m, nullptr) : 0;
+            if (mp > 0) *(int*)((char*)tms + OFF_TMS_LEAVE_MAP) = mp;
+            LOGI("[join] 家园：补 leaveTeamMap=%d", mp);
+        }
+    } else LOGI("[join] 家园：该角色没有 m_TeamMemberState");
+
+    void* k_sm = find_class("WuLin", "StoryManager");
+    void* smi = k_sm ? find_object_of_type(k_sm) : nullptr;
+    if ((uintptr_t)smi > 0x10000) {
+        char tag[64];
+        snprintf(tag, sizeof(tag), "UnlockInviting-%d", uid);
+        void* s = A_string_new ? A_string_new(tag) : nullptr;
+        void* f_have = method_of(smi, "HaveString", 1);
+        bool have = (f_have && s) ? ((bool (*)(void*, void*, void*))f_have)(smi, s, nullptr) : false;
+        if (!have) {
+            void* f_w = method_of(smi, "WriteString", 1);
+            if (f_w && s) { ((void (*)(void*, void*, void*))f_w)(smi, s, nullptr); LOGI("[join] 家园：写标签 %s", tag); }
+            else LOGI("[join] 家园：取不到 WriteString");
+        } else LOGI("[join] 家园：标签 %s 已存在", tag);
+    } else LOGI("[join] 家园：取不到 StoryManager");
+}
 static int team_add(int uid)
 {
     void* lst = team_list();
@@ -521,6 +581,7 @@ static int join_handle(const char* text)
     int joined = team_add2(inst, uid);
     if (joined < 0) joined = team_add(uid);
     unstranger_m(inst);
+    fief_ready(inst, uid);
     if (bond) set_bond(inst, uid);
     LOGI("[join] %s → uid=%d，本次入队=%d", text, uid, joined);
     return 1;
