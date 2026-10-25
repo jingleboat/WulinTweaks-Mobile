@@ -127,6 +127,7 @@ $env:JAVA_HOME="<jdk>"
 | **v86** | 回退称号功能，名字恢复成模板「姓+名」（与 PC 1.11.8 同步） |
 | **v87** | 剧情展开**接管层对齐 PC**：新增「门级接管」—— 被展开的门在 `HoldNode.CheckCondition` 之后整门判真（`flat_add_gate` / `flatten_gate_forced`），不再依赖「门挂的是伙伴/在队条件」；恒真表去掉 `F_FLAT` 判据（中途关开关不会出现「线已改、门不判真」）；冲突判定把超上限 region 也算进来（与 PC 一致） |
 | **v88** | 固定名单（不放宽）追加 `R20004-6`（伙伴的故事，包打听离队那段）；与 PC 1.11.9 同步 |
+| **v112** | 水面排查诊断包：`MapEntity.IsBlock/IsSwimGrid` 双挂 + 四个钩子与 `Role.CheckInBathWater` 打点（只在烤表地图、每条前 40 次）+ 每秒状态行。为查「手机端角色走不到水面上」 |
 | **v111** | 固定图加回 `R20004-6`（用户要求） |
 | **v110** | 固定图改正则（`Guide10099-` 整族 + `Fame-2`）；**结缘图判定提到放宽链最前**（修月老祠不生效） |
 | **v109** | 放宽改为「每图只放宽一次」；移除固定名单 |
@@ -197,6 +198,57 @@ $env:JAVA_HOME="<jdk>"
 5. 开易物面板与搬空后各跑一次 `merge_dup_piles()`，把老存档里已经被拆开的同类堆并回一堆。
 
 ---
+
+## 水域：水面可走 + 入水形态（技术归档，2026-10-25）
+
+> 与 PC 端同源结论（PC 侧完整版见 `wulin-mod/README.md` 的「水域 / 入水机制」）。
+
+### 1. 手机为什么必须「烤表」
+
+游戏用地图 prefab 里的 `_SwimGrid`（Tilemap）定义水域格，**只有 504 / 2160 有数据**
+（504 = 760 格、2160 = 177 格、2169 = 0 格）。但手机运行期的地图实例里
+`_SwimGrid` / `_SwimLadder` 两个图层**根本不存在**（运行期只有 24 个图层），
+所以 `mSwimGrid` 全零、`MapManager.IsSwimGrid` 恒 false —— 原版手机端不可能下水。
+
+因此 `water_mask.h` 由 `gen_water_mask.py` 从 APK 地图 prefab 里把 `_SwimGrid` 烤成坐标表，
+运行期用 `water.cpp` 的两个钩子顶替：
+
+| 钩子 | RVA（V1.2.0820B131） | 作用 |
+|---|---|---|
+| `MapManager.IsBlock` | `0x2395B74` | 烤表命中 → 返回 false（水面可走） |
+| `MapManager.IsSwimGrid` | `0x2395AB8` | 烤表命中 → 返回 true（触发入水形态） |
+
+坐标空间已核对一致：`Role.CheckInBathWater` 内部用 `WorldToCell(transform.position)` 取格，
+与烤表里的 tilemap 格坐标同一套；`Vector3Int` 在 ARM64 上按 `x1 = x | y<<32`、`x2 = z` 传递。
+
+### 2. 判定链（与 PC 完全一致）
+
+```
+cell = tile ?? WorldToCell(transform.position)
+swim = MapManager.IsSwimGrid(cell)      ← 唯一判据，不看 id / 性别 / 形象
+if (swim == Role.IsInBath) return       ← 幂等
+Role.IsInBath = swim; SetBathing(swim); CreateRoleGhost; Animator.SetFloat("IsBath", swim?1:0)
+移速 = CharMoveSpeedInWater; 影子隐藏
+```
+
+调用点只有：`Role.OnMove`（每走一格）、`CreateRoleMar.CreateNpc/CreatePlayer`、剧情
+`MoveNode`/`JumpToDestination`/`ChangeNpcDestination`。**站着不动不会被调用。**
+
+### 3. 两个已知限制（都不是钩子的问题）
+
+1. **站桩不触发**：被直接放进水格、之后不移动的角色，没人替她调 `CheckInBathWater` →
+   `IsInBath` 一直是 false、`IsBath` 参数一直是 0。可以加「状态自愈」（节流遍历场景角色，
+   把 `IsInBath` 与 `IsSwimGrid(脚下格)` 对齐后补调一次）来解决。
+2. **没有水中形象的角色，入水也不显示游泳**：游泳观感由形象资源决定 ——
+   `{B|Z}{形象}_Wash*` 动作（160 条 / 78 个形象）+ `{形象}w` 贴图集（40 套）。
+   没有这两个资源的形象（例如 177）即使 `IsBath=1`，动画也只能继续播 `stand/walk`，
+   看起来就是「站在水面上走」。这是数据层，mod 改不了。
+
+### 4. `ForceNPCSwim`
+
+`GameEnvConstStrData` 里的 `ForceNPCSwim`（官方值为空）是「把某些 NPC 的落点放进家园水域格」的开关，
+进入水域图时由 `GameConfig.GetConfigStr` 读；它**只改落点**，不负责入水状态与动作。
+实测：填 `10033` 后该角色从陆地落点变成 504 的水域格。
 
 ## 已知限制
 
