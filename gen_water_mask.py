@@ -33,7 +33,8 @@ ALWAYS_EMIT_EMPTY = [2169]
 #   ADD    ：这些格**额外算水域**（与 prefab 的 _SwimGrid 取并集）
 #   REPLACE：这张图的水域**以文件为准**（整表替换，prefab 的格子不再自动并入）
 WATER_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native", "water_data")
-ADD_FILES = {504: "504.add.txt"}
+EXCLUDE_FILES = {504: "504.exclude.txt"}   # 先减
+ADD_FILES = {504: "504.add.txt"}          # 再把我方漏掉的加回来
 REPLACE_FILES = {2160: "2160.replace.txt"}
 
 
@@ -56,6 +57,15 @@ def apply_overrides(data):
         old = len(set(data.get(mid, [])))
         data[mid] = list(cells)
         log.append("map %d 整表替换：%d -> %d 格（%s）" % (mid, old, len(cells), fn))
+    for mid, fn in EXCLUDE_FILES.items():
+        p = os.path.join(WATER_DATA_DIR, fn)
+        if not os.path.exists(p) or mid not in data:
+            continue
+        drop = _parse_pairs(p)
+        before = set(data[mid])
+        data[mid] = list(before - drop)
+        log.append("map %d 排除：%d - %d -> %d 格（%s，命中 %d）"
+                   % (mid, len(before), len(drop), len(data[mid]), fn, len(before & drop)))
     for mid, fn in ADD_FILES.items():
         p = os.path.join(WATER_DATA_DIR, fn)
         if not os.path.exists(p):
