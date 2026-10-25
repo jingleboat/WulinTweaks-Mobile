@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v115"         /* v115：504 并集 + 2160 整表替换；CreateNpc 强制定位进水域格 */
+#define MOD_VER "v116"         /* v116：摘掉导致闪退的 CreateNpc 钩子（保留水域并集/整表替换） */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */

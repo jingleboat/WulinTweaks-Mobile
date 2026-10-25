@@ -251,72 +251,6 @@ static void hook_ciw(void* self, uint64_t xy, uint32_t zh) {
     if (orig_ciw) orig_ciw(self, xy, zh);
 }
 
-/* ---- v115：名单里的 NPC 直接落到水域格上 ----------------------------------
- * 手机端**不读** ForceNPCSwim（v113 的覆写从未被调用过，日志可以作证），
- * 所以改成在「角色真正被创建」的那一刻把落点换掉：CreateRoleMar.CreateNpc 的第二个参数
- * 就是目标格，换掉它，游戏随后自己在 CreateNpc 内部调 CheckInBathWater → 直接入水。
- */
-typedef void* (*fn_crn)(void*, uint64_t, uint32_t, void*, int, int, int);
-static fn_crn orig_crn_a = nullptr, orig_crn_b = nullptr;
-
-/* 名单解析：逗号/空格分隔的 uid */
-static int uid_in_force_list(int uid) {
-    if (!FORCE_SWIM_IDS[0] || uid <= 0) return 0;
-    const char* p = FORCE_SWIM_IDS;
-    while (*p) {
-        while (*p == ',' || *p == ' ') ++p;
-        if (!*p) break;
-        int v = 0, neg = 0;
-        if (*p == '-') { neg = 1; ++p; }
-        while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); ++p; }
-        if (neg) v = -v;
-        if (v == uid) return 1;
-    }
-    return 0;
-}
-
-/* 在烤表里找离 (x,y) 最近的水域格（曼哈顿距离） */
-static int pick_water_cell(const WaterMaskEntry* e, int x, int y, int* ox, int* oy) {
-    if (!e || e->count <= 0) return 0;
-    int best = 0x7fffffff, bx = 0, by = 0;
-    for (int i = 0; i < e->count; ++i) {
-        int64_t k = e->keys[i];
-        int cx = (int)(uint32_t)(k & 0xffffffffu);
-        int cy = (int)(uint32_t)(k >> 32);
-        int d = abs(cx - x) + abs(cy - y);
-        if (d < best) { best = d; bx = cx; by = cy; }
-    }
-    *ox = bx; *oy = by;
-    return 1;
-}
-
-static void* crn_common(fn_crn orig, void* gci, uint64_t xy, uint32_t z,
-                        void* parent, int a, int b, int c) {
-    if (FORCE_SWIM_IDS[0] && (uintptr_t)gci > 0x10000) {
-        int uid = *(int*)((char*)gci + OFF_GCI_TPL_UID);
-        if (uid_in_force_list(uid)) {
-            const WaterMaskEntry* e = mask_for(g_cur_map);
-            int x = vec_x(xy), y = vec_y(xy);
-            if (e && !mask_has(e, x, y)) {
-                int ox = 0, oy = 0;
-                if (pick_water_cell(e, x, y, &ox, &oy)) {
-                    xy = ((uint64_t)(uint32_t)ox) | ((uint64_t)(uint32_t)oy << 32);
-                    z = 0;
-                    LOGI("[water] 强制定位 uid=%d map=%d (%d,%d) -> 水域 (%d,%d)", uid, g_cur_map, x, y, ox, oy);
-                }
-            }
-        }
-    }
-    return orig ? orig(gci, xy, z, parent, a, b, c) : nullptr;
-}
-
-static void* hook_crn_a(void* gci, uint64_t xy, uint32_t z, void* p, int a, int b, int c) {
-    return crn_common(orig_crn_a, gci, xy, z, p, a, b, c);
-}
-static void* hook_crn_b(void* gci, uint64_t xy, uint32_t z, void* p, int a, int b, int c) {
-    return crn_common(orig_crn_b, gci, xy, z, p, a, b, c);
-}
-
 void water_install() {
     if (!g_i2cpp) g_i2cpp = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
     for (int i = 0; i < WATER_MASK_COUNT; ++i) {
@@ -355,17 +289,8 @@ void water_install() {
     else
         LOGE("[water] 挂 CheckInBathWater 失败");
 
-    /* v115：创建时把名单里的 NPC 落点换到水域格（手机端不读 ForceNPCSwim，只能这样） */
-    if (hook_install("CreateRoleMar.CreateNpc#A", (void*)(g_base + RVA_CRN_A),
-                     (void*)hook_crn_a, (void**)&orig_crn_a))
-        LOGI("[water] 已挂 CreateRoleMar.CreateNpc#A（强制定位）");
-    else
-        LOGE("[water] 挂 CreateRoleMar.CreateNpc#A 失败");
-    if (hook_install("CreateRoleMar.CreateNpc#B", (void*)(g_base + RVA_CRN_B),
-                     (void*)hook_crn_b, (void**)&orig_crn_b))
-        LOGI("[water] 已挂 CreateRoleMar.CreateNpc#B（强制定位）");
-    else
-        LOGE("[water] 挂 CreateRoleMar.CreateNpc#B 失败");
+    /* v116：CreateRoleMar.CreateNpc 的钩子已摘除 —— 0x234EAD4 那个重载实际用到 w7（第 8 个参数），
+       我们的转调只保留到 x6，丢参会把垃圾指针传进游戏 → 加载存档闪退。等确认参数表再挂。 */
 
     /* v113：覆写 ForceNPCSwim（PC 端有效；手机端实测没被调用过，保留作对照） */
     if (hook_install("GameConfig.GetConfigStr", (void*)(g_base + RVA_GC_GETCONFIGSTR),
