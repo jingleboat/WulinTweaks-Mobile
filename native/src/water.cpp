@@ -359,6 +359,7 @@ static void hook_setpos(void* self, uint64_t xy, uint32_t z, int also) {
 #define RVA_GCI_CUR_MAP  0x223C1A8  /* int GameCharacterInstance.get_CurMapId() */
 #define RVA_GCI_CUR_POS  0x223C1B8  /* Vector3Int GameCharacterInstance.get_CurPos() */
 #define RVA_ROLE_NPCTP   0x2184F80  /* void Role.NpcTP(Vector3Int pos) —— 真正把角色传送到某格 */
+#define RVA_ROLE_SETEND  0x2184D50  /* void Role.SetEndPos(Vector3Int end) —— 设终点，角色会自己走过去 */
 
 static void* g_gcm = nullptr;
 static time_t g_last_poll = 0;
@@ -438,10 +439,22 @@ static void force_poll(void) {
         uint64_t cell_xy = ((uint64_t)(uint32_t)ox) | ((uint64_t)(uint32_t)oy << 32);
         void* role = role_of_uid(uid);
         if (role) {
+            /* 第一次：真传送到水里（否则走不进去）；之后：给一个别的水平格当终点，
+             * 让她「在水里走」——走动时游戏才播 {形象}_WashMove1（=游泳），静止播 WashStand1（泡澡坐姿）。 */
+            static int tick = 0;
+            tick++;
             typedef void (*fn_tp)(void*, uint64_t, uint32_t, void*);
             ((fn_tp)(g_base + RVA_ROLE_NPCTP))(role, cell_xy, 0, nullptr);
+            if (e->count > 1 && (tick % 2) == 0) {
+                int64_t k2 = e->keys[(tick * 7) % e->count];
+                int tx = (int)(uint32_t)(k2 & 0xffffffffu);
+                int ty = (int)(uint32_t)(k2 >> 32);
+                uint64_t tgt = ((uint64_t)(uint32_t)tx) | ((uint64_t)(uint32_t)ty << 32);
+                typedef void (*fn_end)(void*, uint64_t, uint32_t, void*);
+                ((fn_end)(g_base + RVA_ROLE_SETEND))(role, tgt, 0, nullptr);
+            }
             if (g_force_hits2++ < 15)
-                LOGI("[water] NpcTP 传送 uid=%d map=%d (%d,%d) -> 水域 (%d,%d)", uid, map, x, y, ox, oy);
+                LOGI("[water] 传送+游动 uid=%d map=%d (%d,%d) -> 水域 (%d,%d)", uid, map, x, y, ox, oy);
         } else {
             if (g_force_hits2++ < 15)
                 LOGI("[water] 找不到 Role uid=%d（不在场景里？）", uid);
