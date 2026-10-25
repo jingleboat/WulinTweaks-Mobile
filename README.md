@@ -127,6 +127,12 @@ $env:JAVA_HOME="<jdk>"
 | **v86** | 回退称号功能，名字恢复成模板「姓+名」（与 PC 1.11.8 同步） |
 | **v87** | 剧情展开**接管层对齐 PC**：新增「门级接管」—— 被展开的门在 `HoldNode.CheckCondition` 之后整门判真（`flat_add_gate` / `flatten_gate_forced`），不再依赖「门挂的是伙伴/在队条件」；恒真表去掉 `F_FLAT` 判据（中途关开关不会出现「线已改、门不判真」）；冲突判定把超上限 region 也算进来（与 PC 一致） |
 | **v88** | 固定名单（不放宽）追加 `R20004-6`（伙伴的故事，包打听离队那段）；与 PC 1.11.9 同步 |
+| **v123** | **水中播「游泳」动作**：NpcTP 传送进水域后，隔一拍 `Role.SetEndPos` 给另一个水平格当终点，让角色在水里持续走动 → 播 `{形象}_WashMove1`。之前「坐着」是 `WashStand1`（静止泡水）本来的姿势，不是手机版改资源（PC 与手机的动作名/采样率/`{形象}w` 贴图集完全一致） |
+| **v122** | `Role.NpcTP(0x2184F80)` 真正传送进水域（v121 的 `SetPos` 只改实例数据、画面不动）；名单补严如蕊 20063；丁小姐 20127 排除（形象 269 无 Wash 动作/无 `269w` 贴图） |
+| **v121** | 改为**轮询**（不依赖钩子）：借 `MapManager.IsBlock` 做节拍，每 500ms 对名单逐个 `GetCharacter` → `get_CurMapId` → `get_CurPos` → 不在水域就 `SetPos`。日志实证 `SetPos`/`SetMapId` 的**跳板都构造失败**，两个钩子都装不上 |
+| **v120** | 尝试改钩 `GameCharacterInstance.SetMapId`（`SetPos` 钩不上）+ 直接调 `SetPos`；实测 `SetMapId` 同样**跳板构造失败** |
+| **v118** | 504 = 760 − 96 + 15（补 `(34,21)(34,22)(34,23)`）= 679 格 |
+| **v116** | 摘掉导致**加载存档闪退**的 `CreateRoleMar.CreateNpc` 钩子（`0x234EAD4` 用到了 w7 = 第 8 个参数，转调只保留到 x6，丢参把垃圾指针传进游戏） |
 | **v119** | 修 2160 跨图污染：`MapEntity.IsBlock/IsSwimGrid` 以前用「任意烤表命中就算」，导致 2160 里 504 池子的坐标（如 (26,34)）也被当水域；改为只认当前图（`g_cur_map`）的烤表。另加 `GameCharacterInstance.SetPos` 强制定位：名单内 uid 的落点换成当前图烤表里最近的水域格 |
 | **v117** | 水域按实测两文件正确落地：**504 = 760 − 96（桌面 `504.txt`，首数是场景名已去掉）+ 12（`E:\笔记\504.txt`）= 676 格**；**2160 = 177 格（两版数据一致，维持不变）**。`gen_water_mask.py` 支持 EXCLUDE + ADD + REPLACE 三种覆盖 |
 | **v115** | 水域：**504 = prefab ∪ 504.txt（并集，仍 760 格，因为 96 格本来就在水域里）**、**2160 = 2160.txt 整表（177 格）**；并新增 `CreateRoleMar.CreateNpc` 强制定位 —— 手机端不读 `ForceNPCSwim`（v113 的覆写从未被调用），改在角色创建那一刻把落点换成最近的水域格 |
@@ -257,6 +263,45 @@ Role.IsInBath = swim; SetBathing(swim); CreateRoleGhost; Animator.SetFloat("IsBa
    `{B|Z}{形象}_Wash*` 动作（160 条 / 78 个形象）+ `{形象}w` 贴图集（40 套）。
    没有这两个资源的形象（例如 177）即使 `IsBath=1`，动画也只能继续播 `stand/walk`，
    看起来就是「站在水面上走」。这是数据层，mod 改不了。
+
+
+### 手机端「让 NPC 进水」的落地记录（v112 ~ v123）
+
+这一段是踩了 10 个版本才通的，按顺序记下来，别再走回头路：
+
+| 结论 | 证据 |
+|---|---|
+| **`ForceNPCSwim` 手机端根本不读** | 进 504 时 PC 会用 `GameConfig.GetConfigStr("ForceNPCSwim")` 读它；手机整场日志**零调用** → 方案 A（覆写配置）在手机不成立 |
+| **`CreateRoleMar.CreateNpc` 不能乱钩** | 它有 8 个参数（`0x234EAD4` 里 `mov w26, w7`），只保留到 x6 的转调会把垃圾指针传进去 → **加载存档闪退**（v115） |
+| **`GameCharacterInstance.SetPos` / `SetMapId` 钩不上** | 日志 `hook …: 跳板构造失败`，v119/v120 完全没生效 |
+| **`SetPos` 只改数据，画面不动** | v121 日志里 CurPos 一直在变（还被打回），Role 一动不动 |
+| **`Role.NpcTP(Vector3Int)`（0x2184F80）才是真传送** | v122 起角色真的出现在水里 |
+| **静止 = 坐着，走动 = 游泳** | 动画只有两个：`{B|Z}{形象}_WashStand1`（泡水坐姿）/ `WashMove1`（划水）。PC 与手机同名同采样率（6.0）、`{形象}w` 贴图集同为 256×256 —— **「坐着」不是手机版改的资源** |
+
+最终实现（v123，`water.cpp`）：
+
+```
+每 500ms（借 MapManager.IsBlock 节拍）：
+  对 FORCE_SWIM_IDS 里每个 uid →
+    GetCharacter(uid)（0x2263114） → get_CurMapId（0x223C1A8）== 当前图？
+    get_CurPos（0x223C1B8）在水域格里？ 是 → 跳过
+    否 → Resources.FindObjectsOfTypeAll(Role) 按 uid 找 Role →
+         Role.NpcTP(最近的水域格)  +  GameCharacterInstance.SetPos(同格)
+    隔一拍 → Role.SetEndPos(另一个水平格)  让其在水中走动 → 播 WashMove1
+```
+
+**名单（24 人，写死在 `water.cpp` 的 `FORCE_SWIM_IDS`）**：
+
+```
+10021 曼陀罗   10084 洛千雪   10092 华青青   10009 叶银瓶
+10039 定海棠   10064 曲忘忧   10056 绛紫烟   10008 凌梦蝶
+10045 韩红玉   10071 福箐郡主 10094 一枝花   10081 哑琴
+10028 完颜昭宁 10005 苗彩蝶   10075 付瑶琴   10052 顾倾城
+10098 鱼薇儿   10088 唐婉儿   10108 海棠秋   10105 凤璇玑
+10049 月咏樱羽 10136 纪茯苓   20025 花四娘   20063 严如蕊
+```
+
+被排除：**丁小姐 20127**（形象 269 既无 `Wash*` 动作也无 `269w` 贴图，入水也只能播走路）。
 
 ### 4. `ForceNPCSwim`
 
