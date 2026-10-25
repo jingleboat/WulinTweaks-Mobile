@@ -46,7 +46,10 @@
  * 这里就是把这个「读」的结果换掉：名单写在下面一行，逗号分隔；留空 = 完全不干预。
  * 名单里的 id 必须是「角色池 uid」（例如 10033 叶云）。
  */
-#define FORCE_SWIM_IDS "10033"
+/* v121：用户指定的名单（uid）。已查：曼陀罗/洛千雪/华青青/叶银瓶/定海棠/曲忘忧/绛紫烟/凌梦蝶/韩红玉/
+ * 福箐郡主/一枝花/哑琴/完颜昭宁/苗彩蝶/付瑶琴/顾倾城/鱼薇儿/唐婉儿/海棠秋/凤璇玑/月咏樱羽 + 纪茯苓(10136) + 花四娘(20025，待确认)
+ * 未查到：严如蕊、丁小姐（角色池里没有，可能在 DLC 包里）—— 给我 id 我加上 */
+#define FORCE_SWIM_IDS "10021,10084,10092,10009,10039,10064,10056,10008,10045,10071,10094,10081,10028,10005,10075,10052,10098,10088,10108,10105,10049,10136,20025"
 
 #define RVA_GC_GETCONFIGSTR 0x2271D50 /* string GameConfig.GetConfigStr(string) */
 
@@ -118,6 +121,7 @@ static void dbg_tick(int map) {
 }
 
 /* ------------------------------------------------------------------- hooks */
+static void force_poll(void);   /* 前置声明：IsBlock 钩子里驱动 */
 static fn_block orig_mm_block = nullptr, orig_mm_swim = nullptr;
 static fn_block orig_me_block = nullptr, orig_me_swim = nullptr;
 static fn_ciw orig_ciw = nullptr;
@@ -128,6 +132,7 @@ static bool hook_mm_isblock(void* self, uint64_t xy, uint32_t z) {
     if (!self) return r;
     int map = *(int*)((char*)self + OFF_MM_CURMAP);
     g_cur_map = map;
+    force_poll();
     dbg_tick(map);
     g_n_mm_block++;
     if (!F_WATER) return r;
@@ -279,13 +284,47 @@ static int pick_water_cell(const WaterMaskEntry* e, int x, int y, int* ox, int* 
     return 1;
 }
 
+#define RVA_GCI_SETPOS 0x2245B58   /* void SetPos(Vector3Int, bool=true) —— 直接调用（钩子跳板构造失败） */
+#define RVA_GCI_SETMAPID 0x2245B48 /* void SetMapId(int mapId, bool alsoChangeTarget=true) */
+typedef void (*fn_setpos)(void*, uint64_t, uint32_t, int);
+static fn_setpos orig_setpos = nullptr;
+
+/* v120：SetPos 的跳板构造不出来（日志 "hook GameCharacterInstance.SetPos: 跳板构造失败"），
+ * 改为挂同族的 SetMapId —— 角色上图/换图时一定会调它；我们只观察，动手在它之后直接调 SetPos。 */
+
+typedef void (*fn_setmapid)(void*, int, int);
+static fn_setmapid orig_setmapid = nullptr;
+static int g_mapid_hits = 0;
+
+static void hook_setmapid(void* self, int map_id, int also) {
+    if (orig_setmapid) orig_setmapid(self, map_id, also);
+    if (!FORCE_SWIM_IDS[0] || (uintptr_t)self < 0x10000) return;
+
+    int uid = *(int*)((char*)self + OFF_GCI_TPL_UID);
+    int all = (strcmp(FORCE_SWIM_IDS, "all") == 0);
+    if (!all && !uid_in_force_list(uid)) return;
+
+    const WaterMaskEntry* e = mask_for(map_id);
+    if (!e || e->count <= 0) return;
+
+    /* 当前坐标：SetPos 之后游戏自己知道，这里只想判断"是否已经在某张表的水格里"，
+       保守做法——无条件挪到离 (0,0) 最近的入口不行，改成：先读 gci 里的位置字段不可靠，
+       所以直接给一个「按 map 取的中心水域格」= 表里排序后的中间那个，位置稳定且一定在水里。 */
+    int64_t k = e->keys[e->count / 2];
+    int wx = (int)(uint32_t)(k & 0xffffffffu);
+    int wy = (int)(uint32_t)(k >> 32);
+
+    if (g_mapid_hits++ < 12)
+        LOGI("[water] SetMapId 强制定位 uid=%d map=%d -> 水域 (%d,%d)", uid, map_id, wx, wy);
+
+    if (orig_setpos)
+        orig_setpos(self, ((uint64_t)(uint32_t)wx) | ((uint64_t)(uint32_t)wy << 32), 0, 1);
+}
+
 /* ---- v119：名单内角色 SetPos 时，把坐标换成当前地图烤表里最近的水域格 ----
  * 手机端不读 ForceNPCSwim（v113 实测零调用），CreateNpc 的参数表又太长（v115 因此闪退），
  * 所以改钩这个签名最简单的：GameCharacterInstance.SetPos(Vector3Int pos, bool alsoChangeTarget)。
  */
-#define RVA_GCI_SETPOS 0x2245B58
-typedef void (*fn_setpos)(void*, uint64_t, uint32_t, int);
-static fn_setpos orig_setpos = nullptr;
 static int g_pos_hits = 0;
 
 static void hook_setpos(void* self, uint64_t xy, uint32_t z, int also) {
@@ -307,6 +346,76 @@ static void hook_setpos(void* self, uint64_t xy, uint32_t z, int also) {
         }
     }
     if (orig_setpos) orig_setpos(self, xy, z, also);
+}
+
+/* ---- v121：轮询强制定位 ----------------------------------------------------
+ * 理由：SetPos(0x2245B58) 与 SetMapId(0x2245B48) 的**跳板都构造失败**（日志实证），
+ * 这两个函数钩不上；而 CreateNpc 的参数表太长（v115 因此闪退）。
+ * 所以改成不用钩子：借 MapManager.IsBlock（每帧都调、已挂）做节拍，每 500ms 查一遍名单：
+ *   GetCharacter(uid) → 是否在当前图 → CurPos 是否水域格 → 不是就 SetPos(最近的烤表水域格)。
+ */
+#define RVA_GCM_GETCHAR  0x2263114  /* GameCharacterInstance GameCharacterManager.GetCharacter(int) */
+#define RVA_GCI_CUR_MAP  0x223C1A8  /* int GameCharacterInstance.get_CurMapId() */
+#define RVA_GCI_CUR_POS  0x223C1B8  /* Vector3Int GameCharacterInstance.get_CurPos() */
+
+static void* g_gcm = nullptr;
+static time_t g_last_poll = 0;
+static int g_force_hits2 = 0;
+
+static void* gcm(void) {
+    if (g_gcm && (uintptr_t)g_gcm > 0x10000) return g_gcm;
+    void* k = find_class("WuLin", "GameCharacterManager");
+    void* inst = k ? find_object_of_type(k) : nullptr;
+    g_gcm = inst;
+    return inst;
+}
+
+static void force_poll(void) {
+    if (!FORCE_SWIM_IDS[0]) return;
+    time_t now = time(nullptr);
+    if (now == g_last_poll) return;
+    g_last_poll = now;
+
+    int map = g_cur_map;
+    const WaterMaskEntry* e = mask_for(map);
+    if (!e || e->count <= 0) return;
+    void* m = gcm();
+    if (!m) return;
+
+    typedef void* (*fn_getc)(void*, int, void*);
+    typedef int   (*fn_map)(void*, void*);
+    typedef uint64_t (*fn_pos)(void*, void*);
+    fn_getc getc_ = (fn_getc)(g_base + RVA_GCM_GETCHAR);
+    fn_map  gmap  = (fn_map)(g_base + RVA_GCI_CUR_MAP);
+    fn_pos  gpos  = (fn_pos)(g_base + RVA_GCI_CUR_POS);
+
+    /* 逐个 uid 处理 */
+    const char* p = FORCE_SWIM_IDS;
+    while (*p) {
+        while (*p == ',' || *p == ' ') ++p;
+        if (!*p) break;
+        int uid = 0, neg = 0;
+        if (*p == '-') { neg = 1; ++p; }
+        while (*p >= '0' && *p <= '9') { uid = uid * 10 + (*p - '0'); ++p; }
+        if (neg) uid = -uid;
+        if (uid <= 0) continue;
+
+        void* gci = getc_(m, uid, nullptr);
+        if ((uintptr_t)gci < 0x10000) continue;
+        if (gmap(gci, nullptr) != map) continue;          /* 不在当前图 */
+
+        uint64_t xy = gpos(gci, nullptr);
+        int x = (int)(uint32_t)(xy & 0xffffffffu);
+        int y = (int)(uint32_t)(xy >> 32);
+        if (mask_has(e, x, y)) continue;                  /* 已经在水里 */
+
+        int ox = 0, oy = 0;
+        if (!pick_water_cell(e, x, y, &ox, &oy)) continue;
+        if (orig_setpos)
+            orig_setpos(gci, ((uint64_t)(uint32_t)ox) | ((uint64_t)(uint32_t)oy << 32), 0, 1);
+        if (g_force_hits2++ < 15)
+            LOGI("[water] 强制定位 uid=%d map=%d (%d,%d) -> 水域 (%d,%d)", uid, map, x, y, ox, oy);
+    }
 }
 
 void water_install() {
@@ -350,12 +459,15 @@ void water_install() {
     /* v116：CreateRoleMar.CreateNpc 的钩子已摘除 —— 0x234EAD4 那个重载实际用到 w7（第 8 个参数），
        我们的转调只保留到 x6，丢参会把垃圾指针传进游戏 → 加载存档闪退。等确认参数表再挂。 */
 
-    /* v119：SetPos 强制定位（名单内角色一被定位就换到最近水域格） */
-    if (hook_install("GameCharacterInstance.SetPos", (void*)(g_base + RVA_GCI_SETPOS),
-                     (void*)hook_setpos, (void**)&orig_setpos))
-        LOGI("[water] 已挂 GameCharacterInstance.SetPos（强制定位）");
+    /* v120：SetPos 只取函数指针直接调用（它的跳板构造失败，钩不上） */
+    orig_setpos = (fn_setpos)(g_base + RVA_GCI_SETPOS);
+    LOGI("[water] SetPos 指针 = %p（直接调用，不挂钩子）", (void*)orig_setpos);
+
+    if (hook_install("GameCharacterInstance.SetMapId", (void*)(g_base + RVA_GCI_SETMAPID),
+                     (void*)hook_setmapid, (void**)&orig_setmapid))
+        LOGI("[water] 已挂 GameCharacterInstance.SetMapId（强制定位）");
     else
-        LOGE("[water] 挂 GameCharacterInstance.SetPos 失败");
+        LOGE("[water] 挂 GameCharacterInstance.SetMapId 失败");
 
     /* v113：覆写 ForceNPCSwim（PC 端有效；手机端实测没被调用过，保留作对照） */
     if (hook_install("GameConfig.GetConfigStr", (void*)(g_base + RVA_GC_GETCONFIGSTR),

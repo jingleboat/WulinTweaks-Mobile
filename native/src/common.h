@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v119"         /* v119：修 2160 跨图污染（只认当前图的烤表）+ SetPos 强制定位 */
+#define MOD_VER "v121"         /* v121：轮询强制定位（不依赖钩子）+ 25 人名单 */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
