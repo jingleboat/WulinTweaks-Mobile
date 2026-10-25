@@ -331,8 +331,12 @@ static int resolve(const char* token)
     if (!is_cls(pool, "CharacterPoolDataScriptObject")) { LOGI("[join] 角色池对象无效"); return 0; }
     void* arr = *(void**)((char*)pool + OFF_POOL_ARRAY);
     if ((uintptr_t)arr <= 0x10000) return 0;
+    /* v102：先确认这确实是个 il2cpp 数组（类名以 "[]" 结尾），否则不碰它 —— 名字查找的崩溃
+     * 就出在拿着不像数组的指针去读 length/元素。 */
+    const char* an = cls_of(arr);
+    if (!an || strstr(an, "[]") == nullptr) { LOGI("[join] 角色池不是数组(%s)，名字查找跳过", an ? an : "?"); return 0; }
     int n = *(int*)((char*)arr + OFF_ARRAY_LEN);
-    if (n <= 0 || n > 20000) return 0;
+    if (n <= 0 || n > 8000) { LOGI("[join] 角色池长度异常 %d，跳过", n); return 0; }
 
     int best = 0;
     char full[128], name[128];
