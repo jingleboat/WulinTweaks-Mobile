@@ -650,6 +650,15 @@ static int keep_original_for_uncached(void* condNode) {
         if (strcmp(gn, k_fixed_original[i]) == 0) return 1;
 
     if (story_blacklisted(gn)) return 1;
+    /* v110：固定图改用正则 —— ^Guide10099-（师父线整族）+ ^Fame-2$（仅这一张）；
+     * 烈酒与故事(R10112-2)、伙伴的故事(R20004-6) 已移除，交给「每图只放宽一次」。 */
+    if (strncmp(gn, "Guide10099-", 11) == 0 || strcmp(gn, "Fame-2") == 0) return 1;
+
+    /* v110：结缘图（含「结缘界面」= 月老祠那条线）一律不放宽 —— 放在最前面，先于任何放宽出口 */
+    if (is_bond_graph(g, gn)) {
+        if (g_bond_log++ < 20) LOGI("[team] 图 %s 含「结缘界面」→ 不放宽（原版：必须在队）", gn);
+        return 1;
+    }
 
     int selfId = parse_r_id(gn);
     if (selfId <= 0) return 0;                       /* 非角色剧情图：放宽 */
