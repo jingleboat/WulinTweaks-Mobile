@@ -207,9 +207,18 @@ $env:JAVA_HOME="<jdk>"
 ### 1. 手机为什么必须「烤表」
 
 游戏用地图 prefab 里的 `_SwimGrid`（Tilemap）定义水域格，**只有 504 / 2160 有数据**
-（504 = 760 格、2160 = 177 格、2169 = 0 格）。但手机运行期的地图实例里
-`_SwimGrid` / `_SwimLadder` 两个图层**根本不存在**（运行期只有 24 个图层），
-所以 `mSwimGrid` 全零、`MapManager.IsSwimGrid` 恒 false —— 原版手机端不可能下水。
+（504 = 760 格、2160 = 177 格、2169 = 0 格）。
+
+现状要分两层说清（2026-10-25 复核）：
+
+- **数据层：原版手机 APK 里就有**。`assets/aa/Android/prefabs_map_assets_assets/_artwork/map/prefab/`
+  下的 `map_504.prefab.bundle` 里 `_SwimGrid` = 760 格 + `_SwimLadder` 8 格，`map_2160.prefab.bundle`
+  里 177 格 + 2 格，与 PC 的 `_SwimGrid` 逐格一致（`gen_water_mask.py --check` 可复验）。
+- **运行层：v6x~v7x 的设备探针当时看到的是「运行期地图实例只有 24 个图层、没有 `_SwimGrid`/`_SwimLadder`」**，
+  于是判断 `mSwimGrid` 全零、`IsSwimGrid` 恒 false —— 这也是当初做烤表的原因。
+- ⚠️ 但 v112/v113 的诊断日志（`[water] ME.IsSwimGrid(x,y) 原值=…`）能直接验这一条：
+  **只要出现 `原值=1`，就说明原版手机其实认水域格，烤表只是"兜底/补漏"而不是"无中生有"**。
+  这条待日志确认后要回来改本节措辞。
 
 因此 `water_mask.h` 由 `gen_water_mask.py` 从 APK 地图 prefab 里把 `_SwimGrid` 烤成坐标表，
 运行期用 `water.cpp` 的两个钩子顶替：
