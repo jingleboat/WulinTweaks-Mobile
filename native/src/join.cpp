@@ -279,6 +279,40 @@ static void* team_list(void)
     return ((uintptr_t)lst > 0x10000) ? lst : nullptr;
 }
 
+/* v103：改用游戏自己的方法（与 PC 完全同一条路）—— 运行期按名字取 MethodInfo，
+ * 不再手写 List 追加，避免重复入队与队伍逻辑错乱。 */
+static void* method_of(void* obj, const char* name, int argc)
+{
+    if (!A_class_get_method && g_i2cpp)
+        A_class_get_method = (void* (*)(void*, const char*, int))dlsym(g_i2cpp, "il2cpp_class_get_method_from_name");
+    if (!A_class_get_method) return nullptr;
+    void* k = A_obj_get_class(obj);
+    if ((uintptr_t)k < 0x10000) return nullptr;
+    void* mi = A_class_get_method(k, name, argc);
+    if (!mi) return nullptr;
+    void* fp = *(void**)mi;
+    return ((uintptr_t)fp > 0x10000) ? fp : nullptr;
+}
+
+static int team_add2(void* inst, int uid)
+{
+    void* m = ptm();
+    if (!m || !inst) return -1;
+    void* f_has = method_of(m, "HasCharacterAsMember", 2);
+    if (f_has) {
+        bool has = ((bool (*)(void*, void*, bool, void*))f_has)(m, inst, false, nullptr);
+        if (has) { LOGI("[join] uid=%d 已在队（HasCharacterAsMember），跳过", uid); return 2; }
+    }
+    void* f_add = method_of(m, "AddCharacter", 1);
+    if (f_add) {
+        bool ok = ((bool (*)(void*, void*, void*))f_add)(m, inst, nullptr);
+        LOGI("[join] AddCharacter(%d) → %d", uid, (int)ok);
+        return ok ? 1 : 0;
+    }
+    LOGI("[join] 取不到 AddCharacter，退回直接写列表");
+    return -1;
+}
+
 static int team_add(int uid)
 {
     void* lst = team_list();
@@ -394,7 +428,8 @@ static int join_handle(const char* text)
     /* v99：只做「入队」这一步，其余动作（解除陌生/家园/结缘）先关掉 ——
      * v98 在动作层仍然段错误，逐层打开比一次全开更容易定位。 */
     LOGI("[join] uid=%d 实例=%p，开始入队", uid, inst);
-    int joined = team_add(uid);
+    int joined = team_add2(inst, uid);
+    if (joined < 0) joined = team_add(uid);
     if (bond) LOGI("[join] 结缘参数本版未启用");
     LOGI("[join] %s → uid=%d，本次入队=%d", text, uid, joined);
     return 1;
