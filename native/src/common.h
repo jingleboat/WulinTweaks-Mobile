@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v94"          /* 本 mod 自己的版本号，只用来对日志 */
+#define MOD_VER "v97"          /* v97：join 兼 hook InvokeCommandInternal（Enter 键）*/
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
@@ -288,6 +288,7 @@ void story_play_end_now(void);   /* v80：剧情收尾时立刻还原（StoryClo
 #define OFF_UI_NPC_TRADE 0xB8    /* TradingWithNpcUI.npcTrading */
 #define OFF_HOLD_TIMES 0x70      /* HoldNode.checkSucessTimes（addTimes 置 1 / clearTimes 置 0） */
 #define OFF_NODE_GRAPH 0x18      /* XNode.Node.graph -> NodeGraph（ScriptableObject，name 即剧情图 ID） */
+#define OFF_GRAPH_NODES 0x18     /* NodeGraph.nodes（List<Node>）—— v95 扫节点类名用 */
 #define OFF_PARTNER_ID 0x58      /* ConditionNode(IsJoinedTeam/HavePartner).partnerID */
 #define OFF_PARTNER_NEGATE 0x5C  /* 同上 Negate（取反） */
 #define OFF_TEAM_STATE 0x130     /* GameCharacterInstance.m_TeamMemberState（== NULL 表示从未入队） */

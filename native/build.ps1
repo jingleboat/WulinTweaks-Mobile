@@ -9,7 +9,7 @@ Push-Location $src
 try {
     Write-Host '--- libwulin.so'
     & $cc -shared -fPIC -O2 -Wall -Wextra -o libwulin.so `
-        src\wulin_main.cpp src\trade.cpp src\ui.cpp src\hook.cpp src\probe.cpp src\water.cpp src\flatten.cpp -llog -lm `
+        src\wulin_main.cpp src\trade.cpp src\ui.cpp src\hook.cpp src\probe.cpp src\water.cpp src\flatten.cpp src\join.cpp -llog -lm `
         '-Wl,-soname,libwulin.so' '-Wl,--build-id=none'
     if ($LASTEXITCODE) { throw 'clang (libwulin) failed' }
 

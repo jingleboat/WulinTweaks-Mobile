@@ -20,6 +20,7 @@
 #include "ui.h"
 #include "probe.h"
 #include "water.h"
+#include "join.h"
 
 #include <dlfcn.h>
 #include <link.h>
@@ -557,6 +558,69 @@ static int keep_original_for(void* condNode) {
     return result;
 }
 
+/* ---- v95：含「结缘界面」的图一律不放宽（与 PC 1.11.19 对齐） -----------------
+ * 这类图（12 张，全在月老祠 map 5016）的收尾会写人物数据：`激活NPC情缘`（SetBond 双向写）、
+ * `获得武功或绝学`（武功）、buff 85xx/89xx/88xx、`改变NPC关系值`。
+ * 她不在队 / 实例不唯一时，这些写入会落到临时实例上 → 人物数据分裂。
+ * 所以直接跳过放宽，走原版「必须在队」。其余本命图照旧放宽（人不在队也照演）。 */
+#define BOND_CACHE_N 64
+static void* g_bond_g[BOND_CACHE_N];
+static int   g_bond_v[BOND_CACHE_N];
+static int   g_bond_i = 0;
+static int   g_bond_log = 0;
+
+static const char* node_class_name(void* node);   /* 定义在「ContinueArrange 递归」那一节 */
+
+/* 已知的 12 张结缘图（扫不到类名时的兜底；DLC 新增的靠节点扫描发现）。 */
+static const char* k_bond_graphs[] = {
+    "R10008-5", "R10009-6", "R10039-9", "R10052-3", "R10056-4", "R10064-6",
+    "R10081-3", "R10084-5", "R10092-4", "R10108-3", "R20025-11", "R20063-2",
+};
+
+static void* node_list_item(void* list, int i) {
+    if ((uintptr_t)list < 0x10000 || i < 0) return nullptr;
+    void* arr = *(void**)((char*)list + OFF_LIST_ITEMS);
+    if ((uintptr_t)arr < 0x10000) return nullptr;
+    void* v = *(void**)((char*)arr + OFF_ARRAY_DATA + (size_t)i * 8);
+    return ((uintptr_t)v > 0x10000) ? v : nullptr;
+}
+
+static int is_bond_graph(void* g, const char* gn) {
+    if ((uintptr_t)g < 0x10000) {
+        for (size_t i = 0; i < sizeof(k_bond_graphs) / sizeof(k_bond_graphs[0]); ++i)
+            if (gn && strcmp(gn, k_bond_graphs[i]) == 0) return 1;
+        return 0;
+    }
+    for (int i = 0; i < BOND_CACHE_N; ++i)
+        if (g_bond_g[i] == g) return g_bond_v[i];
+
+    int hit = 0, scanned = 0;
+    void* nodes = *(void**)((char*)g + OFF_GRAPH_NODES);
+    if ((uintptr_t)nodes > 0x10000) {
+        int n = *(int*)((char*)nodes + OFF_LIST_SIZE);
+        if (n > 0 && n <= 4096) {
+            scanned = 1;
+            for (int i = 0; i < n; ++i) {
+                void* nd = node_list_item(nodes, i);
+                if (!nd) continue;
+                if (*(void**)((char*)nd + OFF_NODE_GRAPH) != g) continue;   /* 数组读偏的保险 */
+                const char* cn = node_class_name(nd);
+                if (cn && strcmp(cn, "ShowUIBondsNode") == 0) { hit = 1; break; }
+            }
+        }
+    }
+    if (!scanned) {                                  /* 扫不了：按 12 张已知图名 */
+        for (size_t i = 0; i < sizeof(k_bond_graphs) / sizeof(k_bond_graphs[0]); ++i)
+            if (gn && strcmp(gn, k_bond_graphs[i]) == 0) { hit = 1; break; }
+        if (g_bond_log++ < 20) LOGI("[team] 扫图失败（%s）→ 退回图名表", gn ? gn : "?");
+    }
+
+    g_bond_g[g_bond_i] = g;
+    g_bond_v[g_bond_i] = hit;
+    g_bond_i = (g_bond_i + 1) % BOND_CACHE_N;
+    return hit;
+}
+
 static int keep_original_for_uncached(void* condNode) {
     void* g = *(void**)((char*)condNode + OFF_NODE_GRAPH);
     if ((uintptr_t)g < 0x10000) return 0;
@@ -575,6 +639,12 @@ static int keep_original_for_uncached(void* condNode) {
 
     int pid = *(int*)((char*)condNode + OFF_PARTNER_ID);
     if (pid != selfId) return 0;                     /* 条件是别的角色：放宽（彩蛋） */
+
+    if (is_bond_graph(g, gn)) {                      /* v95：结缘图跳过放宽 */
+        if (g_bond_log++ < 20)
+            LOGI("[team] 图 %s 含「结缘界面」→ 跳过放宽（按原版：必须在队）", gn);
+        return 1;
+    }
     return never_joined(pid);                        /* 本命角色：仅「从未入队」时才挡 */
 }
 
@@ -2190,6 +2260,9 @@ static void install_tweaks() {
      * 名单内的图在这里直接放行，交给原版判断。 */
     hook_install("剧情.HoldCheck", (void*)(g_base + RVA_HOLD_CHECK),
                  (void*)hook_hold_check, (void**)&orig_hold_check);
+
+    /* v96：控制台 join 指令（静默，命中即吞） */
+    join_install_hooks();
 
     /* v50：离队容错 —— remove 一个不在队的角色时当作已成功，避免剧情卡死 */
     if (hook_install("剧情.伙伴离队容错", (void*)(g_base + RVA_CHANGE_PARTNER),
