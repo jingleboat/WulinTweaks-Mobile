@@ -365,6 +365,38 @@ static void set_bond(void* inst, int uid)
         LOGI("[join] 心情/情缘 buff %d/%d/%d", 8500 + xx, 8900 + xx, 8800 + xx);
     }
 }
+/* v105：解除陌生 —— 与 PC 同一条路（SetRelation 双向 100 + 初次见面=1 + 清陌生名） */
+static void unstranger_m(void* inst)
+{
+    void* m = ptm();
+    if (!m || !inst) return;
+    void* f_me = method_of(m, "get_PlayerDataInstance", 0);
+    void* me = f_me ? ((void* (*)(void*, void*))f_me)(m, nullptr) : nullptr;
+    if ((uintptr_t)me > 0x10000) {
+        void* f_id = method_of(me, "get_InstanceId", 0);
+        int meId = f_id ? ((int (*)(void*, void*))f_id)(me, nullptr) : 0;
+        void* f_hid = method_of(inst, "get_InstanceId", 0);
+        int herId = f_hid ? ((int (*)(void*, void*))f_hid)(inst, nullptr) : 0;
+        void* f_rel = method_of(inst, "SetRelation", 2);
+        if (f_rel && meId > 0) ((void (*)(void*, int, int, void*))f_rel)(inst, meId, 100, nullptr);
+        f_rel = method_of(me, "SetRelation", 2);
+        if (f_rel && herId > 0) ((void (*)(void*, int, int, void*))f_rel)(me, herId, 100, nullptr);
+
+        void* f_st = method_of(inst, "get_IsUsingStangerName", 0);
+        bool stranger = f_st ? ((bool (*)(void*, void*))f_st)(inst, nullptr) : true;
+        if (stranger) {
+            void* f_add = method_of(inst, "ChangeAdditionPropWithLog", 2);
+            if (f_add) ((void (*)(void*, void*, int, void*))f_add)(inst, A_string_new("初次见面"), 1, nullptr);
+            void* f_sur = method_of(inst, "SetSurName", 1);
+            if (f_sur) ((void (*)(void*, void*, void*))f_sur)(inst, A_string_new(""), nullptr);
+            void* f_giv = method_of(inst, "SetGivenName", 1);
+            if (f_giv) ((void (*)(void*, void*, void*))f_giv)(inst, A_string_new(""), nullptr);
+            LOGI("[join] 解除陌生：relation 100 + 初次见面=1 + 清姓名");
+        } else {
+            LOGI("[join] 解除陌生：本来就不是陌生状态，跳过");
+        }
+    }
+}
 static int team_add(int uid)
 {
     void* lst = team_list();
@@ -410,6 +442,10 @@ static int resolve(const char* token)
 {
     int id = parse_r_id_str(token);
     if (id > 0) return id;
+    /* v105：按名字查找已移除（真机不稳），只接受数字 ID */
+    LOGI("[join] 只支持数字 ID（例如 join 20025）");
+    return 0;
+#if 0
 
     void* c = cfg();
     if (!c) { LOGI("[join] GameConfig 实例无效"); return 0; }
@@ -449,6 +485,7 @@ static int resolve(const char* token)
         if (uid > 0 && (best == 0 || uid < best)) best = uid;   /* 同名克隆取最小 uid */
     }
     return best;
+#endif
 }
 
 /* ---------------------------------------------------------------- 指令本体 */
@@ -483,6 +520,7 @@ static int join_handle(const char* text)
     LOGI("[join] uid=%d 实例=%p，开始入队", uid, inst);
     int joined = team_add2(inst, uid);
     if (joined < 0) joined = team_add(uid);
+    unstranger_m(inst);
     if (bond) set_bond(inst, uid);
     LOGI("[join] %s → uid=%d，本次入队=%d", text, uid, joined);
     return 1;
