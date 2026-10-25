@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v121"         /* v121：轮询强制定位（不依赖钩子）+ 25 人名单 */
+#define MOD_VER "v122"         /* v122：改用 Role.NpcTP 真正传送 + 名单加严如蕊(20063) */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */

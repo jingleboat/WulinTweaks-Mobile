@@ -48,8 +48,9 @@
  */
 /* v121：用户指定的名单（uid）。已查：曼陀罗/洛千雪/华青青/叶银瓶/定海棠/曲忘忧/绛紫烟/凌梦蝶/韩红玉/
  * 福箐郡主/一枝花/哑琴/完颜昭宁/苗彩蝶/付瑶琴/顾倾城/鱼薇儿/唐婉儿/海棠秋/凤璇玑/月咏樱羽 + 纪茯苓(10136) + 花四娘(20025，待确认)
- * 未查到：严如蕊、丁小姐（角色池里没有，可能在 DLC 包里）—— 给我 id 我加上 */
-#define FORCE_SWIM_IDS "10021,10084,10092,10009,10039,10064,10056,10008,10045,10071,10094,10081,10028,10005,10075,10052,10098,10088,10108,10105,10049,10136,20025"
+ * 严如蕊=20063（形象 255，有 Wash 动作 + 255w 贴图）
+ * 丁小姐=20127 **不加入**：形象 269 没有 Wash 动作、也没有 269w 贴图，入了水也只能播走路 */
+#define FORCE_SWIM_IDS "10021,10084,10092,10009,10039,10064,10056,10008,10045,10071,10094,10081,10028,10005,10075,10052,10098,10088,10108,10105,10049,10136,20025,20063"
 
 #define RVA_GC_GETCONFIGSTR 0x2271D50 /* string GameConfig.GetConfigStr(string) */
 
@@ -357,6 +358,7 @@ static void hook_setpos(void* self, uint64_t xy, uint32_t z, int also) {
 #define RVA_GCM_GETCHAR  0x2263114  /* GameCharacterInstance GameCharacterManager.GetCharacter(int) */
 #define RVA_GCI_CUR_MAP  0x223C1A8  /* int GameCharacterInstance.get_CurMapId() */
 #define RVA_GCI_CUR_POS  0x223C1B8  /* Vector3Int GameCharacterInstance.get_CurPos() */
+#define RVA_ROLE_NPCTP   0x2184F80  /* void Role.NpcTP(Vector3Int pos) —— 真正把角色传送到某格 */
 
 static void* g_gcm = nullptr;
 static time_t g_last_poll = 0;
@@ -368,6 +370,28 @@ static void* gcm(void) {
     void* inst = k ? find_object_of_type(k) : nullptr;
     g_gcm = inst;
     return inst;
+}
+
+/* 枚举场景里所有 Role，按 uid 找她的 Role —— SetPos 只改 GameCharacterInstance 的数据，
+ * 画面上不动；要真挪人必须拿 Role 对象调 NpcTP。 */
+static void* role_of_uid(int uid) {
+    void* k = find_class("WuLin", "Role");
+    if (!k) return nullptr;
+    void* t = class_type(k);
+    if (!t) return nullptr;
+    typedef void* (*fn_all)(void*, void*);
+    void* arr = ((fn_all)(g_base + RVA_FIND_OBJECTS_ALL))(t, nullptr);
+    if ((uintptr_t)arr < 0x10000) return nullptr;
+    int n = *(int*)((char*)arr + 0x18);
+    if (n <= 0 || n > 4000) return nullptr;
+    for (int i = 0; i < n; ++i) {
+        void* r = *(void**)((char*)arr + 0x20 + (size_t)i * 8);
+        if ((uintptr_t)r < 0x10000) continue;
+        void* gci = *(void**)((char*)r + OFF_ROLE_GCI);
+        if ((uintptr_t)gci < 0x10000) continue;
+        if (*(int*)((char*)gci + OFF_GCI_TPL_UID) == uid) return r;
+    }
+    return nullptr;
 }
 
 static void force_poll(void) {
@@ -411,10 +435,18 @@ static void force_poll(void) {
 
         int ox = 0, oy = 0;
         if (!pick_water_cell(e, x, y, &ox, &oy)) continue;
-        if (orig_setpos)
-            orig_setpos(gci, ((uint64_t)(uint32_t)ox) | ((uint64_t)(uint32_t)oy << 32), 0, 1);
-        if (g_force_hits2++ < 15)
-            LOGI("[water] 强制定位 uid=%d map=%d (%d,%d) -> 水域 (%d,%d)", uid, map, x, y, ox, oy);
+        uint64_t cell_xy = ((uint64_t)(uint32_t)ox) | ((uint64_t)(uint32_t)oy << 32);
+        void* role = role_of_uid(uid);
+        if (role) {
+            typedef void (*fn_tp)(void*, uint64_t, uint32_t, void*);
+            ((fn_tp)(g_base + RVA_ROLE_NPCTP))(role, cell_xy, 0, nullptr);
+            if (g_force_hits2++ < 15)
+                LOGI("[water] NpcTP 传送 uid=%d map=%d (%d,%d) -> 水域 (%d,%d)", uid, map, x, y, ox, oy);
+        } else {
+            if (g_force_hits2++ < 15)
+                LOGI("[water] 找不到 Role uid=%d（不在场景里？）", uid);
+        }
+        if (orig_setpos) orig_setpos(gci, cell_xy, 0, 1);
     }
 }
 
