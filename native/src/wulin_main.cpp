@@ -536,6 +536,23 @@ static int never_joined(int uid) {
  * 读不到图名时保守返回 0（放宽），避免误挡。 */
 static int keep_original_for_uncached(void* condNode);
 
+/* v109：同一张剧情图只放宽一次（不再用固定名单） */
+#define RELAX_ONCE_N 128
+static char g_ro_name[RELAX_ONCE_N][64];
+static int  g_ro_i = 0;
+static int  g_ro_log = 0;
+static int relax_once(const char* gn) {
+    if (!gn || !gn[0]) return 1;
+    for (int i = 0; i < RELAX_ONCE_N; ++i)
+        if (g_ro_name[i][0] && strcmp(g_ro_name[i], gn) == 0) {
+            if (g_ro_log++ < 12) LOGI("[relax] 图 %s 已放宽过一次 -> 本次走原版", gn);
+            return 0;
+        }
+    snprintf(g_ro_name[g_ro_i], sizeof(g_ro_name[0]), "%s", gn);
+    g_ro_i = (g_ro_i + 1) % RELAX_ONCE_N;
+    return 1;
+}
+
 /* 带 TTL 缓存的入口：条件检查是热路径，若每次读图名 + 调 GetCharacter 会卡。
  * 入队状态会变，所以 TTL 3 秒，不能永久缓存。 */
 static int keep_original_for(void* condNode) {
@@ -638,14 +655,15 @@ static int keep_original_for_uncached(void* condNode) {
     if (selfId <= 0) return 0;                       /* 非角色剧情图：放宽 */
 
     int pid = *(int*)((char*)condNode + OFF_PARTNER_ID);
-    if (pid != selfId) return 0;                     /* 条件是别的角色：放宽（彩蛋） */
+    if (pid != selfId) return relax_once(gn) ? 0 : 1;  /* 彩蛋：放宽（每图一次） */
 
     if (is_bond_graph(g, gn)) {                      /* v95：结缘图跳过放宽 */
         if (g_bond_log++ < 20)
             LOGI("[team] 图 %s 含「结缘界面」→ 跳过放宽（按原版：必须在队）", gn);
         return 1;
     }
-    return never_joined(pid);                        /* 本命角色：仅「从未入队」时才挡 */
+    if (never_joined(pid)) return 1;                 /* 本命角色：从未入队 → 不放宽 */
+    return relax_once(gn) ? 0 : 1;                   /* 已入过队 → 只放宽一次 */
 }
 
 /* 每次「需要伙伴 / 有伙伴」条件判定 +1（按线程）。
