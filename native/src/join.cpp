@@ -76,6 +76,20 @@
 #define OFF_TMS_LEAVE_POS        0x20        /* leaveTeamPos (Vector3Int) */
 #define OFF_TMS_LEAVE_DIR        0x2C        /* leaveTeamDir */
 
+/* ---------------- 类名校验（v98）：任何 managed 指针在用之前先确认真身，
+ * 崩溃点 join_handle+652 就是拿着不像样的指针去读字段。 */
+static const char* cls_of(void* o)
+{
+    if ((uintptr_t)o < 0x10000 || !A_obj_get_class || !A_class_get_name) return nullptr;
+    void* k = A_obj_get_class(o);
+    if ((uintptr_t)k < 0x10000) return nullptr;
+    return A_class_get_name(k);
+}
+static int is_cls(void* o, const char* name)
+{
+    const char* c = cls_of(o);
+    return (c && name && strcmp(c, name) == 0) ? 1 : 0;
+}
 /* ---------------------------------------------------------------- 缓存 */
 static void* g_cfg = nullptr;
 static void* g_ptm = nullptr;
@@ -95,7 +109,7 @@ static void* mng(void** slot, const char* ns, const char* name)
     if (*slot && (uintptr_t)*slot > 0x10000 && now - g_cache_t < 60000) return *slot;
     void* k = find_class(ns, name);
     void* inst = k ? find_object_of_type(k) : nullptr;
-    *slot = ((uintptr_t)inst > 0x10000) ? inst : nullptr;
+    *slot = is_cls(inst, name) ? inst : nullptr;
     g_cache_t = now;
     return *slot;
 }
@@ -111,7 +125,7 @@ static void* get_char(int uid)
     void* m = mng(&g_cfg, "WuLin", "GameCharacterManager");
     if (!m) return nullptr;
     void* c = CALL(void*, RVA_GCM_GET_CHARACTER, void*, int)(m, uid, nullptr);
-    return ((uintptr_t)c > 0x10000) ? c : nullptr;
+    return is_cls(c, "GameCharacterInstance") ? c : nullptr;
 }
 
 static int  gci_uid(void* inst)   { return CALL(int,  RVA_GCI_TEMPLETE_UID, void*)(inst, nullptr); }
@@ -247,6 +261,48 @@ static void make_bond(void* inst)
     CALL(void*, RVA_GCI_APPLY_BUFF, void*, int, int, int, void*)(me,   8800 + xx, 0, 1, nullptr, nullptr);
 }
 
+/* ---- v99：往 SaveObjectPlayerTeam.playerTeam(List<int>) 里加一个 uid。
+ * 链路来自反汇编 get_TeamSize(0x22B2354)：ptm+0x60 → +0x20 → +0x90 = List<int>。
+ * 用运行期取 List`1.Add 的 methodPointer 来加，避免猜 RVA。 */
+static void* (*A_class_get_method)(void*, const char*, int) = nullptr;
+static void* g_list_add = nullptr;
+
+static void* team_list(void)
+{
+    void* m = ptm();
+    if (!m) return nullptr;
+    void* dc = *(void**)((char*)m + OFF_PTM_CONTAINER);
+    if ((uintptr_t)dc < 0x10000) return nullptr;
+    void* so = *(void**)((char*)dc + OFF_SOC_DATA);
+    if ((uintptr_t)so < 0x10000) return nullptr;
+    void* lst = *(void**)((char*)so + OFF_SOPT_LIST);
+    return ((uintptr_t)lst > 0x10000) ? lst : nullptr;
+}
+
+static int team_add(int uid)
+{
+    void* lst = team_list();
+    if (!lst) { LOGI("[join] 取不到队伍 List"); return 0; }
+    int n = *(int*)((char*)lst + OFF_LIST_SIZE);
+    LOGI("[join] 队伍 List=%p 当前 %d 人", lst, n);
+
+    if (!g_list_add)
+    {
+        if (!A_class_get_method && g_i2cpp)
+            A_class_get_method = (void* (*)(void*, const char*, int))dlsym(g_i2cpp, "il2cpp_class_get_method_from_name");
+        if (A_class_get_method)
+        {
+            void* k = A_obj_get_class(lst);
+            void* mi = k ? A_class_get_method(k, "Add", 1) : nullptr;
+            if (mi) g_list_add = *(void**)mi;
+        }
+    }
+    if (!g_list_add) { LOGI("[join] 取不到 List<int>.Add"); return 0; }
+
+    ((void (*)(void*, int, void*))g_list_add)(lst, uid, nullptr);
+    int n2 = *(int*)((char*)lst + OFF_LIST_SIZE);
+    return (n2 > n) ? 1 : 0;
+}
 /* ---------------------------------------------------------------- 名字 → uid */
 static int parse_r_id_str(const char* s)
 {
@@ -270,9 +326,9 @@ static int resolve(const char* token)
     if (id > 0) return id;
 
     void* c = cfg();
-    if (!c) return 0;
+    if (!c) { LOGI("[join] GameConfig 实例无效"); return 0; }
     void* pool = CALL(void*, RVA_CFG_POOL_DATA, void*)(c, nullptr);
-    if ((uintptr_t)pool <= 0x10000) return 0;
+    if (!is_cls(pool, "CharacterPoolDataScriptObject")) { LOGI("[join] 角色池对象无效"); return 0; }
     void* arr = *(void**)((char*)pool + OFF_POOL_ARRAY);
     if ((uintptr_t)arr <= 0x10000) return 0;
     int n = *(int*)((char*)arr + OFF_ARRAY_LEN);
@@ -284,11 +340,15 @@ static int resolve(const char* token)
     {
         void* e = *(void**)((char*)arr + OFF_ARRAY_DATA + (size_t)i * 8);
         if ((uintptr_t)e <= 0x10000) continue;
+        if (!is_cls(e, "CharacterPoolData")) continue;          /* v98：先验类名再读字段 */
 
-        const char* un = (const char*)str_to_buf(*(void**)((char*)e + OFF_BDS_UNAME), name, sizeof(name));
-        const char* sn = (const char*)str_to_buf(*(void**)((char*)e + OFF_CPD_SURNAME), full, sizeof(full));
-        char gn[64];
-        const char* g = (const char*)str_to_buf(*(void**)((char*)e + OFF_CPD_GIVENNAME), gn, sizeof(gn));
+        void* pu = *(void**)((char*)e + OFF_BDS_UNAME);
+        void* ps = *(void**)((char*)e + OFF_CPD_SURNAME);
+        void* pg = *(void**)((char*)e + OFF_CPD_GIVENNAME);
+        const char* un = ((uintptr_t)pu > 0x10000) ? (const char*)str_to_buf(pu, name, sizeof(name)) : "";
+        const char* sn = ((uintptr_t)ps > 0x10000) ? (const char*)str_to_buf(ps, full, sizeof(full)) : "";
+        char gn[64]; gn[0] = 0;
+        const char* g = ((uintptr_t)pg > 0x10000) ? (const char*)str_to_buf(pg, gn, sizeof(gn)) : "";
 
         char joined[160];
         snprintf(joined, sizeof(joined), "%s%s", sn ? sn : "", g ? g : "");
@@ -327,13 +387,12 @@ static int join_handle(const char* text)
     void* inst = get_char(uid);
     if (!inst) { LOGI("[join] uid=%d 实例不存在（还没被游戏创建）", uid); return 1; }
 
-    int revived = revive(inst);
-    int joined = add_team(inst);
-    unstranger(inst);
-    fief_ready(inst);
-    if (bond) make_bond(inst);
-
-    LOGI("[join] %s → uid=%d，复活=%d，本次入队=%d，结缘=%d", text, uid, revived, joined, bond);
+    /* v99：只做「入队」这一步，其余动作（解除陌生/家园/结缘）先关掉 ——
+     * v98 在动作层仍然段错误，逐层打开比一次全开更容易定位。 */
+    LOGI("[join] uid=%d 实例=%p，开始入队", uid, inst);
+    int joined = team_add(uid);
+    if (bond) LOGI("[join] 结缘参数本版未启用");
+    LOGI("[join] %s → uid=%d，本次入队=%d", text, uid, joined);
     return 1;
 }
 
@@ -351,7 +410,6 @@ static void hook_console_invoke_str(void* self, void* command)
 
 /* v97：Enter 键走的是 `InvokeCommandInternal()`，它自己读 `textInput.text`。
  * 手机端不引 TMP 头，运行期用 il2cpp_class_get_method_from_name 取 `TMP_InputField.get_text`。 */
-static void* (*A_class_get_method)(void*, const char*, int) = nullptr;
 static void* g_tmp_get_text = nullptr;
 
 static void* ui_input_text(void* consoleUI)
@@ -384,6 +442,7 @@ static void hook_console_internal(void* self)
     buf[0] = 0;
     void* s = ui_input_text(self);
     if (s) str_to_buf(s, buf, sizeof(buf));
+    if (buf[0]) LOGI("[join] 收到(内部入口): \"%s\"", buf);      /* v98 诊断 */
     if (join_handle(buf)) return;                    /* 吞掉：不打印任何提示 */
     if (orig_console_internal) orig_console_internal(self);
 }
