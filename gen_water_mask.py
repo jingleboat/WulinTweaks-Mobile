@@ -30,10 +30,10 @@ ALWAYS_EMIT_EMPTY = [2169]
 
 # ---- 手工覆盖（用户实测给的「手机端和 PC 不一致」的部分，2026-10-26）----
 # 语义不同，别混：
-#   EXCLUDE：这张图 prefab 里的 _SwimGrid 有这些格，但手机端**不该算水域** → 从烤表里减掉
-#   REPLACE：这张图的水域**以文件为准**（整表替换）
+#   ADD    ：这些格**额外算水域**（与 prefab 的 _SwimGrid 取并集）
+#   REPLACE：这张图的水域**以文件为准**（整表替换，prefab 的格子不再自动并入）
 WATER_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native", "water_data")
-EXCLUDE_FILES = {504: "504.exclude.txt"}
+ADD_FILES = {504: "504.add.txt"}
 REPLACE_FILES = {2160: "2160.replace.txt"}
 
 
@@ -56,16 +56,16 @@ def apply_overrides(data):
         old = len(set(data.get(mid, [])))
         data[mid] = list(cells)
         log.append("map %d 整表替换：%d -> %d 格（%s）" % (mid, old, len(cells), fn))
-    for mid, fn in EXCLUDE_FILES.items():
+    for mid, fn in ADD_FILES.items():
         p = os.path.join(WATER_DATA_DIR, fn)
-        if not os.path.exists(p) or mid not in data:
+        if not os.path.exists(p):
             continue
-        drop = _parse_pairs(p)
-        before = set(data[mid])
-        after = before - drop
+        add = _parse_pairs(p)
+        before = set(data.get(mid, []))
+        after = before | add
         data[mid] = list(after)
-        log.append("map %d 排除：%d - %d -> %d 格（%s，命中 %d）"
-                   % (mid, len(before), len(drop), len(after), fn, len(before & drop)))
+        log.append("map %d 并入：%d + %d（新增 %d）-> %d 格（%s）"
+                   % (mid, len(before), len(add), len(after - before), len(after), fn))
     return log
 
 
