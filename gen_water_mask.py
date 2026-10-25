@@ -28,6 +28,46 @@ OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "water_mask.h")
 # 只有「有图层但没格子」的地图需要保留占位（原表里就是 2169）
 ALWAYS_EMIT_EMPTY = [2169]
 
+# ---- 手工覆盖（用户实测给的「手机端和 PC 不一致」的部分，2026-10-26）----
+# 语义不同，别混：
+#   EXCLUDE：这张图 prefab 里的 _SwimGrid 有这些格，但手机端**不该算水域** → 从烤表里减掉
+#   REPLACE：这张图的水域**以文件为准**（整表替换）
+WATER_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native", "water_data")
+EXCLUDE_FILES = {504: "504.exclude.txt"}
+REPLACE_FILES = {2160: "2160.replace.txt"}
+
+
+def _parse_pairs(path):
+    """文件格式：一行逗号/空白分隔的坐标流，如 `3,2,1,4` = (3,2) 与 (1,4)。"""
+    txt = open(path, encoding="utf-8").read()
+    nums = [int(x) for x in re.findall(r"-?\d+", txt)]
+    if len(nums) % 2:
+        nums = nums[:-1]
+    return set((nums[i], nums[i + 1]) for i in range(0, len(nums), 2))
+
+
+def apply_overrides(data):
+    log = []
+    for mid, fn in REPLACE_FILES.items():
+        p = os.path.join(WATER_DATA_DIR, fn)
+        if not os.path.exists(p):
+            continue
+        cells = _parse_pairs(p)
+        old = len(set(data.get(mid, [])))
+        data[mid] = list(cells)
+        log.append("map %d 整表替换：%d -> %d 格（%s）" % (mid, old, len(cells), fn))
+    for mid, fn in EXCLUDE_FILES.items():
+        p = os.path.join(WATER_DATA_DIR, fn)
+        if not os.path.exists(p) or mid not in data:
+            continue
+        drop = _parse_pairs(p)
+        before = set(data[mid])
+        after = before - drop
+        data[mid] = list(after)
+        log.append("map %d 排除：%d - %d -> %d 格（%s，命中 %d）"
+                   % (mid, len(before), len(drop), len(after), fn, len(before & drop)))
+    return log
+
 
 def load_bundle(path):
     raw = open(path, "rb").read()
@@ -156,6 +196,8 @@ def main():
     env = load_bundle(path)
     tr, names = build_hierarchy(env)
     data = swim_tiles_by_map(env, tr, names)
+    for line in apply_overrides(data):
+        print("覆盖:", line)
     text = render(data)
     got = {k: len(set(v)) for k, v in sorted(data.items()) if v}
     print("扫描到有水格的地图:", got, "；有 _SwimGrid 图层但一格没画的地图数:", sum(1 for v in data.values() if not v))

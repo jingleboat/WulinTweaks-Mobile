@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v113"         /* v113：覆写 ForceNPCSwim（指定 NPC 落点进水域格） */
+#define MOD_VER "v114"         /* v114：水域烤表按实测覆盖（504 排除 96 格 / 2160 整表替换） */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
