@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v106"         /* v106：join 补「可入家园」三件套（CouldBackToFief / leaveTeamMap / UnlockInviting）*/
+#define MOD_VER "v107"         /* v107：leaveTeamMap 缺省填 -1 */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */

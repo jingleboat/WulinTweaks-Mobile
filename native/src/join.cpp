@@ -434,11 +434,13 @@ static void fief_ready(void* inst, int uid)
     void* tms = *(void**)((char*)inst + OFF_TEAM_STATE);
     if ((uintptr_t)tms > 0x10000) {
         if (*(int*)((char*)tms + OFF_TMS_LEAVE_MAP) <= 0) {
-            void* m = ptm();
-            void* f_map = m ? method_of(m, "get_CurMapId", 0) : nullptr;
-            int mp = f_map ? ((int (*)(void*, void*))f_map)(m, nullptr) : 0;
-            if (mp > 0) *(int*)((char*)tms + OFF_TMS_LEAVE_MAP) = mp;
-            LOGI("[join] 家园：补 leaveTeamMap=%d", mp);
+            /* 回程点缺省 = -1（与存档默认形态一致） */
+            *(int*)((char*)tms + OFF_TMS_LEAVE_MAP) = -1;
+            *(int*)((char*)tms + OFF_TMS_LEAVE_POS) = 0;
+            *(int*)((char*)tms + OFF_TMS_LEAVE_POS + 4) = 0;
+            *(int*)((char*)tms + OFF_TMS_LEAVE_POS + 8) = 0;
+            *(int*)((char*)tms + OFF_TMS_LEAVE_DIR) = 0;
+            LOGI("[join] 家园：leaveTeamMap 置 -1");
         }
     } else LOGI("[join] 家园：该角色没有 m_TeamMemberState");
 
