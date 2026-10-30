@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v126"         /* v126：大地图改「真解锁」（343 个地点图标真写进存档 listShowIcon） */
+#define MOD_VER "v128"         /* v128：地图三合一（图标+马车+存档真解锁），真解锁挪到帧回调里跑 */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
@@ -32,6 +32,9 @@ extern void* g_i2cpp;      /* libil2cpp.so 句柄（dlsym 用） */
  * 易物只有两个开关：「确认搬空」跟随 F_TRADE_WIN（v83 起不再是独立开关）。 */
 extern volatile int F_TRADE_WIN;    /* 易物作价恒占优（含确认搬空、空手也能成交） */
 extern volatile int F_TRADE_POOLS;  /* 易物显示池子 */
+extern volatile int F_TRUEMAP;  /* 已并入 F_MAP，保留变量名兼容旧 cfg */
+/* v128：大地图真解锁的帧回调（ui.cpp 每隔一秒调一次） */
+void map_true_unlock_tick(void);
 extern volatile int F_MAP;          /* 大地图解锁 */
 extern volatile int F_CAB;          /* 马车地图解锁 */
 extern volatile int F_STORY;        /* 剧情/队伍条件放宽 */

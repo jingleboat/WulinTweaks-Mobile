@@ -86,6 +86,7 @@ static const struct { const char* key; volatile int* flag; int def; } SETTINGS[]
     { "flat",       &F_FLAT,        1 },
     { "tradewin",   &F_TRADE_WIN,   1 },
     { "tradepools", &F_TRADE_POOLS, 1 },
+    { "truemap",    &F_TRUEMAP,     0 },   /* 大地图真写进存档：默认关（会闪退，先别开） */
 };
 #define SETTING_N ((int)(sizeof(SETTINGS) / sizeof(SETTINGS[0])))
 
@@ -123,6 +124,7 @@ void ui_settings_load(void) {
         }
         fclose(f);
     }
+    F_CAB = F_MAP;              /* v128：地图三合一 */
     LOGI("面板: 开关 water=%d map=%d cab=%d story=%d flat=%d tradewin=%d tradepools=%d",
          F_WATER, F_MAP, F_CAB, F_STORY, F_FLAT, F_TRADE_WIN, F_TRADE_POOLS);
 }
@@ -480,11 +482,15 @@ static void set_collapsed(int c) {
     LOGI("面板: %s", c ? "已折叠" : "已展开");
 }
 
+/* v128：地图三合一 —— F_MAP 是总开关，马车（F_CAB）与真解锁（map_true_unlock）都跟它走 */
+static void sync_map_master(void) { F_CAB = F_MAP; }
+
 static void toggle_row(int i) {
     if (i < 0 || i >= G_ROW_COUNT) return;
     volatile int* f = ROW_FLAG[i];
     if (!f) return;                       /* 分组标题行不可点 */
     *f = *f ? 0 : 1;
+    sync_map_master();        /* v128：「大地图」一个开关带 马车 + 存档真解锁 */
     ui_settings_save();                   /* v125：点一下记一次 */
     redraw();
     upload();
@@ -528,10 +534,13 @@ static bool hook_mouse_down(int btn) {
 
 static void hook_mtsc_update(void* self) {
     if (orig_mtsc_update) orig_mtsc_update(self);
+    static int synced = 0;
+    if (!synced) { synced = 1; sync_map_master(); }
 
     /* v124：家园白名单自动补行（内部每秒节流、跑完自动停）——放在面板失败检查之前，
      * 免得面板初始化失败时把它一起挡掉 */
     join_fief_auto_tick();
+    map_true_unlock_tick();   /* v128：大地图真解锁（每秒一次，自己节流） */
 
     if (g_fails > 3) return;
     if (++g_ticks < 5) return;

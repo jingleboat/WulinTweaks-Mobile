@@ -51,6 +51,7 @@ void* g_i2cpp = nullptr;
 
 volatile int F_TRADE_WIN = 1;      /* 易物作价恒占优（含确认搬空） */
 volatile int F_TRADE_POOLS = 1;
+volatile int F_TRUEMAP = 0;  /* v127：大地图「真写进存档」—— 默认关（v126 打开时读档会闪退，先停用） */
 volatile int F_MAP = 0;     /* v125：默认关（只改显示层，会让「判断大地图图标显示」这类剧情门永久卡死） */
 volatile int F_CAB = 0;     /* v125：默认关（同上，马车图标） */
 volatile int F_STORY = 1;   /* v44 起默认开（此前是 0，每次启动要手动点） */
@@ -333,6 +334,7 @@ static bool hook_is_pass_icon(void* self, int id) {
 
 static void (*orig_initIcon)(void* self) = nullptr;
 static int map_true_unlock(void);   /* v126：定义在 inject_mapdata 之后 */
+void map_true_unlock_tick(void);    /* v128：帧回调里跑，见下 */
 static void hook_initIcon(void* self) {
     if (self && !g_uimap) {
         g_uimap = self;
@@ -341,7 +343,6 @@ static void hook_initIcon(void* self) {
     /* 先解析存档集合，再让游戏建图标 —— 这样第一遍建出来的图标就是解锁态，
      * 不用等玩家去开一次马车地图。 */
     int ready = ensure_save(1);
-    map_true_unlock();          /* v126：先把地点图标真写进存档，再让游戏建图标 */
     if (orig_initIcon) orig_initIcon(self);
     /* 建图标时集合还没解析出来（存档刚载入等情形）：图标已按原版锁定态建好，
      * 而集合刚刚就绪，重建一遍（等价于 inject_mapdata 末尾那次 orig_initIcon）。 */
@@ -460,9 +461,36 @@ static void list_add_int(void* list, int v)
     if (g_list_add) ((void (*)(void*, int, void*))g_list_add)(list, v, nullptr);
 }
 
+/* ---- v128：把真解锁挪到「主线程帧回调」里跑 -------------------------------
+ * v126 是在 initIcon / UpdateIconShow 里直接 Add —— 那两条路径分别由游戏
+ * 正在「建图标」「刷马车图标」，往 listShowIcon 里插 343 项极易踩到
+ * 游戏自己的遍历/枚举（读档时直接闪退）。v127 先停用，v128 改成：
+ *   由 ui.cpp 的 MainThreadSync.Update 每秒调一次，确认存档对象就绪、
+ *   且「这一份存档还没写过」才写一次；写完记下 g_data 指针，换档才重来。
+ * 和 [fief] 白名单自动补行是同一套（那套已实测不崩）。
+ */
+static uint64_t g_truemap_t = 0;
+static void* g_truemap_done = nullptr;
+
+void map_true_unlock_tick(void)
+{
+    if (!F_MAP) return;
+    uint64_t now = rule_now_ms();
+    if (g_truemap_t && now - g_truemap_t < 1000) return;
+    g_truemap_t = now;
+
+    if (!ensure_save(1)) return;
+    if (g_data && g_data == g_truemap_done) return;      /* 这份存档已经写过 */
+
+    int added = map_true_unlock();
+    if (g_data) g_truemap_done = g_data;
+    LOGI("大地图: 真解锁完成 +%d（本份存档）", added);
+}
+
 /* 返回本次新增条数（0 = 已经全在） */
 static int map_true_unlock(void)
 {
+    if (!F_MAP) return 0;                /* v128：并入「地图」总开关 */
     if (!g_data && !ensure_save(1)) return 0;
     if (!g_set_vis) return 0;
     int added = 0;
@@ -481,7 +509,6 @@ static void (*orig_cabIcon)(void* self) = nullptr;
 static void hook_cabIcon(void* self) {
     ensure_save(1);
     if (orig_cabIcon) orig_cabIcon(self);
-    map_true_unlock();          /* v126：换档/读档后再补一次 */
     if (F_CAB) inject_mapdata(self);
 }
 
