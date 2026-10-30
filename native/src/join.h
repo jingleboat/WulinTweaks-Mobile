@@ -8,3 +8,8 @@
  *       已死亡角色先复活（m_isAlive）。
  */
 void join_install_hooks(void);
+
+/* v124：家园白名单自动补行 —— 由 ui.cpp 的帧回调每秒调一次（内部自己节流）。
+ * 名单优先读 /sdcard/Android/data/com.xd.dxlzz.global.gp/files/fief_ready.txt，
+ * 读不到就用内置默认 {10142, 10143}。 */
+void join_fief_auto_tick(void);

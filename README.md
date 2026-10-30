@@ -160,6 +160,69 @@ $env:JAVA_HOME="<jdk>"
 | **v91** | 名字写入前加**类型校验**：实例必须 `GameCharacterInstance` 且 `m_templeteUid` 等于槽位 uid，模板必须 `CharacterPoolData` 且 uid 一致，不符就跳过（离队/换图后实例地址可能被复用）。同名校验也加在「还原」与「模板改名」两处 |
 | **v92 / v93** | 排查探针（默认关，`WULIN_NAMEPROBE`）：TMP 里出现纯 ASCII 短串就记一条并带 GameObject 名；名字 getter 返回 ASCII 名时记一条并 dump **实例的 `m_surName`/`m_givenName` 指针+文本**与**模板四个名字字段**。靠它定位到：`OutPort` 出在实例 `m_givenName` 上，模板是干净的；显示位置是 `HeadName`（头顶名牌）与 `Text (TMP)`（对话/信息面板），两者都读 `get_FullName` |
 | **v94** | **读侧消毒**（最终修法）：`get_FullName` / `get_FullNameWithTitle` 返回值若是「端口名式纯 ASCII 串」，就用模板重新算一个该显示的名字返回 —— **不写任何游戏字段、不碰存档**，头顶名牌与对话/信息面板同时恢复正常 |
+| **v124** | **家园可入真正落地**：① CTMED 表里**没有该 uid 的记录时造一行**（PC `PartnerTools.FiefReady` 同款：`object_new` + `.ctor`(0x3D374C0) + 写 `Uid`(0x10)/`UName`(0x18)/`CouldBackToFief`(0x50) + `AddData`；虚方法没生效则退回 `data` 字典直插，每步回读验证）；② **白名单自动补行**（帧回调里每秒一次，名单优先读 `files/fief_ready.txt`，否则内置 `{10142,10143}`）；③ 取配置对象改走 `BaseDataClass.GetGameDataInternal(Type, dataGroup)`（0x3D25248）—— 该类在 **`GameData` 命名空间**、且是 ScriptableObject，`find_class("WuLin",…)` 与 `FindObjectOfType` 都拿不到 |
+
+---
+
+## 家园可入：CTMED 造行 + 白名单自动补行（v124）
+
+**需求**：10142、10143 这类角色 `join` 之后仍然放不进家园。
+
+### 三件套里缺哪一件
+
+`PartnerTools` / `join` 的「可入家园」是三条并列条件，缺一不可：
+
+| # | 条件 | 落在哪 | 10142/10143 |
+|---|---|---|---|
+| ① | `CharacterTeamMemberExtendData.CouldBackToFief = true`（偏移 0x50） | **运行时配置**（`SerializedScriptableObject`） | **缺** |
+| ② | `m_TeamMemberState.leaveTeamMap/Pos/Dir` | 存档 | 有 |
+| ③ | 故事标签 `UnlockInviting-<uid>` | 存档 `TagString` | 有 |
+
+②③ 是存档数据、写一次就留住；**① 不是** —— `CharacterTeamMemberExtendData` 是配置表，SaveObject 里根本没有这个字段
+（Save0 的 16 个 `.save` 全搜过，`couldBackToFief` 出现 0 次）。所以它天生只在内存里，重启即失效 ——
+**写进存档这条路不存在，只能每次启动补一遍**。
+
+而 10142/10143 连 `CharacterPoolData` 都没有（DLC 角色），CTMED 表只有 90 行（本体伙伴），
+`GetData(uid)` 必然返回 null；v106 的做法是打一行日志跳过，于是永远进不去。
+
+### v124 的两处改动
+
+**1）缺行就造行**（`join.cpp::ctmed_row_new` / `ctmed_ensure`）
+
+```
+il2cpp_object_new(GameData.CharacterTeamMemberExtendData)
+  → .ctor()                        RVA 0x3D374C0
+  → Uid(0x10) / UName(0x18)        BaseDataStorageClass 的字段
+  → CouldBackToFief(0x50) = true
+  → so.AddData(rec)                BaseDataClass 虚方法，本类 Slot 16 有 override（0x3D37DB0）
+      ↳ 若 AddData 未生效（虚方法分派没走到）：直接往 data 字典(0x60) Add
+  → 每步都用 GetData(uid) 回读确认
+```
+
+**2）白名单自动补行**（`join_fief_auto_tick`，挂在 `MainThreadSync.Update` 帧回调，每秒最多一次）
+
+- 名单优先读 `/sdcard/Android/data/com.xd.dxlzz.global.gp/files/fief_ready.txt`（一行一个 uid，`#` 注释），
+  读不到就用内置 `{10142, 10143}` —— **以后加人只改这个 txt，不用重装**；
+- 只补「已经当过队友」的角色（`m_TeamMemberState` 非空），其余等入队；
+- **标题界面不计重试次数**（`PlayerTeamManager.TeamSize <= 0` 时直接返回）：否则在菜单停留超过
+  120 秒就把 120 次机会耗光，读档后永远补不上 —— 这个坑第一版踩过。
+
+### 真正的坑：配置对象根本取不到
+
+`CharacterTeamMemberExtendDataScriptObject` 在 **`GameData` 命名空间**，而且它是 `ScriptableObject`：
+
+- `find_class("WuLin", …)` → null（命名空间错了）；
+- `FindObjectOfType` / `Resources.FindObjectsOfTypeAll` → 这类配置不是 Resources 资源，摸不到
+  （`CharacterPoolData` 上早就踩过同款问题，见 `wulin_main.cpp::tpl_by_uid` 的注释）。
+
+正确姿势是走游戏自己的查表通道：
+
+```c
+class_type(类) → BaseDataClass.GetGameDataInternal(Type, dataGroup)   // RVA 0x3D25248
+dataGroup      ← BaseDataClass.get_dataGroup()                        // RVA 0x3D250BC
+```
+
+（PC 端等价物就是 `BaseDataClass.GetGameData<T>()`。）v124 做了三级兜底：游戏查表 → `FindObjectOfType` → `GameConfig` 缓存，每级都验类名。
 
 ---
 

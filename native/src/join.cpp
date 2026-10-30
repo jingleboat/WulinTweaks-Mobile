@@ -414,22 +414,137 @@ static void* find_class_any(const char* name)
     return nullptr;
 }
 
+/* ---- v124：给「表里没有」的角色补一行 CharacterTeamMemberExtendData -------
+ * 背景：CTMED 只有 90 行（全是本体里能入家园的伙伴）。10142/10143 这类 DLC 角色
+ * 连 CharacterPoolData 里都没有，GetData() 必然返回 null —— v106 之前这里只是
+ * 打一行日志跳过，于是 join 完仍然进不了家园（PC 端 PartnerTools.FiefReady 会造行，
+ * 所以 PC 能放）。v124 按 PC 同款做法补：object_new + .ctor + 写
+ * Uid/UName/CouldBackToFief + AddData；AddData 是 BaseDataClass 的虚方法（Slot 16），
+ * 万一没被 override（空实现），退回直接往 data(Dictionary<int,T>) 里 Add。
+ *
+ * 字段/接口（dumpout-intl/dump.cs，国服国际版 V1.2.0820B131）：
+ *   CharacterTeamMemberExtendData : BaseDataStorageClass
+ *     Uid 0x10 / UName 0x18（基类 BaseDataStorageClass）、CouldBackToFief 0x50
+ *     .ctor()                          RVA 0x3D374C0
+ *   CharacterTeamMemberExtendDataScriptObject : BaseDataClass
+ *     data(Dictionary<int,T>) 0x60 / nameDict(Dictionary<string,T>) 0x68
+ *     GetData(int)                     RVA 0x3D376F0
+ */
+#define RVA_CTMED_CTOR  0x3D374C0
+#define OFF_CTMED_DATA  0x60
+/* v124b：取配置对象要走游戏自己的通道。
+ * `ScriptableObject` 配置不是 Resources 里的资源，`FindObjectOfType` 经常取不到
+ * （同类问题在 CharacterPoolData 上已经踩过：见 wulin_main.cpp tpl_by_uid 的注释）。
+ * 游戏自己是 BaseDataClass.GetGameData<T>() → 内部 GetGameDataInternal(Type, dataGroup)。
+ * 这里直接调那个**非泛型**的 internal 版本（dump: RVA 0x3D25248），
+ * dataGroup 用当前的 get_dataGroup()（RVA 0x3D250BC）。 */
+#define RVA_BDC_GETGAMEDATA_INTERNAL 0x3D25248
+#define RVA_BDC_GET_DATAGROUP        0x3D250BC
+
+static void* ctmed_so(void)
+{
+    static void* k_so;
+    static int k_state;      /* 0=未查 1=可用 2=不可用 */
+
+    if (k_state == 0)
+    {
+        k_so = find_class_any("CharacterTeamMemberExtendDataScriptObject");
+        k_state = k_so ? 1 : 2;
+        if (!k_so) LOGI("[fief] 找不到 CharacterTeamMemberExtendDataScriptObject 类");
+    }
+    if (!k_so) return nullptr;
+
+    /* ① 游戏自己的查表通道（首选） */
+    void* ty = class_type(k_so);
+    if ((uintptr_t)ty > 0x10000)
+    {
+        void* grp = ((void* (*)(void*))(g_base + RVA_BDC_GET_DATAGROUP))(nullptr);
+        void* so = ((void* (*)(void*, void*, void*))(g_base + RVA_BDC_GETGAMEDATA_INTERNAL))(ty, grp, nullptr);
+        if (is_cls(so, "CharacterTeamMemberExtendDataScriptObject")) return so;
+    }
+
+    /* ② 退路：FindObjectOfType */
+    void* so2 = find_object_of_type(k_so);
+    if (is_cls(so2, "CharacterTeamMemberExtendDataScriptObject")) return so2;
+
+    /* ③ 再退一步：GameConfig 缓存 */
+    void* so3 = mng(&g_cfg, "WuLin", "CharacterTeamMemberExtendDataScriptObject");
+    if (is_cls(so3, "CharacterTeamMemberExtendDataScriptObject")) return so3;
+
+    LOGI("[fief] 取不到 CharacterTeamMemberExtendDataScriptObject 实例（三条路都失败）");
+    return nullptr;
+}
+
+static void* ctmed_get(void* so, int uid)
+{
+    if (!so) return nullptr;
+    void* f = method_of(so, "GetData", 1);
+    void* r = f ? ((void* (*)(void*, int, void*))f)(so, uid, nullptr) : nullptr;
+    return ((uintptr_t)r > 0x10000) ? r : nullptr;
+}
+
+static void* ctmed_row_new(int uid)
+{
+    void* k = find_class("WuLin", "CharacterTeamMemberExtendData");
+    if ((uintptr_t)k < 0x10000) k = find_class_any("CharacterTeamMemberExtendData");
+    if ((uintptr_t)k < 0x10000 || !A_object_new) return nullptr;
+    if (A_class_init) A_class_init(k);
+
+    void* rec = A_object_new(k);
+    if ((uintptr_t)rec < 0x10000) return nullptr;
+    CALL(void, RVA_CTMED_CTOR, void*)(rec, nullptr);
+
+    *(int*)((char*)rec + OFF_CPD_UID) = uid;
+    char nm[24];
+    snprintf(nm, sizeof(nm), "uid-%d", uid);
+    *(void**)((char*)rec + OFF_CPD_UNAME) = str(nm);   /* UName 只当 nameDict 的键/配置表显示 */
+    *(bool*)((char*)rec + OFF_CTMED_FIEF) = true;
+    return rec;
+}
+
+/* 保证 uid 在 CTMED 里有记录且 CouldBackToFief=true。1=成功 0=失败 */
+static int ctmed_ensure(int uid)
+{
+    void* so = ctmed_so();
+    if (!so) { LOGI("[fief] uid=%d 取不到 CharacterTeamMemberExtendDataScriptObject", uid); return 0; }
+
+    void* rec = ctmed_get(so, uid);
+    if (rec) {
+        *(bool*)((char*)rec + OFF_CTMED_FIEF) = true;
+        LOGI("[fief] uid=%d 表里已有行 → CouldBackToFief=true（rec=%p）", uid, rec);
+        return 1;
+    }
+
+    rec = ctmed_row_new(uid);
+    if (!rec) { LOGI("[fief] uid=%d 造行失败（类/对象取不到）", uid); return 0; }
+
+    void* f_add = method_of(so, "AddData", 1);
+    if (f_add)
+    {
+        ((void (*)(void*, void*, void*))f_add)(so, rec, nullptr);
+        if (ctmed_get(so, uid)) {
+            LOGI("[fief] uid=%d 已补进 CharacterTeamMemberExtendData（AddData）", uid);
+            return 1;
+        }
+        LOGI("[fief] uid=%d AddData 未见效（虚方法可能是空实现），改字典直插", uid);
+    }
+
+    void* dict = *(void**)((char*)so + OFF_CTMED_DATA);
+    void* f_dadd = ((uintptr_t)dict > 0x10000) ? method_of(dict, "Add", 2) : nullptr;
+    if (f_dadd)
+    {
+        ((void (*)(void*, int, void*, void*))f_dadd)(dict, uid, rec, nullptr);
+        if (ctmed_get(so, uid)) { LOGI("[fief] uid=%d 已补进 data 字典", uid); return 1; }
+    }
+    LOGI("[fief] uid=%d 补行失败：AddData 与字典直插都不可用", uid);
+    return 0;
+}
+
 static void fief_ready(void* inst, int uid)
 {
     if (!inst || uid <= 0) return;
 
-    void* k_so = find_class_any("CharacterTeamMemberExtendDataScriptObject");
-    void* so = k_so ? find_object_of_type(k_so) : nullptr;
-    if ((uintptr_t)so > 0x10000) {
-        void* f_get = method_of(so, "GetData", 1);
-        void* rec = f_get ? ((void* (*)(void*, int, void*))f_get)(so, uid, nullptr) : nullptr;
-        if ((uintptr_t)rec > 0x10000) {
-            *(bool*)((char*)rec + OFF_CTMED_FIEF) = true;
-            LOGI("[join] 家园：CouldBackToFief=true (uid=%d)", uid);
-        } else {
-            LOGI("[join] 家园：数据表没有 uid=%d 的记录（手机端不新建行）", uid);
-        }
-    } else LOGI("[join] 家园：取不到 CharacterTeamMemberExtendDataScriptObject");
+    if (ctmed_ensure(uid)) LOGI("[join] 家园：CouldBackToFief=true (uid=%d)", uid);
 
     void* tms = *(void**)((char*)inst + OFF_TEAM_STATE);
     if ((uintptr_t)tms > 0x10000) {
@@ -459,6 +574,92 @@ static void fief_ready(void* inst, int uid)
         } else LOGI("[join] 家园：标签 %s 已存在", tag);
     } else LOGI("[join] 家园：取不到 StoryManager");
 }
+
+/* ---- v124：家园白名单自动补行（每次启动跑一次）-------------------------
+ * 为什么需要：① 的 CTMED 记录只活在内存里，重启就没了；所以就算 join 过一次，
+ * 下次开游戏 10142/10143 又进不了家园。这里在帧回调里自动补一遍。
+ *
+ * 名单来源：
+ *   1) /sdcard/Android/data/com.xd.dxlzz.global.gp/files/fief_ready.txt
+ *      （一行一个 uid，# 开头是注释）—— 存在且非空就以它为准，改名单不用重装
+ *   2) 读不到/为空 → 用内置默认 {10142, 10143}
+ * 触发：ui.cpp 的 MainThreadSync.Update 帧回调里调用，每秒最多一次；
+ *       角色实例还没建出来（或还不是队友）时自动重试，最多 120 次。
+ */
+static const int k_fief_auto_default[] = { 10142, 10143 };
+#define FIEF_AUTO_FILE "/sdcard/Android/data/com.xd.dxlzz.global.gp/files/fief_ready.txt"
+
+static int g_fief_list[16];
+static int g_fief_n = -1;      /* -1 = 尚未加载 */
+
+static void fief_auto_load_list(void)
+{
+    if (g_fief_n >= 0) return;
+    g_fief_n = 0;
+
+    FILE* f = fopen(FIEF_AUTO_FILE, "r");
+    if (f)
+    {
+        char line[128];
+        while (g_fief_n < 16 && fgets(line, sizeof(line), f))
+        {
+            char* p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p == '#' || *p == '\r' || *p == '\n' || *p == 0) continue;
+            int v = atoi(p);
+            if (v > 0) g_fief_list[g_fief_n++] = v;
+        }
+        fclose(f);
+        if (g_fief_n > 0) { LOGI("[fief] 白名单来自 %s（%d 个）", FIEF_AUTO_FILE, g_fief_n); return; }
+        LOGI("[fief] %s 为空，改用内置名单", FIEF_AUTO_FILE);
+    }
+
+    int dflt = (int)(sizeof(k_fief_auto_default) / sizeof(k_fief_auto_default[0]));
+    for (int i = 0; i < dflt && g_fief_n < 16; i++) g_fief_list[g_fief_n++] = k_fief_auto_default[i];
+    LOGI("[fief] 白名单用内置名单（%d 个）", g_fief_n);
+}
+
+void join_fief_auto_tick(void)
+{
+    static int state;        /* 0=未做 1=做完 2=放弃 */
+    static long last_sec;
+    static int tries;
+    if (state) return;
+
+    long now = (long)time(nullptr);
+    if (now == last_sec) return;                 /* 每秒最多一次 */
+    last_sec = now;
+
+    fief_auto_load_list();
+    if (g_fief_n <= 0) { state = 1; return; }
+
+    /* 还在标题界面 / 没读档：队伍还没建出来，这时候不该消耗重试次数，
+     * 否则在菜单里停留超过 120 秒就把整次机会用光了。 */
+    void* t = ptm();
+    int teamSize = t ? CALL(int, RVA_PTM_TEAM_SIZE, void*)(t, nullptr) : 0;
+    if (teamSize <= 0) return;
+
+    if (++tries > 120) {
+        state = 2;
+        LOGI("[fief] 自动补行放弃：120 次仍取不到角色实例（看是不是还没入队）");
+        return;
+    }
+
+    int pending = 0, ok = 0;
+    for (int i = 0; i < g_fief_n; i++)
+    {
+        int uid = g_fief_list[i];
+        void* inst = get_char(uid);
+        if (!inst) { pending++; continue; }                              /* 实例还没建出来 */
+        void* tms = *(void**)((char*)inst + OFF_TEAM_STATE);
+        if ((uintptr_t)tms < 0x10000) { pending++; continue; }           /* 还不是队友 */
+        fief_ready(inst, uid);
+        ok++;
+    }
+
+    if (pending == 0) { state = 1; LOGI("[fief] 自动补行完成：%d/%d", ok, g_fief_n); }
+}
+
 static int team_add(int uid)
 {
     void* lst = team_list();

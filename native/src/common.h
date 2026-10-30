@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v123"         /* v123：NpcTP 传送 + SetEndPos 让其在水中走动（播 WashMove1=游泳） */
+#define MOD_VER "v124"         /* v124：家园可入 —— CTMED 缺行时造行（PC 同款），+ 白名单自动补行 */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
