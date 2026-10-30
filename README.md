@@ -161,6 +161,7 @@ $env:JAVA_HOME="<jdk>"
 | **v92 / v93** | 排查探针（默认关，`WULIN_NAMEPROBE`）：TMP 里出现纯 ASCII 短串就记一条并带 GameObject 名；名字 getter 返回 ASCII 名时记一条并 dump **实例的 `m_surName`/`m_givenName` 指针+文本**与**模板四个名字字段**。靠它定位到：`OutPort` 出在实例 `m_givenName` 上，模板是干净的；显示位置是 `HeadName`（头顶名牌）与 `Text (TMP)`（对话/信息面板），两者都读 `get_FullName` |
 | **v94** | **读侧消毒**（最终修法）：`get_FullName` / `get_FullNameWithTitle` 返回值若是「端口名式纯 ASCII 串」，就用模板重新算一个该显示的名字返回 —— **不写任何游戏字段、不碰存档**，头顶名牌与对话/信息面板同时恢复正常 |
 | **v124** | **家园可入真正落地**：① CTMED 表里**没有该 uid 的记录时造一行**（PC `PartnerTools.FiefReady` 同款：`object_new` + `.ctor`(0x3D374C0) + 写 `Uid`(0x10)/`UName`(0x18)/`CouldBackToFief`(0x50) + `AddData`；虚方法没生效则退回 `data` 字典直插，每步回读验证）；② **白名单自动补行**（帧回调里每秒一次，名单优先读 `files/fief_ready.txt`，否则内置 `{10142,10143}`）；③ 取配置对象改走 `BaseDataClass.GetGameDataInternal(Type, dataGroup)`（0x3D25248）—— 该类在 **`GameData` 命名空间**、且是 ScriptableObject，`find_class("WuLin",…)` 与 `FindObjectOfType` 都拿不到 |
+| **v126** | **大地图改「真解锁」**：把 343 个地点图标（LocData 的 `WMapName_<id>` 全集）用 `List<int>.Add` 真写进存档 `SaveObjectMapManager.listShowIcon`（`map_true_unlock()`，挂 `initIcon` / `UpdateIconShow`）。原因：v48 起只拦 `Contains` 改显示层，而剧情「判断大地图图标显示 mapID=X」读的是**存档数据** —— 图标看着亮、剧情永远判不过（曼陀罗 R10021-4 玉门关 5059、M2221-12 问路 炎城 20400 都是这么卡死的）。同时 `F_MAP`/`F_CAB` 默认关、面板开关改为记忆到 `files/wulin_mod.cfg`（v125） |
 
 ---
 

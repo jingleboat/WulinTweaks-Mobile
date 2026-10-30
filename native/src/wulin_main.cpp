@@ -51,8 +51,8 @@ void* g_i2cpp = nullptr;
 
 volatile int F_TRADE_WIN = 1;      /* 易物作价恒占优（含确认搬空） */
 volatile int F_TRADE_POOLS = 1;
-volatile int F_MAP = 1;
-volatile int F_CAB = 1;
+volatile int F_MAP = 0;     /* v125：默认关（只改显示层，会让「判断大地图图标显示」这类剧情门永久卡死） */
+volatile int F_CAB = 0;     /* v125：默认关（同上，马车图标） */
 volatile int F_STORY = 1;   /* v44 起默认开（此前是 0，每次启动要手动点） */
 volatile int F_FLAT = 1;    /* v65 剧情分支展开，默认开 */
 volatile int F_WATER = 1;
@@ -332,6 +332,7 @@ static bool hook_is_pass_icon(void* self, int id) {
 }
 
 static void (*orig_initIcon)(void* self) = nullptr;
+static int map_true_unlock(void);   /* v126：定义在 inject_mapdata 之后 */
 static void hook_initIcon(void* self) {
     if (self && !g_uimap) {
         g_uimap = self;
@@ -340,6 +341,7 @@ static void hook_initIcon(void* self) {
     /* 先解析存档集合，再让游戏建图标 —— 这样第一遍建出来的图标就是解锁态，
      * 不用等玩家去开一次马车地图。 */
     int ready = ensure_save(1);
+    map_true_unlock();          /* v126：先把地点图标真写进存档，再让游戏建图标 */
     if (orig_initIcon) orig_initIcon(self);
     /* 建图标时集合还没解析出来（存档刚载入等情形）：图标已按原版锁定态建好，
      * 而集合刚刚就绪，重建一遍（等价于 inject_mapdata 末尾那次 orig_initIcon）。 */
@@ -397,10 +399,89 @@ static void inject_mapdata(void* self) {
     }
 }
 
+/* ---- v126：大地图「真解锁」 -----------------------------------------------
+ * v48 起「大地图全解锁」只改显示层（拦 List<int>.Contains 让它恒真），
+ * SaveObjectMapManager.listShowIcon（存档数据）一直没动过 —— 而剧情里的
+ * 「判断大地图图标显示 mapID=X」读的正是这份存档数据，于是曼陀罗 R10021-4
+ * （玉门关 5059）、M2221-12 问路（炎城 20400）这类事件被永久卡死。
+ *
+ * v126 改成真写：把「大地图可显示的地点图标」全集（LocData 里全部 WMapName_<id>，
+ * 343 个）逐个 Add 进 listShowIcon。游戏一存盘就是永久解锁，不再需要假解锁
+ * （F_MAP 现在默认关，只作应急显示用）。
+ */
+static const int k_all_icons[] = {
+      1301,   1400,   1200,   5008,   2010,   2060,   2080,  20100,   2140,   2020,   2030,   2040,
+      2110,   5025,  20200,   2050,   2070,   2090,   5009,  20300,   5033,   6000,   5060,   5063,
+      2100,   2170,   2130,   5015,   5016,   1100,   5059,   2160,   2220,    500,    600,   1500,
+      1600,   2120,   2150,   2155,   2180,   2190,   2200,   2230,   2240,   2250,   2270,   2280,
+      2290,   2299,   5001,   5003,   5005,   5007,   5011,   5012,   5014,   5029,   5032,   5037,
+      5039,   5046,   5049,   5050,   5051,   5052,   5061,   5062,   5064,   5065,   5068,  10040,
+     10050,  10060,  10070,  10100,  10110,  10120,  10140,  10150,  10160,  10170,  10180,  20400,
+     20500,   1000,   1001,   1002,   1003,   1004,   1005,   1006,   1007,   1101,   1102,   1103,
+      1104,   1105,   1106,   1107,   1108,   1109,   1201,   1202,   1203,   1204,   1300,   1302,
+      1401,   1402,   1501,   1700,   2000,   2011,   2012,   2013,   2014,   2015,   2016,   2017,
+      2018,   2021,   2022,   2023,   2024,   2025,   2026,   2027,   2028,   2031,   2032,   2041,
+      2042,   2043,   2051,   2052,   2053,   2061,   2062,   2063,   2064,   2065,   2071,   2072,
+      2073,   2074,   2081,   2082,   2083,   2091,   2092,   2101,   2102,   2111,   2121,   2122,
+      2131,   2139,   2151,   2152,   2153,   2156,   2157,   2158,   2159,   2161,   2231,   2241,
+      2251,   2252,   2253,   2254,   2255,   2271,   2272,   2273,   2274,   2279,   2281,   2282,
+      2300,   2310,   2998,   2999,   5002,   5004,   5006,   5013,   5018,   5019,   5020,   5022,
+      5023,   5026,   5027,   5030,   5031,   5034,   5035,   5036,   5038,   5043,   5053,   5054,
+      5055,   5056,   5057,   5058,   5066,   5067,   6001,   6002,  10010,  10020,  10030,  10031,
+     10038,  10039,  10071,  10080,  10130,  20101,  20102,  20103,  20104,  20105,  20106,  20107,
+     20108,  20109,  20110,  20111,  20112,  20113,  20114,  20115,  20116,  20117,  20118,  20119,
+     20120,  20121,  20122,  20123,  20124,  20195,  20196,  20197,  20198,  20199,  20201,  20202,
+     20203,  20204,  20205,  20206,  20207,  20208,  20209,  20210,  20211,  20212,  20213,  20214,
+     20215,  20216,  20217,  20218,  20219,  20220,  20221,  20222,  20223,  20224,  20225,  20226,
+     20227,  20228,  20229,  20297,  20298,  20301,  20302,  20303,  20304,  20305,  20306,  20307,
+     20308,  20309,  20310,  20311,  20312,  20313,  20314,  20315,  20316,  20317,  20318,  20319,
+     20320,  20321,  20322,  20323,  20324,  20325,  20326,  20327,  20328,  20329,  20330,  20331,
+     20332,  20333,  20334,  20335,  20336,  20397,  20398,  20401,  20402,  20420,  20491,  20492,
+     20501,  20502,  20503,  20504,  20505,  20506,  20507,  20508,  20509,  20510,  20511,  20512,
+     20513,  20514,  20515,  20516,  20517,  20518,  20519
+};
+
+static void* g_list_add = nullptr;
+
+static void list_add_int(void* list, int v)
+{
+    if (!g_list_add) {
+        if (!g_i2cpp) g_i2cpp = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
+        if (!g_i2cpp || !A_obj_get_class) return;
+        typedef void* (*fn_m)(void*, const char*, int);
+        fn_m get_m = (fn_m)dlsym(g_i2cpp, "il2cpp_class_get_method_from_name");
+        if (!get_m) { LOGI("大地图: 取不到 il2cpp_class_get_method_from_name"); return; }
+        void* k = A_obj_get_class(list);
+        if ((uintptr_t)k < 0x10000) return;
+        void* mi = get_m(k, "Add", 1);
+        if (!mi) { LOGI("大地图: 取不到 List<int>.Add"); return; }
+        g_list_add = *(void**)mi;
+    }
+    if (g_list_add) ((void (*)(void*, int, void*))g_list_add)(list, v, nullptr);
+}
+
+/* 返回本次新增条数（0 = 已经全在） */
+static int map_true_unlock(void)
+{
+    if (!g_data && !ensure_save(1)) return 0;
+    if (!g_set_vis) return 0;
+    int added = 0;
+    int n = (int)(sizeof(k_all_icons) / sizeof(k_all_icons[0]));
+    for (int i = 0; i < n; ++i) {
+        int id = k_all_icons[i];
+        if (orig_contains && orig_contains(g_set_vis, id, nullptr)) continue;
+        list_add_int(g_set_vis, id);
+        added++;
+    }
+    if (added) LOGI("大地图: 真解锁 listShowIcon +%d（目标 %d 个）", added, n);
+    return added;
+}
+
 static void (*orig_cabIcon)(void* self) = nullptr;
 static void hook_cabIcon(void* self) {
     ensure_save(1);
     if (orig_cabIcon) orig_cabIcon(self);
+    map_true_unlock();          /* v126：换档/读档后再补一次 */
     if (F_CAB) inject_mapdata(self);
 }
 
@@ -2220,6 +2301,12 @@ static void install_tweaks() {
     }
     cache_images();
     LOGI("程序集 %zu 个", g_nimg);
+
+    /* ---- v125：先恢复上次的开关状态（必须在装各模块 hook 之前，
+     *      这样 hook 里第一条读到的就是配置里的值） ---- */
+#if WULIN_PANEL
+    ui_settings_load();
+#endif
 
     /* ---- mod 的 bundle CRC 放行（必须早于任何 mod 加载） ---- */
     hook_install("Addressables.Crc", (void*)(g_base + RVA_ABRO_GET_CRC),

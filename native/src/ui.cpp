@@ -30,6 +30,7 @@
 #include "glyphs.h"
 
 #include <string.h>
+#include <stdio.h>
 #include <math.h>
 #include <dlfcn.h>
 
@@ -65,6 +66,66 @@ static volatile int* const ROW_FLAG[] = {
 };
 static_assert(sizeof(ROW_FLAG) / sizeof(ROW_FLAG[0]) == G_ROW_COUNT,
               "ROW_FLAG 与 glyphs.h 的 G_ROWS 行数不一致（同时改 gen_glyphs.py 再重新生成）");
+
+/* ---- v125：开关记忆 -----------------------------------------------------
+ * 状态落在 <files>/wulin_mod.cfg，一行一个 "键=0|1"（`#` 开头是注释），
+ * 启动时按它恢复，面板上点一下就立刻回写。
+ *
+ * 「地图」那两项（F_MAP / F_CAB）**v125 起默认关**：它们只改显示层，
+ * 玩家因此永远不会去真正点亮地点图标；而剧情里「判断大地图图标显示」读的是
+ * 存档里的 listShowIcon（不是显示层），于是像曼陀罗 R10021-4（玉门关 5059）、
+ * M2221-12 问路（炎城 20400）这类事件会被永久卡住。
+ */
+#define CFG_PATH "/sdcard/Android/data/com.xd.dxlzz.global.gp/files/wulin_mod.cfg"
+
+static const struct { const char* key; volatile int* flag; int def; } SETTINGS[] = {
+    { "water",      &F_WATER,       1 },
+    { "map",        &F_MAP,         0 },   /* 大地图地区全解锁：默认关 */
+    { "cab",        &F_CAB,         0 },   /* 马车地图全解锁：默认关 */
+    { "story",      &F_STORY,       1 },
+    { "flat",       &F_FLAT,        1 },
+    { "tradewin",   &F_TRADE_WIN,   1 },
+    { "tradepools", &F_TRADE_POOLS, 1 },
+};
+#define SETTING_N ((int)(sizeof(SETTINGS) / sizeof(SETTINGS[0])))
+
+void ui_settings_save(void) {
+    FILE* f = fopen(CFG_PATH, "w");
+    if (!f) { LOGI("面板: 配置写入失败 %s", CFG_PATH); return; }
+    fprintf(f, "# wulin mod settings (v125) —— 一行一个 键=0|1\n");
+    for (int i = 0; i < SETTING_N; ++i)
+        fprintf(f, "%s=%d\n", SETTINGS[i].key, *SETTINGS[i].flag ? 1 : 0);
+    fclose(f);
+}
+
+void ui_settings_load(void) {
+    for (int i = 0; i < SETTING_N; ++i) *SETTINGS[i].flag = SETTINGS[i].def;
+
+    FILE* f = fopen(CFG_PATH, "r");
+    if (!f) {
+        LOGI("面板: 无配置文件，按默认值创建 %s", CFG_PATH);
+        ui_settings_save();
+    } else {
+        char line[128];
+        while (fgets(line, sizeof(line), f)) {
+            char* p = line;
+            while (*p == ' ' || *p == '\t') ++p;
+            if (*p == '#' || *p == '\r' || *p == '\n' || !*p) continue;
+            char* eq = strchr(p, '=');
+            if (!eq) continue;
+            *eq = 0;
+            char* k = p;
+            char* e = k + strlen(k);
+            while (e > k && (e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
+            int val = atoi(eq + 1) ? 1 : 0;
+            for (int i = 0; i < SETTING_N; ++i)
+                if (strcmp(k, SETTINGS[i].key) == 0) { *SETTINGS[i].flag = val; break; }
+        }
+        fclose(f);
+    }
+    LOGI("面板: 开关 water=%d map=%d cab=%d story=%d flat=%d tradewin=%d tradepools=%d",
+         F_WATER, F_MAP, F_CAB, F_STORY, F_FLAT, F_TRADE_WIN, F_TRADE_POOLS);
+}
 
 static inline int row_h(int i) { return ROW_FLAG[i] ? ROW : SEC; }
 
@@ -424,6 +485,7 @@ static void toggle_row(int i) {
     volatile int* f = ROW_FLAG[i];
     if (!f) return;                       /* 分组标题行不可点 */
     *f = *f ? 0 : 1;
+    ui_settings_save();                   /* v125：点一下记一次 */
     redraw();
     upload();
     LOGI("面板: 第 %d 行(%s) -> %s", i, G_ROWS[i], *f ? "开" : "关");
