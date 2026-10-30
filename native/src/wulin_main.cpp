@@ -442,23 +442,87 @@ static const int k_all_icons[] = {
      20513,  20514,  20515,  20516,  20517,  20518,  20519
 };
 
-static void* g_list_add = nullptr;
+/* v130：不再调用 List<int>.Add（v126 就是它崩的 —— 与 v100/v101「join 查重实验」同一个坑）。
+ * 改成**整份重建 _items 数组**：读旧元素 → 造一个更大的 Int32[] → 拷旧 + 追加新的 →
+ * 用 il2cpp_gc_wbarrier_set_field 换引用 → 更新 _size / _version。
+ * 全程只碰 List 的三个字段（0x10 _items / 0x18 _size / 0x1C _version）与数组数据区，
+ * 不进入任何托管泛型方法。 */
+#define OFF_LIST_ITEMS  0x10
+#define OFF_LIST_SIZE   0x18
+#define OFF_LIST_VER    0x1C
 
-static void list_add_int(void* list, int v)
+static void* sym_of(const char* n)
 {
-    if (!g_list_add) {
-        if (!g_i2cpp) g_i2cpp = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
-        if (!g_i2cpp || !A_obj_get_class) return;
-        typedef void* (*fn_m)(void*, const char*, int);
-        fn_m get_m = (fn_m)dlsym(g_i2cpp, "il2cpp_class_get_method_from_name");
-        if (!get_m) { LOGI("大地图: 取不到 il2cpp_class_get_method_from_name"); return; }
-        void* k = A_obj_get_class(list);
-        if ((uintptr_t)k < 0x10000) return;
-        void* mi = get_m(k, "Add", 1);
-        if (!mi) { LOGI("大地图: 取不到 List<int>.Add"); return; }
-        g_list_add = *(void**)mi;
+    if (!g_i2cpp) g_i2cpp = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
+    return g_i2cpp ? dlsym(g_i2cpp, n) : nullptr;
+}
+
+/* true = 已有则跳过；返回本次新增条数 */
+static int list_merge_ints(void* list, const int* want, int want_n)
+{
+    if ((uintptr_t)list < 0x10000 || want_n <= 0) return 0;
+
+    int size = *(int*)((char*)list + OFF_LIST_SIZE);
+    void* items = *(void**)((char*)list + OFF_LIST_ITEMS);
+    if (size < 0 || size > 8192) return 0;
+    if (size > 0 && (uintptr_t)items < 0x10000) return 0;
+
+    const int* old = size > 0 ? (const int*)((char*)items + OFF_ARRAY_DATA) : nullptr;
+
+    /* 先算要追加哪些 */
+    int append[512];
+    int na = 0;
+    for (int i = 0; i < want_n && na < 512; ++i) {
+        int v = want[i];
+        if (v <= 0) continue;
+        bool dup = false;
+        for (int k = 0; k < size && !dup; ++k) if (old[k] == v) dup = true;
+        for (int k = 0; k < na && !dup; ++k) if (append[k] == v) dup = true;
+        if (!dup) append[na++] = v;
     }
-    if (g_list_add) ((void (*)(void*, int, void*))g_list_add)(list, v, nullptr);
+    if (na == 0) return 0;
+
+    int need = size + na;
+    if (need > 8192) return 0;
+
+    /* 造新数组：元素类从旧数组的 klass 反查；没有旧数组就按 System.Int32 找 */
+    typedef void* (*fn_elem)(void*);
+    fn_elem get_elem = (fn_elem)sym_of("il2cpp_class_get_element_class");
+    typedef void* (*fn_bar)(void*, void**, void*);
+    fn_bar wbar = (fn_bar)sym_of("il2cpp_gc_wbarrier_set_field");
+    if (!A_array_new || !get_elem || !wbar) { LOGI("大地图: 缺 il2cpp 符号（array_new/elem/wbarrier）"); return 0; }
+
+    /* 元素类：优先直接找 System.Int32（空列表时 items 里没有类型信息可用） */
+    void* elemk = find_class("System", "Int32");
+    if ((uintptr_t)elemk < 0x10000 && size > 0 && (uintptr_t)items > 0x10000) {
+        void* arrklass = *(void**)items;
+        if ((uintptr_t)arrklass > 0x10000) elemk = get_elem(arrklass);
+    }
+    if ((uintptr_t)elemk < 0x10000) { LOGI("大地图: 取不到 Int32 元素类"); return 0; }
+
+    void* narr = A_array_new(elemk, (size_t)need);
+    if ((uintptr_t)narr < 0x10000) { LOGI("大地图: 新建数组失败"); return 0; }
+
+    int* dst = (int*)((char*)narr + OFF_ARRAY_DATA);
+    for (int i = 0; i < size; ++i) dst[i] = old[i];
+    for (int i = 0; i < na; ++i) dst[size + i] = append[i];
+
+    wbar(list, (void**)((char*)list + OFF_LIST_ITEMS), narr);
+    *(int*)((char*)list + OFF_LIST_SIZE) = need;
+    *(int*)((char*)list + OFF_LIST_VER) += 1;
+    return na;
+}
+
+/* 返回本次新增条数（0 = 已经全在） */
+static int map_true_unlock(void)
+{
+    if (!F_MAP) return 0;                /* v128：并入「地图解锁」总开关 */
+    if (!g_data && !ensure_save(1)) return 0;
+    if (!g_set_vis) return 0;
+    int n = (int)(sizeof(k_all_icons) / sizeof(k_all_icons[0]));
+    int added = list_merge_ints(g_set_vis, k_all_icons, n);
+    if (added) LOGI("大地图: 真解锁 listShowIcon +%d（目标 %d 个）", added, n);
+    return added;
 }
 
 /* ---- v128：把真解锁挪到「主线程帧回调」里跑 -------------------------------
@@ -482,31 +546,9 @@ void map_true_unlock_tick(void)
     if (!ensure_save(1)) return;
     if (g_data && g_data == g_truemap_done) return;      /* 这份存档已经写过 */
 
-    /* v129：暂停 —— 实测在集合就绪的那一帧调用 List<int>.Add 会闪退
-     * （v100/v101 那次「join 查重实验会崩」是同一类问题）。
-     * 待改成走游戏自己的 UIWorldMapManager.SetCityVisible(worldMapID, mapID, true, false) 再开。
-     * 存档侧的 343 项已经写入过，数据层是真解锁状态。 */
-    int added = 0; (void)map_true_unlock;
+    int added = map_true_unlock();   /* v130：改用重建数组实现 */
     if (g_data) g_truemap_done = g_data;
     LOGI("大地图: 真解锁完成 +%d（本份存档）", added);
-}
-
-/* 返回本次新增条数（0 = 已经全在） */
-static int map_true_unlock(void)
-{
-    if (!F_MAP) return 0;                /* v128：并入「地图」总开关 */
-    if (!g_data && !ensure_save(1)) return 0;
-    if (!g_set_vis) return 0;
-    int added = 0;
-    int n = (int)(sizeof(k_all_icons) / sizeof(k_all_icons[0]));
-    for (int i = 0; i < n; ++i) {
-        int id = k_all_icons[i];
-        if (orig_contains && orig_contains(g_set_vis, id, nullptr)) continue;
-        list_add_int(g_set_vis, id);
-        added++;
-    }
-    if (added) LOGI("大地图: 真解锁 listShowIcon +%d（目标 %d 个）", added, n);
-    return added;
 }
 
 static void (*orig_cabIcon)(void* self) = nullptr;

@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v129"         /* v129：面板地图合一行「地图解锁」；运行期真解锁暂停（List.Add 会闪退） */
+#define MOD_VER "v130"         /* v130：真解锁改用「重建 _items 数组」，不再调 List.Add */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */

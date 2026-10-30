@@ -539,6 +539,7 @@ static void hook_mtsc_update(void* self) {
     /* v124：家园白名单自动补行（内部每秒节流、跑完自动停）——放在面板失败检查之前，
      * 免得面板初始化失败时把它一起挡掉 */
     join_fief_auto_tick();
+    map_true_unlock_tick();   /* v130：大地图真解锁（每秒一次，自己节流） */
 
     if (g_fails > 3) return;
     if (++g_ticks < 5) return;
