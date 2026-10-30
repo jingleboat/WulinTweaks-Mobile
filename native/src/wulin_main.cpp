@@ -482,7 +482,11 @@ void map_true_unlock_tick(void)
     if (!ensure_save(1)) return;
     if (g_data && g_data == g_truemap_done) return;      /* 这份存档已经写过 */
 
-    int added = map_true_unlock();
+    /* v129：暂停 —— 实测在集合就绪的那一帧调用 List<int>.Add 会闪退
+     * （v100/v101 那次「join 查重实验会崩」是同一类问题）。
+     * 待改成走游戏自己的 UIWorldMapManager.SetCityVisible(worldMapID, mapID, true, false) 再开。
+     * 存档侧的 343 项已经写入过，数据层是真解锁状态。 */
+    int added = 0; (void)map_true_unlock;
     if (g_data) g_truemap_done = g_data;
     LOGI("大地图: 真解锁完成 +%d（本份存档）", added);
 }

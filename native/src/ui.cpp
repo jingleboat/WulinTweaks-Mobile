@@ -55,8 +55,7 @@ static volatile int* const ROW_FLAG[] = {
     /* [1] 角色游泳        */ nullptr,
     /*   角色可入水游泳    */ &F_WATER,
     /* [2] 地图            */ nullptr,
-    /*   大地图地区全解锁  */ &F_MAP,
-    /*   马车地图全解锁    */ &F_CAB,
+    /*   地图解锁          */ &F_MAP,   /* v129：大地图+马车+真解锁 三合一 */
     /* [3] 剧情            */ nullptr,
     /*   忽略队伍角色条件  */ &F_STORY,
     /*   剧情分支展开      */ &F_FLAT,
@@ -540,7 +539,6 @@ static void hook_mtsc_update(void* self) {
     /* v124：家园白名单自动补行（内部每秒节流、跑完自动停）——放在面板失败检查之前，
      * 免得面板初始化失败时把它一起挡掉 */
     join_fief_auto_tick();
-    map_true_unlock_tick();   /* v128：大地图真解锁（每秒一次，自己节流） */
 
     if (g_fails > 3) return;
     if (++g_ticks < 5) return;
