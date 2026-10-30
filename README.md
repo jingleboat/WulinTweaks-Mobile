@@ -162,6 +162,41 @@ $env:JAVA_HOME="<jdk>"
 | **v94** | **读侧消毒**（最终修法）：`get_FullName` / `get_FullNameWithTitle` 返回值若是「端口名式纯 ASCII 串」，就用模板重新算一个该显示的名字返回 —— **不写任何游戏字段、不碰存档**，头顶名牌与对话/信息面板同时恢复正常 |
 | **v124** | **家园可入真正落地**：① CTMED 表里**没有该 uid 的记录时造一行**（PC `PartnerTools.FiefReady` 同款：`object_new` + `.ctor`(0x3D374C0) + 写 `Uid`(0x10)/`UName`(0x18)/`CouldBackToFief`(0x50) + `AddData`；虚方法没生效则退回 `data` 字典直插，每步回读验证）；② **白名单自动补行**（帧回调里每秒一次，名单优先读 `files/fief_ready.txt`，否则内置 `{10142,10143}`）；③ 取配置对象改走 `BaseDataClass.GetGameDataInternal(Type, dataGroup)`（0x3D25248）—— 该类在 **`GameData` 命名空间**、且是 ScriptableObject，`find_class("WuLin",…)` 与 `FindObjectOfType` 都拿不到 |
 | **v126** | **大地图改「真解锁」**：把 343 个地点图标（LocData 的 `WMapName_<id>` 全集）用 `List<int>.Add` 真写进存档 `SaveObjectMapManager.listShowIcon`（`map_true_unlock()`，挂 `initIcon` / `UpdateIconShow`）。原因：v48 起只拦 `Contains` 改显示层，而剧情「判断大地图图标显示 mapID=X」读的是**存档数据** —— 图标看着亮、剧情永远判不过（曼陀罗 R10021-4 玉门关 5059、M2221-12 问路 炎城 20400 都是这么卡死的）。同时 `F_MAP`/`F_CAB` 默认关、面板开关改为记忆到 `files/wulin_mod.cfg`（v125） |
+| **v127–v131** | 地图三合一落地 + 真解锁重写：v127 停用会闪退的运行期写入；v128 挪到 `MainThreadSync.Update` 帧回调（每份存档只写一次）；v129 面板两行合并为一行「地图解锁」；**v130/v131 真解锁改用「重建 `_items` 数组」**（不再调 `List<int>.Add`，见下节） |
+
+---
+
+## 大地图「真解锁」：为什么不调 List.Add（v126→v131 演进）
+
+**目标**：把「大地图可显示的地点图标」全集（`LocData` 里全部 `WMapName_<id>`，**343 个**）
+真写进存档 `SaveObjectMapManager.listShowIcon`，让剧情「判断大地图图标显示 mapID=X」能真通过。
+
+| 版本 | 做法 | 结果 |
+|---|---|---|
+| v126 | 在 `initIcon`/`UpdateIconShow` 里 `List<int>.Add` 逐个加 | **读档必闪退** |
+| v127 | 先停用（cfg `truemap`） | 能进游戏 |
+| v128 | 挪到 `MainThreadSync.Update` 帧回调、按存档指针只写一次 | **开启地图即闪退**（`存档集合已就绪` 之后立刻崩） |
+| v129 | 面板两行合并成「地图解锁」；真解锁暂停 | 稳定 |
+| **v130/v131** | **整份重建 `_items` 数组**（见下） | ✅ 实测 `大地图: 真解锁完成 +343（本份存档）` |
+
+崩溃根因：直接调 `List<T>.Add`（值类型泛型实例）在 IL2CPP 上不安全 —— 和 v100/v101
+「join 查重实验（会崩）→ 回退」是同一个坑（v103 才改成走游戏自己的 `AddCharacter`）。
+
+安全写法（`list_merge_ints()`）：
+
+```
+读 list._items(0x10) / _size(0x18) / _version(0x1C)
+  → 算差集（已有跳过）
+  → A_array_new(System.Int32, 旧数+新增数)      ← 元素类直接 find_class("System","Int32")
+  → 拷旧元素 + 追加新元素（数组数据区 +0x20）
+  → il2cpp_gc_wbarrier_set_field(list, &_items, 新数组)
+  → _size = 新长度；_version += 1
+```
+
+全程**不进入任何托管泛型方法**。注意空列表时要从 `System.Int32` 取元素类，
+从空数组反查会拿不到（首次踩坑：`大地图: 取不到 Int32 元素类` → `+0`）。
+
+开关：面板一行「地图解锁」（`F_MAP` 总开关，`F_CAB` 跟随）＝ 大地图图标 + 马车地图 + 存档真解锁。
 
 ---
 
