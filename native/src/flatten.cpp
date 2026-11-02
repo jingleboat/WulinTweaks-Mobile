@@ -63,8 +63,8 @@ extern volatile int F_STORY;     /* 剧情条件放宽（姓名窗口也受它�
 #define FLAT_MAX_NODES   2050        /* 单图节点上限（最大的图约 1300） */
 #define FLAT_MAX_EDGES   8200
 #define FLAT_MAX_PAIRS   48
-#define FLAT_MAX_CONDS   128
-#define FLAT_MAX_GATES   512         /* v87：被接管的门（HoldNode）指针表，与 PC 的 HashSet 对齐 */
+#define FLAT_MAX_CONDS   4096    /* v158：128 → 4096（实测打满后所有门 forced=N，展平失效） */
+#define FLAT_MAX_GATES   8192        /* v158：512 → 8192（同上） */
 #define FLAT_MAX_REGION  512         /* region 节点上限 */
 #define FLAT_DONE_MAX    96          /* 处理过的图指针（环形） */
 #define FLAT_LOG_GRAPH   200   /* v149：40 → 200（本次诊断发现 40 条上限把 R10049-2 的结果吞掉了） */
@@ -155,11 +155,13 @@ static int port_set_conn_node(void* port, int idx, void* target) {
 static void* g_flat_cond[FLAT_MAX_CONDS];
 static int g_flat_cond_n = 0;
 
+static int g_cond_full_warned = 0, g_gate_full_warned = 0;
 static void flat_add_cond(void* cond) {
     if ((uintptr_t)cond < 0x10000) return;
     for (int i = 0; i < g_flat_cond_n; ++i)
         if (g_flat_cond[i] == cond) return;
     if (g_flat_cond_n < FLAT_MAX_CONDS) g_flat_cond[g_flat_cond_n++] = cond;
+    else if (!g_cond_full_warned) { g_cond_full_warned = 1; LOGE("[flat] 条件表已满（%d），后续条件不再登记 —— 展平会失效", FLAT_MAX_CONDS); }
 }
 
 /* v87：被接管的**门**（HoldNode）本身 —— 与 PC 的 BranchFlatten._gateForced 对齐。
@@ -176,6 +178,7 @@ static void flat_add_gate(void* gate) {
     for (int i = 0; i < g_flat_gate_n; ++i)
         if (g_flat_gate[i] == gate) return;
     if (g_flat_gate_n < FLAT_MAX_GATES) g_flat_gate[g_flat_gate_n++] = gate;
+    else if (!g_gate_full_warned) { g_gate_full_warned = 1; LOGE("[flat] 门表已满（%d），后续门不再登记 —— 展平会失效", FLAT_MAX_GATES); }
 }
 
 /* 这道门是否已被「分支展开」接管（= 无条件判真）。由 hook_hold_check 调用。 */
@@ -404,9 +407,8 @@ static int is_story_idx(int i) {
  * 绛紫烟本人出演的 _6_7 由「需要伙伴」控制，按用户规则不加。 */
 static int is_story_cond(const char* cn) {
     if (!cn || !cn[0]) return 0;
-    return strcmp(cn, "HavePartnerCondition") == 0        /* 需要伙伴（当前在队） */
-        || strcmp(cn, "NpcAtMapCondition") == 0           /* 判断地图存在NPC */
-        || strcmp(cn, "CheckNpcAtFiefCondition") == 0;    /* 需要NPC处于家园中 */
+    /* v158（用户指定）：放宽与展平**都只对「需要伙伴」生效**。 */
+    return strcmp(cn, "HavePartnerCondition") == 0;
 }
 
 /* v157：门 → (pid, 侧别)，供 [gate] 轨迹日志打印 */
@@ -457,7 +459,7 @@ static int flat_region(int k) {
     memset(out, 0, (size_t)g_nnodes);
 
     int head = 0;
-    if (p->g1 >= 0 && p->g1 < g_nnodes) { out[p->g1] = 2; st[head++] = p->g1; }
+    if (p->s >= 0 && p->s < g_nnodes) { out[p->s] = 2; st[head++] = p->s; }
     while (head > 0) {
         int cur = st[--head];
         for (int e = 0; e < g_ec[cur]; ++e) {
@@ -469,7 +471,7 @@ static int flat_region(int k) {
     }
 
     head = 0;
-    if (p->g0 >= 0 && p->g0 < g_nnodes && !out[p->g0]) { out[p->g0] = 3; st[head++] = p->g0; }
+    if (p->f >= 0 && p->f < g_nnodes && !out[p->f]) { out[p->f] = 3; st[head++] = p->f; }
     while (head > 0) {
         int cur = st[--head];
         for (int e = 0; e < g_ec[cur]; ++e) {
@@ -647,7 +649,7 @@ static void flatten_try_inner(void* any_node) {
             for (int e = 0; e < g_ec[i]; ++e) {
                 int ei = g_e0[i] + e;
                 if (reg[g_edge[ei].tgt] == 1) continue;      /* 内部边 */
-                if (g_edge[ei].tgt == p->g1) continue;       /* 已经接过去了 */
+                if (g_edge[ei].tgt == p->s) continue;        /* 已经接过去了 */
                 if (g_nexit >= FLAT_MAX_EDGES) break;
                 g_exit[g_nexit++] = ei;
                 p->ex_n++;
@@ -674,7 +676,7 @@ static void flatten_try_inner(void* any_node) {
     for (int k = 0; k < g_npairs; ++k) {
         FLAT_PAIR* p = &g_pair[k];
         if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION || p->ex_n == 0) continue;
-        flat_mark_reach(p->g1, g_tmp_reach);
+        flat_mark_reach(p->s, g_tmp_reach);
         for (int i = 0; i < g_nnodes; ++i)
             if (g_tmp_reach[i]) g_before_bits[k][i >> 3] |= (unsigned char)(1u << (i & 7));
     }
@@ -704,19 +706,19 @@ static void flatten_try_inner(void* any_node) {
             if (!port_set_conn_node(ed->port, ed->slot, g_nd[p->g1])) { commit_fail = 1; break; }
             g_undo[g_undo_n].ei = ei;
             g_undo[g_undo_n].old_tgt = ed->tgt;
-            g_undo[g_undo_n].g1 = p->g1;
+            g_undo[g_undo_n].g1 = p->s;
             g_undo_n++;
-            ed->tgt = p->g1;          /* 镜像到内存表，后面的 DFS 才看得到新边 */
+            ed->tgt = p->s;          /* 镜像到内存表，后面的 DFS 才看得到新边 */
             ok++;
         }
         redirected += ok;
         if (commit_fail) { rolled = 1; break; }
 
-        flat_add_cond(g_cond[p->g0]);
-        flat_add_cond(g_cond[p->g1]);
-        flat_add_gate(g_nd[p->g0]);
-        flat_add_gate(g_nd[p->g1]);
-        gate_info_add(g_nd[p->g0], p->pid, 1);
+        flat_add_cond(g_cond[p->f]);
+        flat_add_cond(g_cond[p->s]);
+        flat_add_gate(g_nd[p->f]);
+        flat_add_gate(g_nd[p->s]);
+        gate_info_add(g_nd[p->g0], p->pid, 1);    /* 侧别仅用于日志：Negate=0 = 在队 */
         gate_info_add(g_nd[p->g1], p->pid, 0);
 
         expanded++;
@@ -740,7 +742,7 @@ static void flatten_try_inner(void* any_node) {
         for (int k = 0; k < g_npairs && !rolled; ++k) {
             FLAT_PAIR* p = &g_pair[k];
             if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION || p->ex_n == 0) continue;
-            flat_mark_reach(p->g1, g_tmp_reach);
+            flat_mark_reach(p->s, g_tmp_reach);
             for (int i = 0; i < g_nnodes; ++i) {
                 if (!(g_before_bits[k][i >> 3] & (1u << (i & 7)))) continue;
                 if (!g_tmp_reach[i]) { rolled = 1; break; }
