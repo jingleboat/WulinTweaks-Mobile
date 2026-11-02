@@ -106,6 +106,7 @@ $env:JAVA_HOME="<jdk>"
 只列功能节点，中间的调试版本见 git 历史。
 
 | 版本 | 内容 |
+| **v148** | **收敛成一句话：随剧情条件放宽一起做 clear(pid)。** ① clear 从「hook 里放宽命中时」挪到 `keep_original_for_uncached()` 里、`relax_once` **之前** —— `relax_once` 是「每图只放宽一次」的计数器，只该限制放宽、不该限制清名字，否则同一张图（R10049-2 有 19 个 partnerID）第一个条件用掉那一次后其余角色全清不到（凌梦蝶即此例）；放在结缘图 / never_joined 守卫**之后**，这两类是故意不放宽、清名字会剧透。② 停用临时改名（`rn_sync()` 直接 return）。③ 停用显示层接管（`hook_fullname` / `hook_fullname_title` 直接返回游戏原值）。现在 mod 只做「清 @」，显示完全交回游戏 |
 | **v147** | **删除姓名回落机制**：`real_name_of` 只保留最直接的一级来源 —— 模板 `surName`+`givenName`（去前导 `@`）；不再回落 `get_RealFullName`（实测对「只有姓没有名」的角色只返回姓，对 20204 返回「大梁城·知府」）、不再回落 `uName`、不再回落 `nameAsStranger`。另：`unstranger` 只清 `m_givenName` 的 `@`，`m_surName` 的 `@` 判断删除（4 份存档核对：surName 带 `@` 的 0 条） |
 |---|---|
 | **v146** | **简化**：放宽在队条件触发时，对该 `partnerID` 的实例**只做一件事 —— 清空 `m_givenName` 里 `@` 及其后面的全部内容**（`m_surName` 仅在它本身也以 `@` 开头时才清）。不再查模板、不再写模板真名、不再判断"模板有没有真名"。清完之后显示成什么交给游戏自己的回落 + `real_name_of` 取值链 |

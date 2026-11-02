@@ -222,6 +222,7 @@ static void resolve_save() {
 static uint64_t rule_now_ms(void);          /* 定义在剧情缓存那一节 */
 static void char_mgr_reset(void);           /* 定义在「从未入队」那一节：换档后清角色管理器缓存 */
 static void relax_once_reset(void);         /* v145：清「每图只放宽一次」（定义在放宽规则那一节） */
+static void unstranger_apply_uid(int pid, int force);   /* v148：清该 uid 实例的 '@' 陌生名 */
 
 static int save_sets_ready(void) {
     return ((uintptr_t)g_set_enable > 0x10000) || ((uintptr_t)g_set_vis > 0x10000);
@@ -916,17 +917,28 @@ static int keep_original_for_uncached(void* condNode) {
     }
 
     int selfId = parse_r_id(gn);
-    if (selfId <= 0) return 0;                       /* 非角色剧情图：放宽 */
+    if (selfId <= 0) {                               /* 非角色剧情图：放宽 */
+        int p0 = *(int*)((char*)condNode + OFF_PARTNER_ID);
+        if (p0 > 0) unstranger_apply_uid(p0, 0);     /* ★ 顺带清掉涉及角色的陌生名 */
+        return 0;
+    }
 
     int pid = *(int*)((char*)condNode + OFF_PARTNER_ID);
-    if (pid != selfId) return relax_once(gn) ? 0 : 1;  /* 彩蛋：放宽（每图一次） */
+    if (pid != selfId) {                             /* 彩蛋：放宽（每图一次） */
+        /* ★ v148：清陌生名放在 relax_once 之前 —— relax_once 是「每图只放宽一次」的
+         * 计数器，它只该限制"放宽"，不该限制"清名字"。否则同一张图（如 R10049-2 有 19 个
+         * partnerID）第一个条件用掉那一次之后，后面所有角色都清不到（凌梦蝶就是这样漏掉的）。 */
+        unstranger_apply_uid(pid, 0);
+        return relax_once(gn) ? 0 : 1;
+    }
 
     if (is_bond_graph(g, gn)) {                      /* v95：结缘图跳过放宽 */
         if (g_bond_log++ < 20)
             LOGI("[team] 图 %s 含「结缘界面」→ 跳过放宽（按原版：必须在队）", gn);
-        return 1;
+        return 1;                                    /* 故意不放宽 → 也不清名字（避免剧透） */
     }
-    if (never_joined(pid)) return 1;                 /* 本命角色：从未入队 → 不放宽 */
+    if (never_joined(pid)) return 1;                 /* 本命角色：从未入队 → 不放宽，同样不清 */
+    unstranger_apply_uid(pid, 0);                     /* ★ 只在"本来会放宽"时才清 */
     return relax_once(gn) ? 0 : 1;                   /* 已入过队 → 只放宽一次 */
 }
 
@@ -1483,6 +1495,13 @@ static int rn_live_playing(int uid) {
 
 /* 按「播放状态」同步改名：该改的改、该还原的还原 */
 static void rn_sync(void) {
+    /* v148（用户指定）：**停用临时改名**。
+     * 现在只做一件事 —— 放宽命中时清掉实例 m_givenName 的 '@'（unstranger_apply_uid），
+     * 显示完全交回游戏（手机端对"实例名字为空"会自行回落）。
+     * 这套「剧情期间写模板真名 + 收尾还原」既没必要，又是"只显示姓""称号·姓名拼重复"
+     * 一类脏数据的来源，故整体停用（代码保留，便于回溯）。 */
+    return;
+#if 0
     int playing = playing_now();
     for (int i = 0; i < RN_SLOTS; ++i) {
         if (g_rn[i].uid <= 0) continue;
@@ -1497,6 +1516,7 @@ static void rn_sync(void) {
             rn_restore_tpl(i);
         }
     }
+#endif
 }
 
 /* 播放状态变化检测（挂在很热的 hook 上，250ms 节流 + 只在状态真的变了才做事） */
@@ -1675,26 +1695,17 @@ static void probe_name_result(const char* tag, void* self, void* r) {
 }
 
 static void* hook_fullname(void* self) {
-    void* r = story_real_name(self);
-    if (r) return r;
+    /* v148（用户指定）：删除显示层的取名接管 —— 直接返回游戏原值。
+     * 我们只负责把实例的 '@' 清掉，显示成什么完全由游戏自己决定。 */
     void* v = orig_fullname ? orig_fullname(self) : nullptr;
     probe_name_result("get_FullName", self, v);
-    if (str_is_ascii_name(v)) {                    /* v94：读侧消毒 */
-        void* fix = rn_fix_ascii_name(self);
-        if (fix) return fix;
-    }
     return v;
 }
 
 static void* hook_fullname_title(void* self) {
-    void* r = story_real_name(self);
-    if (r) return r;
+    /* v148：同上，不再用我们的取值链覆盖。 */
     void* v = orig_fullname_title ? orig_fullname_title(self) : nullptr;
     probe_name_result("get_FullNameWithTitle", self, v);
-    if (str_is_ascii_name(v)) {                    /* v94：读侧消毒 */
-        void* fix = rn_fix_ascii_name(self);
-        if (fix) return fix;
-    }
     return v;
 }
 
