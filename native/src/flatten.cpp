@@ -44,6 +44,7 @@
  *   HavePartnerCondition     partnerID 0x58(int)  Negate 0x5C(bool)
  *   il2cpp 数组元素起点 0x20（List._items 指向数组对象）
  */
+#include <cstdio>
 #include "common.h"
 
 #include <string.h>
@@ -413,16 +414,37 @@ static int is_story_cond(const char* cn) {
 
 /* v157：门 → (pid, 侧别)，供 [gate] 轨迹日志打印 */
 #define FLAT_GATE_INFO 256
-typedef struct { void* gate; int pid; int in_team; } FLAT_GATE_INFO_T;
+typedef struct { void* gate; int pid; int in_team; char cls[40]; } FLAT_GATE_INFO_T;
 static FLAT_GATE_INFO_T g_ginfo[FLAT_GATE_INFO];
 static int g_ginfo_n = 0;
-static void gate_info_add(void* gate, int pid, int in_team) {
+static void gate_info_add_cls(void* gate, int pid, int in_team, const char* cls) {
     if ((uintptr_t)gate < 0x10000 || g_ginfo_n >= FLAT_GATE_INFO) return;
     for (int i = 0; i < g_ginfo_n; ++i) if (g_ginfo[i].gate == gate) return;
     g_ginfo[g_ginfo_n].gate = gate;
     g_ginfo[g_ginfo_n].pid = pid;
     g_ginfo[g_ginfo_n].in_team = in_team;
+    snprintf(g_ginfo[g_ginfo_n].cls, sizeof(g_ginfo[0].cls), "%s", cls ? cls : "");
     g_ginfo_n++;
+}
+static void gate_info_add(void* gate, int pid, int in_team) { gate_info_add_cls(gate, pid, in_team, ""); }
+
+/* v160：把「本图所有带条件的门」都登记一遍（含未接管的）——
+ * 只用于日志，不加入强制放行表。这样 [gate] 里就不会全是 pid=0 侧=?。 */
+static void gate_info_register_all(const char* gn) {
+    (void)gn;
+    for (int i = 0; i < g_nnodes; ++i) {
+        void* cond = g_cond[i];
+        if ((uintptr_t)cond < 0x10000) continue;
+        int pid = *(int*)((char*)cond + OFF_HP_PARTNER_ID);
+        int neg = (int)*(unsigned char*)((char*)cond + OFF_HP_NEGATE);
+        char cb[40];
+        gate_info_add_cls(g_nd[i], pid, neg ? 0 : 1, cls_name(cond, cb, sizeof(cb)));
+    }
+}
+const char* flatten_gate_cls(void* gate) {
+    for (int i = 0; i < g_ginfo_n; ++i)
+        if (g_ginfo[i].gate == gate) return g_ginfo[i].cls;
+    return "";
 }
 int flatten_gate_pid(void* gate, int* in_team) {
     for (int i = 0; i < g_ginfo_n; ++i)
@@ -577,6 +599,8 @@ static void flatten_try_inner(void* any_node) {
         }
         return;
     }
+
+    gate_info_register_all(gn);          /* v160：只登记不接管 */
 
     /* ---------------- ① 找互补门对 ---------------- */
     g_npairs = 0;

@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v159"         /* v159：补回 p->f/p->s/first_is_g0 赋值（v158 因此全部判空）+ 改线目标用 s */
+#define MOD_VER "v160"         /* v160：放宽改为每(图,pid)一次；[gate] 登记所有带条件的门（只登记不接管）+ 类名 */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
@@ -49,7 +49,8 @@ int flatten_cond_always_true(void* cond);
 /* v87：该**门**（HoldNode）是否已被接管 —— 由 hook_hold_check 整门判真，与 PC 的
  * BranchFlatten.IsGateForced 同一语义（故意不看开关）。 */
 int flatten_gate_forced(void* gate);
-int flatten_gate_pid(void* gate, int* in_team);   /* v157：门 → (pid, 是否在队侧) */
+int flatten_gate_pid(void* gate, int* in_team);
+const char* flatten_gate_cls(void* gate);   /* v160：门的条件类名（只登记，不接管） */   /* v157：门 → (pid, 是否在队侧) */
 /* 只读体检：打印某 uid 的角色模板内容（姓/名/陌生时姓名/UName）与实例是否存在。 */
 void relax_name_probe(int uid);
 /* 提前打开某 uid 的「熟悉后姓名」窗口（由分支展开在 patch 图时调用）。 */

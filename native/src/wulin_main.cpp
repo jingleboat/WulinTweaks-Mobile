@@ -755,19 +755,25 @@ static int never_joined(int uid) {
  * 读不到图名时保守返回 0（放宽），避免误挡。 */
 static int keep_original_for_uncached(void* condNode);
 
-/* v109：同一张剧情图只放宽一次（不再用固定名单） */
-#define RELAX_ONCE_N 128
+/* v160：放宽粒度从「每图一次」改成「每 (图, partnerID) 一次」。
+ * 原因：R10049-2 里有 12 对「需要伙伴」，旧的每图一次让第一个角色吃掉额度，
+ * 其余 11 个角色全部走原版 —— 明显不是本意（放宽的对象本来就是"某个角色的在队条件"）。
+ * 防循环能力不变：每个角色在每张图里仍然只放宽一次。 */
+#define RELAX_ONCE_N 256
 static char g_ro_name[RELAX_ONCE_N][64];
+static int  g_ro_pid[RELAX_ONCE_N];
 static int  g_ro_i = 0;
 static int  g_ro_log = 0;
-static int relax_once(const char* gn) {
+static int relax_once_pid(const char* gn, int pid) {
     if (!gn || !gn[0]) return 1;
+    if (pid <= 0) pid = -1;
     for (int i = 0; i < RELAX_ONCE_N; ++i)
-        if (g_ro_name[i][0] && strcmp(g_ro_name[i], gn) == 0) {
-            if (g_ro_log++ < 12) LOGI("[relax] 图 %s 已放宽过一次 -> 本次走原版", gn);
+        if (g_ro_name[i][0] && g_ro_pid[i] == pid && strcmp(g_ro_name[i], gn) == 0) {
+            if (g_ro_log++ < 20) LOGI("[relax] 图 %s pid=%d 已放宽过一次 -> 本次走原版", gn, pid);
             return 0;
         }
     snprintf(g_ro_name[g_ro_i], sizeof(g_ro_name[0]), "%s", gn);
+    g_ro_pid[g_ro_i] = pid;
     g_ro_i = (g_ro_i + 1) % RELAX_ONCE_N;
     return 1;
 }
@@ -782,6 +788,7 @@ static int relax_once(const char* gn) {
  *    不适合做 16 字节内联补丁（跳板重定位踩到 PC 相对指令）。该钩子已撤掉，改走既有信号。 */
 static void relax_once_reset(void) {
     memset(g_ro_name, 0, sizeof(g_ro_name));
+    memset(g_ro_pid, 0, sizeof(g_ro_pid));
     g_ro_i = 0;
 }
 
@@ -920,7 +927,7 @@ static int keep_original_for_uncached(void* condNode) {
     if (selfId <= 0) {                               /* 非角色剧情图：放宽 */
         int p0 = *(int*)((char*)condNode + OFF_PARTNER_ID);
         if (p0 > 0) unstranger_apply_uid(p0, 0);     /* ★ 顺带清掉涉及角色的陌生名 */
-        return 0;
+        return 0;                                   /* 非角色剧情图：直接放宽（不计额度） */
     }
 
     int pid = *(int*)((char*)condNode + OFF_PARTNER_ID);
@@ -929,7 +936,7 @@ static int keep_original_for_uncached(void* condNode) {
          * 计数器，它只该限制"放宽"，不该限制"清名字"。否则同一张图（如 R10049-2 有 19 个
          * partnerID）第一个条件用掉那一次之后，后面所有角色都清不到（凌梦蝶就是这样漏掉的）。 */
         unstranger_apply_uid(pid, 0);
-        return relax_once(gn) ? 0 : 1;
+        return relax_once_pid(gn, pid) ? 0 : 1;
     }
 
     if (is_bond_graph(g, gn)) {                      /* v95：结缘图跳过放宽 */
@@ -939,7 +946,7 @@ static int keep_original_for_uncached(void* condNode) {
     }
     if (never_joined(pid)) return 1;                 /* 本命角色：从未入队 → 不放宽，同样不清 */
     unstranger_apply_uid(pid, 0);                     /* ★ 只在"本来会放宽"时才清 */
-    return relax_once(gn) ? 0 : 1;                   /* 已入过队 → 只放宽一次 */
+    return relax_once_pid(gn, pid) ? 0 : 1;                   /* 已入过队 → 只放宽一次 */
 }
 
 /* 每次「需要伙伴 / 有伙伴」条件判定 +1（按线程）。
@@ -2509,7 +2516,8 @@ static void gate_trace(void* self, int forced, int result) {
     const char* gn = ((uintptr_t)g > 0x10000) ? obj_name(g, gb, sizeof(gb)) : "?";
     int in_team = -1;
     int pid = flatten_gate_pid(self, &in_team);
-    LOGI("[gate] 图=%s 门=%p pid=%d 侧=%s forced=%s → %s", gn, self, pid,
+    LOGI("[gate] 图=%s 门=%p pid=%d 类=%s 侧=%s forced=%s → %s", gn, self, pid,
+         flatten_gate_cls(self),
          pid <= 0 ? "?" : (in_team ? "在队" : "不在队"),
          forced ? "Y" : "N", result ? "通过" : "不通过");
 }
