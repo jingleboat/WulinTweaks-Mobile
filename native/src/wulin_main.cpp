@@ -1865,57 +1865,33 @@ static void unstranger_apply_uid(int pid, int force) {
     }
     if (!stranger) return;                        /* v142：不缓存"非@"——@ 可能在初始化稍后才写上来 */
 
-    /* ⚠️ 手机端不能"清空"，必须"写模板真名"。
-     * 实测（用户 2026-11-02 反馈，角色 20006 无名小村铁匠）：
-     *   实例 sur/giv 都为空时 —— PC 版显示「王大锤」= 模板 surName+givenName，
-     *   手机版显示「无名小村铁匠」= CharacterPoolData.uName。
-     * 也就是两端的取名回落不一样：清空在 PC 上能拿到真名，在手机上只会退成 uName。
-     * 所以这里照 v75 的做法，把模板的 surName / givenName 直接写进实例。 */
-    void* tpl = *(void**)((char*)c + OFF_GCI_TEMPLATE);
-    if ((uintptr_t)tpl < 0x10000) return;         /* v142：不缓存失败分支 */
-    if (!obj_is_class(tpl, "CharacterPoolData") ||
-        *(int*)((char*)tpl + OFF_CPD_UID) != pid) return;
+    /* v146（用户指定）：**只做一件事 —— 清空 '@' 及其后面的全部内容。**
+     * 不再查模板、不再写真名、不再判断"模板有没有真名"。
+     *     m_givenName : "@一本正经的道人" → ""
+     *     m_surName   : 只有当它本身也以 '@' 开头时才清（正常情况它是空串，不动它）
+     * 清完之后显示成什么，交给游戏自己的取名回落 + 本 mod 的 real_name_of 取值链，
+     * 这里不再干预。 */
 
-    void* ts = *(void**)((char*)tpl + OFF_CPD_SURNAME);
-    void* tg = *(void**)((char*)tpl + OFF_CPD_GIVENNAME);
-    int has_sur = !str_empty(ts);
-    int has_giv = !str_empty(tg);
-
-    /* v90 教训：先把旧文本拷出来，**再**改字段。
-     * 字段一被覆盖，g0 指向的字符串就没有引用了，GC 一回收再读就是 use-after-free。 */
+    /* v90 教训：先把旧文本拷出来，**再**改字段（字段一覆盖，旧串没人引用，GC 回收后再读就是 UAF） */
     char gb[96] = {0};
     str_to_buf(g0, gb, sizeof(gb));
 
-    if (!has_sur && !has_giv) {
-        /* 模板里也没有真姓真名（无名之辈）：保留原样，别把它退化成无名。
-         * v142：这里也不再缓存 —— 失败分支一律不记，下次（播放时）还会再看一眼。 */
-        if (g_us_log++ < 20)
-            LOGI("[name] 放宽在队条件 uid=%d 模板无真名，保留陌生名 \"%s\"", pid, gb);
-        return;
-    }
-
     void* empty = A_string_new ? A_string_new("") : nullptr;
     if ((uintptr_t)empty < 0x10000) return;
-    *(void**)((char*)c + OFF_GCI_SURNAME)   = has_sur ? ts : empty;
-    *(void**)((char*)c + OFF_GCI_GIVENNAME) = has_giv ? tg : empty;
+
+    *(void**)((char*)c + OFF_GCI_GIVENNAME) = empty;
+
+    void* s0 = *(void**)((char*)c + OFF_GCI_SURNAME);
+    if (il2str_len_ok(s0)) {
+        int LS = *(int*)((char*)s0 + OFF_IL2STR_LEN);
+        const unsigned short* qs = (const unsigned short*)((char*)s0 + OFF_IL2STR_CHARS);
+        if (LS > 0 && qs[0] == 0x40) *(void**)((char*)c + OFF_GCI_SURNAME) = empty;
+    }
+
     us_cache(pid, c);
 
-    /* v140：与老的「剧情期间临时改名」解耦。
-     * 实测日志（v138）出现过这个顺序：
-     *   [name] 放宽在队条件 uid=20006 原陌生名="@相貌丑陋的汉子" → 已清空
-     *   [name] uid=20006 已把实例姓名改成 "王大锤"（数据层）     ← rn_apply_rename 把清空后的值当"原值"存了
-     *   [name] uid=20006 姓名已还原                              ← 于是还原成空 → 显示退化成 uName
-     * 我们已经把真名写死，就不该再让 rn 槽位在剧情结束时回写。
-     * restore=0：直接丢弃槽位，不还原。 */
-    int ri = rn_find(pid);
-    if (ri >= 0) rn_clear_slot(ri, 0);
-
-    if (g_us_log++ < 40) {
-        char sb[64] = {0}, nb[64] = {0};
-        str_to_buf(*(void**)((char*)c + OFF_GCI_SURNAME), sb, sizeof(sb));
-        str_to_buf(*(void**)((char*)c + OFF_GCI_GIVENNAME), nb, sizeof(nb));
-        LOGI("[name] 放宽在队条件 uid=%d 陌生名 \"%s\" → 写入真名 \"%s%s\"", pid, gb, sb, nb);
-    }
+    if (g_us_log++ < 40)
+        LOGI("[name] 放宽在队条件 uid=%d 清空陌生名 \"%s\"", pid, gb);
 }
 
 static bool hook_check_joined(void* self, int io, void* line) {

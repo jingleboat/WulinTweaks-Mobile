@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v145"         /* v145：撤掉 OnLoadFinished 钩子（v144 闪退根因），改用既有换档信号；真名取值链零分配 */
+#define MOD_VER "v146"         /* v146：放宽触发时只清空 '@' 及其后面的内容（不再写模板真名） */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */

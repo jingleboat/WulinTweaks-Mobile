@@ -107,6 +107,7 @@ $env:JAVA_HOME="<jdk>"
 
 | 版本 | 内容 |
 |---|---|
+| **v146** | **简化**：放宽在队条件触发时，对该 `partnerID` 的实例**只做一件事 —— 清空 `m_givenName` 里 `@` 及其后面的全部内容**（`m_surName` 仅在它本身也以 `@` 开头时才清）。不再查模板、不再写模板真名、不再判断"模板有没有真名"。清完之后显示成什么交给游戏自己的回落 + `real_name_of` 取值链 |
 | **v145** | 修 v144「进游戏闪退」：**撤掉 v143 新挂的 `GameCharacterManager.OnLoadFinished`（0x2267FF8）内联钩子**。tombstone 显示 faulting `pc = libil2cpp+0x4F21BB0`（落在 `.got` 之后的数据段 = 跳进数据地址），帧 `#01 0x226A03C` 仍在同一函数体内 → 该位置不适合做 16 字节内联补丁。改用**既有信号**：`ensure_save()` 检测到「存档集合换档」时（日志每份读档都有 `地图: 存档集合换档 enable=0x…`）顺带 `relax_once_reset()`。另外把 `real_name_of` 改回**零分配**（v144 曾在 `get_FullName` 热路径上 `snprintf + il2cpp_string_new`） |
 | **v144** | 真名取值链（`real_name_of`）改为：**只要 `surName` / `givenName` 有一侧非空就用**，**两侧都空**才退化到 `uName`。旧链是 `RealFullName → uName → 陌生名`，压根没试过 `sur+giv`，于是「只有姓没有名」的角色（如 20204：`uName=大梁城知府 / surName=知府 / givenName=null`）会被顶成 uName。现链：① `get_RealFullName` → ② 实例姓 → ③ 实例名 → ④ 模板姓 → ⑤ 模板名 → ⑥ `uName`（仅④⑤皆空）→ ⑦ `nameAsStranger` |
 | **v143** | 修「读档后再触发同一段剧情，陌生名不生效」：挂 `GameCharacterManager.OnLoadFinished`（RVA `0x2267FF8`，紧邻同类的 `Clear` `0x2267FE4`）→ `relax_once_reset()` + `char_mgr_reset()`。不清的话 `g_ro_name` 还留着上一局的图名，第二次触发只有 `[relax] 图 X 已放宽过一次 -> 本次走原版`，`mark_relaxed`/`unstranger_relaxed` 一次都不被调用（日志实证）。另：`unstranger_on_play` 走 `force=1` 忽略实例指针缓存 |
