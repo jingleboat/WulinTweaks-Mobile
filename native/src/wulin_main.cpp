@@ -769,6 +769,16 @@ static int relax_once(const char* gn) {
     return 1;
 }
 
+/* v143：读档完成时把「每图只放宽一次」的状态清掉。
+ * 实测（用户 2026-11-03 复现 + 日志）：读手动存档后再触发同一段剧情，日志里只有
+ *   [relax] 图 R10049-2 已放宽过一次 -> 本次走原版
+ * 也就是说放宽根本没发生 → mark_relaxed / unstranger_relaxed 一次都没被调 →
+ * 陌生名自然没人去改。读档是玩家主动重置，这个一次性状态必须跟着重置。 */
+static void relax_once_reset(void) {
+    memset(g_ro_name, 0, sizeof(g_ro_name));
+    g_ro_i = 0;
+}
+
 /* 带 TTL 缓存的入口：条件检查是热路径，若每次读图名 + 调 GetCharacter 会卡。
  * 入队状态会变，所以 TTL 3 秒，不能永久缓存。 */
 static int keep_original_for(void* condNode) {
@@ -1767,14 +1777,14 @@ static void us_cache(int uid, void* inst) {
     if (g_us_n < US_SLOTS) { g_us_uid[g_us_n] = uid; g_us_inst[g_us_n] = inst; ++g_us_n; }
 }
 
-static void unstranger_apply_uid(int pid);   /* 定义在下面 */
+static void unstranger_apply_uid(int pid, int force);   /* 定义在下面 */
 
 static void unstranger_relaxed(void* condNode) {
     if (!F_STORY || (uintptr_t)condNode < 0x10000) return;
     int pid = *(int*)((char*)condNode + OFF_PARTNER_ID);
     int neg = (int)*(unsigned char*)((char*)condNode + OFF_PARTNER_NEGATE);
     if (pid <= 0 || neg) return;                  /* 只处理「要求某人在队」那一侧 */
-    unstranger_apply_uid(pid);
+    unstranger_apply_uid(pid, 0);
 }
 
 /* v142（B）：剧情真正开始播放时，按「本图被放宽过的 uid」再补一次。
@@ -1793,16 +1803,16 @@ static void unstranger_on_play(void* graph) {
         for (int k = 0; k < n; ++k) if (list[k] == g_rn[i].uid) { dup = 1; break; }
         if (!dup) list[n++] = g_rn[i].uid;
     }
-    for (int i = 0; i < n; ++i) unstranger_apply_uid(list[i]);
+    for (int i = 0; i < n; ++i) unstranger_apply_uid(list[i], 1);
 }
 
-static void unstranger_apply_uid(int pid) {
+static void unstranger_apply_uid(int pid, int force) {
     void* m = char_mgr();
     if ((uintptr_t)m < 0x10000) return;
     typedef void* (*fn_getchar)(void*, int);
     void* c = ((fn_getchar)(g_base + RVA_GET_CHARACTER))(m, pid);
     if ((uintptr_t)c < 0x10000) return;
-    if (us_cached(pid) == c) return;              /* 这个实例已经判定过 */
+    if (!force && us_cached(pid) == c) return;    /* 缓存命中：除非 force（播放时强制重判） */
 
     /* v91 式校验：地址可能被销毁/复用，先验类名与模板 uid 再动字段 */
     if (!obj_is_class(c, "GameCharacterInstance") ||
@@ -1868,6 +1878,26 @@ static void unstranger_apply_uid(int pid) {
         str_to_buf(*(void**)((char*)c + OFF_GCI_GIVENNAME), nb, sizeof(nb));
         LOGI("[name] 放宽在队条件 uid=%d 陌生名 \"%s\" → 写入真名 \"%s%s\"", pid, gb, sb, nb);
     }
+}
+
+/* ---- v143：读档完成 → 重置「每图只放宽一次」与全部姓名缓存 ----
+ * GameCharacterManager.OnLoadFinished(object[])  RVA 0x2267FF8
+ * （dump 里同类的 Clear(object[]) 是 0x2267FE4，紧邻，确认没认错类）。
+ * 只有一个 object[] 参数，转调原样透传，不会出现 v116「丢参把垃圾指针传进游戏」那类问题。
+ *
+ * 为什么必须挂这里：读手动存档后，`g_ro_name`（放宽一次性环形表）还留着上一局的图名，
+ * 于是第二次触发同一段剧情时日志只有 `[relax] 图 X 已放宽过一次 -> 本次走原版`，
+ * mark_relaxed / unstranger_relaxed 一次都不被调用 → 陌生名没机会被改写。
+ * 实测日志（2026-11-03，用户复现）已证实这一条。 */
+#define RVA_GCM_ONLOADFINISHED 0x2267FF8
+static void (*orig_onloadfinished)(void* self, void* paras) = nullptr;
+static int g_load_log = 0;
+
+static void hook_onloadfinished(void* self, void* paras) {
+    if (orig_onloadfinished) orig_onloadfinished(self, paras);
+    relax_once_reset();      /* 放宽一次性状态：读档 = 玩家主动重置 */
+    char_mgr_reset();        /* 内含 clear_relax_name_state()（g_rn 槽位）+ unstranger_reset() */
+    if (g_load_log++ < 10) LOGI("[name] 读档完成 → 重置放宽一次性状态与姓名缓存");
 }
 
 static bool hook_check_joined(void* self, int io, void* line) {
@@ -2729,6 +2759,12 @@ static void install_tweaks() {
     if (hook_install("剧情.伙伴离队容错", (void*)(g_base + RVA_CHANGE_PARTNER),
                      (void*)hook_change_partner, (void**)&orig_change_partner)) {
         LOGI("剧情: 伙伴离队容错 已挂 @ 0x%X", RVA_CHANGE_PARTNER);
+    }
+
+    /* v143：读档完成 → 重置放宽一次性状态与姓名缓存 */
+    if (hook_install("名字.读档完成", (void*)(g_base + RVA_GCM_ONLOADFINISHED),
+                     (void*)hook_onloadfinished, (void**)&orig_onloadfinished)) {
+        LOGI("名字: 读档完成 已挂 @ 0x%X", RVA_GCM_ONLOADFINISHED);
     }
 
     /* v51 诊断：进场区域条件的实际判定值 */

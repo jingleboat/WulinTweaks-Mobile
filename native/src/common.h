@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v142"         /* v142：陌生名不在"非@"时缓存 + 剧情播放时按本图名单补一次 */
+#define MOD_VER "v143"         /* v143：读档完成重置「每图只放宽一次」与姓名缓存；播放时强制重判 */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
