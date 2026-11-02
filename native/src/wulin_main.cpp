@@ -2507,7 +2507,11 @@ static void gate_trace(void* self, int forced, int result) {
     char gb[96]; gb[0] = 0;
     void* g = *(void**)((char*)self + OFF_NODE_GRAPH);
     const char* gn = ((uintptr_t)g > 0x10000) ? obj_name(g, gb, sizeof(gb)) : "?";
-    LOGI("[gate] 图=%s 门=%p forced=%s → %s", gn, self, forced ? "Y" : "N", result ? "通过" : "不通过");
+    int in_team = -1;
+    int pid = flatten_gate_pid(self, &in_team);
+    LOGI("[gate] 图=%s 门=%p pid=%d 侧=%s forced=%s → %s", gn, self, pid,
+         pid <= 0 ? "?" : (in_team ? "在队" : "不在队"),
+         forced ? "Y" : "N", result ? "通过" : "不通过");
 }
 
 static bool hook_hold_check(void* self) {

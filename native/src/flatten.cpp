@@ -399,6 +399,35 @@ static int is_story_idx(int i) {
     return (uintptr_t)sk > 0x10000;
 }
 
+/* v157：允许参与展平的条件类（"和角色在队/在场相关"的那几类）。
+ * 需要NPC情缘**未加入**：R10049-2 里它的下游是 R10049-2_6_6（定海棠出演），
+ * 绛紫烟本人出演的 _6_7 由「需要伙伴」控制，按用户规则不加。 */
+static int is_story_cond(const char* cn) {
+    if (!cn || !cn[0]) return 0;
+    return strcmp(cn, "HavePartnerCondition") == 0        /* 需要伙伴（当前在队） */
+        || strcmp(cn, "NpcAtMapCondition") == 0           /* 判断地图存在NPC */
+        || strcmp(cn, "CheckNpcAtFiefCondition") == 0;    /* 需要NPC处于家园中 */
+}
+
+/* v157：门 → (pid, 侧别)，供 [gate] 轨迹日志打印 */
+#define FLAT_GATE_INFO 256
+typedef struct { void* gate; int pid; int in_team; } FLAT_GATE_INFO_T;
+static FLAT_GATE_INFO_T g_ginfo[FLAT_GATE_INFO];
+static int g_ginfo_n = 0;
+static void gate_info_add(void* gate, int pid, int in_team) {
+    if ((uintptr_t)gate < 0x10000 || g_ginfo_n >= FLAT_GATE_INFO) return;
+    for (int i = 0; i < g_ginfo_n; ++i) if (g_ginfo[i].gate == gate) return;
+    g_ginfo[g_ginfo_n].gate = gate;
+    g_ginfo[g_ginfo_n].pid = pid;
+    g_ginfo[g_ginfo_n].in_team = in_team;
+    g_ginfo_n++;
+}
+int flatten_gate_pid(void* gate, int* in_team) {
+    for (int i = 0; i < g_ginfo_n; ++i)
+        if (g_ginfo[i].gate == gate) { if (in_team) *in_team = g_ginfo[i].in_team; return g_ginfo[i].pid; }
+    return 0;
+}
+
 /* v155：这一侧是否**含有**播放剧情节点（不再要求「单节点直连」）。
  * 用于区分 A/B 类，并决定 X 类是否放开：以前「两侧出口都不是单节点剧情」一律放弃，
  * 于是「门→设置标记→播放剧情」这种形状（X 类）永远拿不到在队内容。 */
@@ -566,8 +595,8 @@ static void flatten_try_inner(void* any_node) {
          * → 存活与死亡剧情同时播，语义矛盾（实测 R10049-2 的 10063）。
          * SlgHavePartnerCondition 属 DLC 小游戏，不参与。 */
         char cn1[64], cn2[64];
-        if (strcmp(cls_name(ca, cn1, sizeof(cn1)), "HavePartnerCondition") != 0) continue;
-        if (strcmp(cls_name(cb, cn2, sizeof(cn2)), "HavePartnerCondition") != 0) continue;
+        if (!is_story_cond(cls_name(ca, cn1, sizeof(cn1)))) continue;
+        if (!is_story_cond(cls_name(cb, cn2, sizeof(cn2)))) continue;
 
         int pa = *(int*)((char*)ca + OFF_HP_PARTNER_ID);
         int pb = *(int*)((char*)cb + OFF_HP_PARTNER_ID);
@@ -687,6 +716,8 @@ static void flatten_try_inner(void* any_node) {
         flat_add_cond(g_cond[p->g1]);
         flat_add_gate(g_nd[p->g0]);
         flat_add_gate(g_nd[p->g1]);
+        gate_info_add(g_nd[p->g0], p->pid, 1);
+        gate_info_add(g_nd[p->g1], p->pid, 0);
 
         expanded++;
         if (g_log_pair < 300) {
