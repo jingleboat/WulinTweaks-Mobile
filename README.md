@@ -106,6 +106,7 @@ $env:JAVA_HOME="<jdk>"
 只列功能节点，中间的调试版本见 git 历史。
 
 | 版本 | 内容 |
+| **v147** | **删除姓名回落机制**：`real_name_of` 只保留最直接的一级来源 —— 模板 `surName`+`givenName`（去前导 `@`）；不再回落 `get_RealFullName`（实测对「只有姓没有名」的角色只返回姓，对 20204 返回「大梁城·知府」）、不再回落 `uName`、不再回落 `nameAsStranger`。另：`unstranger` 只清 `m_givenName` 的 `@`，`m_surName` 的 `@` 判断删除（4 份存档核对：surName 带 `@` 的 0 条） |
 |---|---|
 | **v146** | **简化**：放宽在队条件触发时，对该 `partnerID` 的实例**只做一件事 —— 清空 `m_givenName` 里 `@` 及其后面的全部内容**（`m_surName` 仅在它本身也以 `@` 开头时才清）。不再查模板、不再写模板真名、不再判断"模板有没有真名"。清完之后显示成什么交给游戏自己的回落 + `real_name_of` 取值链 |
 | **v145** | 修 v144「进游戏闪退」：**撤掉 v143 新挂的 `GameCharacterManager.OnLoadFinished`（0x2267FF8）内联钩子**。tombstone 显示 faulting `pc = libil2cpp+0x4F21BB0`（落在 `.got` 之后的数据段 = 跳进数据地址），帧 `#01 0x226A03C` 仍在同一函数体内 → 该位置不适合做 16 字节内联补丁。改用**既有信号**：`ensure_save()` 检测到「存档集合换档」时（日志每份读档都有 `地图: 存档集合换档 enable=0x…`）顺带 `relax_once_reset()`。另外把 `real_name_of` 改回**零分配**（v144 曾在 `get_FullName` 热路径上 `snprintf + il2cpp_string_new`） |

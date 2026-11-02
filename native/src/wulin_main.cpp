@@ -1168,63 +1168,36 @@ static void obj_class_name(void* obj, char* buf, int cap) {
 }
 #endif
 
-/* 名字字符串是否"可用作真名"：非空、且不以 '@' 开头（'@' 开头是陌生名） */
-static int name_usable(void* s) {
-    if (!il2str_len_ok(s)) return 0;
-    int L = *(int*)((char*)s + OFF_IL2STR_LEN);
-    if (L <= 0) return 0;
-    const unsigned short* p = (const unsigned short*)((char*)s + OFF_IL2STR_CHARS);
-    return p[0] != 0x40;
-}
+/* v147：name_usable 随「分层回落」一起删除（现在只用模板 sur/giv，不再逐级挑实例字段） */
 
-/* 取「熟悉后姓名」的分层兜底，全部基于传入的角色实例 self（不查管理器、不依赖缓存）。
+/* v147（用户指定）：**删除全部回落机制**，只留最直接的一级来源 ——
+ * 模板 `surName` + `givenName`（去前导 '@'）。
+ *   · 不再回落到 get_RealFullName（它会把「称号·姓名」或光秃秃的「姓」当结果返回）；
+ *   · 不再回落到 uName（「无名小村铁匠」「大梁城知府」这类内部名）；
+ *   · 不再回落到 nameAsStranger。
+ * 模板两侧都没名字 → 返回 nullptr，由调用方决定怎么办（getter 就直接用游戏原值）。
  *
- * v144/v145（用户 2026-11-03 指定）：**只有 surName 与 givenName 都为空时才允许退化到 uName。**
- *   ① get_RealFullName —— 游戏自己按「姓+名」拼好，两个都有值时最准（零分配）
- *   ② 实例 m_surName   → ③ 实例 m_givenName        （跳过 '@' 陌生名）
- *   ④ 模板 surName     → ⑤ 模板 givenName          ★ 只要有一侧非空就用
- *   ⑥ 模板 uName       —— 仅当 ④⑤ 都为空            ★ 才退化
- *   ⑦ 模板 nameAsStranger —— 最后兜底
- *
- * 例子（20204）：模板 uName='大梁城知府' / surName='知府' / givenName=null
- *   → ① 拿不到 → ② 实例为空 → ④ 命中「知府」；不会再到「大梁城知府」。
- *
- * ⚠️ 这里**不做任何字符串拼接/分配**：本函数挂在 get_FullName 这种每帧几十上百次的热路径上，
- *    v144 曾在里面 snprintf + il2cpp_string_new，已改回"直接返回现成的字符串对象"。
- *    需要"姓+名"合并的场景由 ① 的 get_RealFullName 负责。 */
+ * 只在「剧情播放窗口内、且该 uid 属于当前图」时才会被调用（见 story_real_name），
+ * 不是每帧全量，所以这里做一次拼接分配是可以接受的。 */
 static void* real_name_of(void* self, const char** how) {
     if ((uintptr_t)self < 0x10000) { if (how) *how = "无实例"; return nullptr; }
 
-    /* ① 游戏自己的真名（姓+名拼装） */
-    if (orig_realfullname && !g_rn_busy) {
-        g_rn_busy = 1;
-        void* real = orig_realfullname(self);
-        g_rn_busy = 0;
-        if (!str_empty(real)) { if (how) *how = "RealFullName"; return real; }
-    }
+    void* tpl = *(void**)((char*)self + OFF_GCI_TEMPLATE);
+    if ((uintptr_t)tpl < 0x10000) { if (how) *how = "无模板"; return nullptr; }
 
-    void* isur = *(void**)((char*)self + OFF_GCI_SURNAME);
-    void* igiv = *(void**)((char*)self + OFF_GCI_GIVENNAME);
-    void* tpl  = *(void**)((char*)self + OFF_GCI_TEMPLATE);
-    void* psur = ((uintptr_t)tpl > 0x10000) ? *(void**)((char*)tpl + OFF_CPD_SURNAME)   : nullptr;
-    void* pgiv = ((uintptr_t)tpl > 0x10000) ? *(void**)((char*)tpl + OFF_CPD_GIVENNAME) : nullptr;
+    char sb[96] = {0}, gb[96] = {0};
+    str_to_buf(*(void**)((char*)tpl + OFF_CPD_SURNAME),   sb, sizeof(sb));
+    str_to_buf(*(void**)((char*)tpl + OFF_CPD_GIVENNAME), gb, sizeof(gb));
+    if (sb[0] == '@') memmove(sb, sb + 1, strlen(sb));
+    if (gb[0] == '@') memmove(gb, gb + 1, strlen(gb));
+    if (!sb[0] && !gb[0]) { if (how) *how = "模板无姓无名"; return nullptr; }
 
-    if (name_usable(isur)) { if (how) *how = "实例姓";   return isur; }
-    if (name_usable(igiv)) { if (how) *how = "实例名";   return igiv; }
-    if (name_usable(psur)) { if (how) *how = "模板姓";   return psur; }
-    if (name_usable(pgiv)) { if (how) *how = "模板名";   return pgiv; }
-
-    if ((uintptr_t)tpl > 0x10000) {
-        /* ⑥ 只有 姓/名 两侧都为空，才退到 uName */
-        void* nm = *(void**)((char*)tpl + OFF_CPD_NAME);
-        if (!str_empty(nm)) { if (how) *how = "模板uName(姓/名皆空)"; return nm; }
-        /* ⑦ 陌生名兜底 */
-        void* s = *(void**)((char*)tpl + OFF_CPD_NAME_STRANGER);
-        if (!str_empty(s)) { if (how) *how = "回退陌生名"; return s; }
-    }
-
-    if (how) *how = "模板为空";
-    return nullptr;
+    static __thread char full[200];
+    snprintf(full, sizeof(full), "%s%s", sb, gb);
+    void* r = A_string_new ? A_string_new(full) : nullptr;
+    if ((uintptr_t)r < 0x10000) { if (how) *how = "分配失败"; return nullptr; }
+    if (how) *how = "模板sur+giv";
+    return r;
 }
 
 /* 刷新第 i 个槽位缓存的陌生名/真名（供 swap_if_stranger 的字符串比对用）
@@ -1865,29 +1838,17 @@ static void unstranger_apply_uid(int pid, int force) {
     }
     if (!stranger) return;                        /* v142：不缓存"非@"——@ 可能在初始化稍后才写上来 */
 
-    /* v146（用户指定）：**只做一件事 —— 清空 '@' 及其后面的全部内容。**
-     * 不再查模板、不再写真名、不再判断"模板有没有真名"。
-     *     m_givenName : "@一本正经的道人" → ""
-     *     m_surName   : 只有当它本身也以 '@' 开头时才清（正常情况它是空串，不动它）
-     * 清完之后显示成什么，交给游戏自己的取名回落 + 本 mod 的 real_name_of 取值链，
-     * 这里不再干预。 */
-
-    /* v90 教训：先把旧文本拷出来，**再**改字段（字段一覆盖，旧串没人引用，GC 回收后再读就是 UAF） */
+    /* v147：只清 m_givenName。
+     * 用户核对过 4 份存档（手机 Save2/Save4 + PC Save2/Save4）：
+     *   surName 以 '@' 开头 = 0 条；givenName 以 '@' 开头 = 96~103 条
+     * → 「m_surName 也以 '@' 开头」这个判断从来不会命中，直接删掉，少一条分支。 */
     char gb[96] = {0};
-    str_to_buf(g0, gb, sizeof(gb));
+    str_to_buf(g0, gb, sizeof(gb));   /* v90：先拷旧文本，再改字段（防 UAF） */
 
     void* empty = A_string_new ? A_string_new("") : nullptr;
     if ((uintptr_t)empty < 0x10000) return;
 
     *(void**)((char*)c + OFF_GCI_GIVENNAME) = empty;
-
-    void* s0 = *(void**)((char*)c + OFF_GCI_SURNAME);
-    if (il2str_len_ok(s0)) {
-        int LS = *(int*)((char*)s0 + OFF_IL2STR_LEN);
-        const unsigned short* qs = (const unsigned short*)((char*)s0 + OFF_IL2STR_CHARS);
-        if (LS > 0 && qs[0] == 0x40) *(void**)((char*)c + OFF_GCI_SURNAME) = empty;
-    }
-
     us_cache(pid, c);
 
     if (g_us_log++ < 40)
