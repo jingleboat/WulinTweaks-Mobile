@@ -482,8 +482,8 @@ static int flat_region(int k) {
         }
     }
 
-    if (p->g0 >= 0 && p->g0 < g_nnodes) out[p->g0] = 0;
-    if (p->g1 >= 0 && p->g1 < g_nnodes) out[p->g1] = 0;
+    if (p->f >= 0 && p->f < g_nnodes) out[p->f] = 0;
+    if (p->s >= 0 && p->s < g_nnodes) out[p->s] = 0;
 
     int n = 0;
     for (int i = 0; i < g_nnodes; ++i) if (out[i] == 1) n++;
@@ -624,6 +624,10 @@ static void flatten_try_inner(void* any_node) {
 
         FLAT_PAIR* p = &g_pair[g_npairs++];
         p->g0 = g0; p->g1 = g1; p->pid = pa;
+        /* v159：v156 只加了字段和日志，**赋值丢了** → region 起点恒为 0，全部判空（展开 0）。
+         * a、b 就是父端口的连接顺序：a 先被引擎问。 */
+        p->f = a; p->s = b;
+        p->first_is_g0 = (a == g0) ? 1 : 0;
         p->both_story = (s0 && s1);
         p->reg_n = 0; p->ex_start = 0; p->ex_n = 0;
     }
@@ -703,7 +707,7 @@ static void flatten_try_inner(void* any_node) {
             int ei = g_exit[p->ex_start + e];
             FLAT_EDGE* ed = &g_edge[ei];
             if (g_undo_n >= FLAT_MAX_UNDO) { commit_fail = 1; break; }
-            if (!port_set_conn_node(ed->port, ed->slot, g_nd[p->g1])) { commit_fail = 1; break; }
+            if (!port_set_conn_node(ed->port, ed->slot, g_nd[p->s])) { commit_fail = 1; break; }
             g_undo[g_undo_n].ei = ei;
             g_undo[g_undo_n].old_tgt = ed->tgt;
             g_undo[g_undo_n].g1 = p->s;
