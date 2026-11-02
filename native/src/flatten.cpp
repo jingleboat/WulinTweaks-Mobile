@@ -413,13 +413,22 @@ static int is_story_cond(const char* cn) {
 }
 
 /* v157：门 → (pid, 侧别)，供 [gate] 轨迹日志打印 */
-#define FLAT_GATE_INFO 256
+#define FLAT_GATE_INFO 4096   /* v161：256 → 4096（一晚上几十张图 × 每图几十道门，256 早就满了，导致 pid/类名全空） */
 typedef struct { void* gate; int pid; int in_team; char cls[40]; } FLAT_GATE_INFO_T;
 static FLAT_GATE_INFO_T g_ginfo[FLAT_GATE_INFO];
 static int g_ginfo_n = 0;
 static void gate_info_add_cls(void* gate, int pid, int in_team, const char* cls) {
-    if ((uintptr_t)gate < 0x10000 || g_ginfo_n >= FLAT_GATE_INFO) return;
-    for (int i = 0; i < g_ginfo_n; ++i) if (g_ginfo[i].gate == gate) return;
+    if ((uintptr_t)gate < 0x10000) return;
+    for (int i = 0; i < g_ginfo_n; ++i)
+        if (g_ginfo[i].gate == gate) {
+            /* 已存在：允许用更完整的信息补全（先登记的是 pid=0/无类名） */
+            if (pid > 0) g_ginfo[i].pid = pid;
+            g_ginfo[i].in_team = in_team;
+            if (cls && cls[0] && !g_ginfo[i].cls[0])
+                snprintf(g_ginfo[i].cls, sizeof(g_ginfo[0].cls), "%s", cls);
+            return;
+        }
+    if (g_ginfo_n >= FLAT_GATE_INFO) return;
     g_ginfo[g_ginfo_n].gate = gate;
     g_ginfo[g_ginfo_n].pid = pid;
     g_ginfo[g_ginfo_n].in_team = in_team;
@@ -746,8 +755,11 @@ static void flatten_try_inner(void* any_node) {
         flat_add_cond(g_cond[p->s]);
         flat_add_gate(g_nd[p->f]);
         flat_add_gate(g_nd[p->s]);
-        gate_info_add(g_nd[p->g0], p->pid, 1);    /* 侧别仅用于日志：Negate=0 = 在队 */
-        gate_info_add(g_nd[p->g1], p->pid, 0);
+        /* v161：强制表登记的是 f/s，日志查询的也是 f/s —— 这里必须按 f/s 登记，
+         * 否则 forced=Y 的门查不到 pid（v160 的 pid=0 就是这么来的）。
+         * 侧别仍按 Negate 语义标注（Negate=0 = 在队侧）。 */
+        gate_info_add(g_nd[p->f], p->pid, (p->f == p->g0) ? 1 : 0);
+        gate_info_add(g_nd[p->s], p->pid, (p->s == p->g0) ? 1 : 0);
 
         expanded++;
         if (g_log_pair < 300) {

@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v160"         /* v160：放宽改为每(图,pid)一次；[gate] 登记所有带条件的门（只登记不接管）+ 类名 */
+#define MOD_VER "v161"         /* v161：门信息表 256→4096 + 按 f/s 登记（v160 的 pid/类名全空） */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
