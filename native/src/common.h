@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v154"         /* v154：可达性守恒改为按对比较（v153 用并集，误回滚了大量图） */
+#define MOD_VER "v155"         /* v155：配对白名单(只认HavePartnerCondition) + 修名单":"解析 + X类按region含剧情 + 门轨迹日志 */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */

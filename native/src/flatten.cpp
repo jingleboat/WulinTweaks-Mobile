@@ -396,6 +396,18 @@ static int is_story_idx(int i) {
     return (uintptr_t)sk > 0x10000;
 }
 
+/* v155：这一侧是否**含有**播放剧情节点（不再要求「单节点直连」）。
+ * 用于区分 A/B 类，并决定 X 类是否放开：以前「两侧出口都不是单节点剧情」一律放弃，
+ * 于是「门→设置标记→播放剧情」这种形状（X 类）永远拿不到在队内容。 */
+static unsigned char g_story_reach[FLAT_MAX_NODES];
+static int side_has_story(int gateIdx) {
+    if (gateIdx < 0 || gateIdx >= g_nnodes) return 0;
+    flat_mark_reach(gateIdx, g_story_reach);
+    for (int i = 0; i < g_nnodes; ++i)
+        if (g_story_reach[i] && is_story_idx(i)) return 1;
+    return 0;
+}
+
 /* 这一侧是不是「单个播放剧情节点」——用来区分 A 类 / B 类 */
 static int story_exit(int gateIdx) {
     if (gateIdx < 0 || gateIdx >= g_nnodes) return 0;
@@ -469,7 +481,11 @@ static int flatten_skip(const char* gn) {
     for (size_t i = 0; i < sizeof(k_flatten_skip) / sizeof(k_flatten_skip[0]); ++i) {
         const char* p = k_flatten_skip[i];
         const char* colon = strchr(p, ':');
-        size_t n = colon ? (size_t)(colon - p) : strlen(p);
+        /* v155：带 ':' 的是**门对级**名单，只由 flatten_skip_pair 处理。
+         * 以前这里把它截成 ':' 前的图名当整图匹配 → `Fame-10:10049` 会把整张
+         * 1294 节点的 Fame-10 全跳过（PC 只跳一对），两端行为不一致。 */
+        if (colon) continue;
+        size_t n = strlen(p);
         if (n == 0) continue;
         if (p[n - 1] == '*') {
             if (n > 1 && strncmp(gn, p, n - 1) == 0) return 1;
@@ -541,6 +557,15 @@ static void flatten_try_inner(void* any_node) {
         void* cb = g_cond[b];
         if ((uintptr_t)ca < 0x10000 || (uintptr_t)cb < 0x10000) continue;
 
+        /* v155：**白名单**——只认「当前在队」这一类条件（HavePartnerCondition）。
+         * 以前只看 partnerID+Negate，于是「石万三存活 / 石万三死亡」(NpcDeadCondition)、
+         * 关系值、位置等同样带 partnerID 的条件也被当成在队门对，展平后两侧都强制放行
+         * → 存活与死亡剧情同时播，语义矛盾（实测 R10049-2 的 10063）。
+         * SlgHavePartnerCondition 属 DLC 小游戏，不参与。 */
+        char cn1[64], cn2[64];
+        if (strcmp(cls_name(ca, cn1, sizeof(cn1)), "HavePartnerCondition") != 0) continue;
+        if (strcmp(cls_name(cb, cn2, sizeof(cn2)), "HavePartnerCondition") != 0) continue;
+
         int pa = *(int*)((char*)ca + OFF_HP_PARTNER_ID);
         int pb = *(int*)((char*)cb + OFF_HP_PARTNER_ID);
         if (pa <= 0 || pa != pb) continue;             /* partnerID<=0 不是「需要伙伴」 */
@@ -555,8 +580,8 @@ static void flatten_try_inner(void* any_node) {
         int g0 = na ? b : a;                           /* Negate=0 = 在队侧 */
         int g1 = na ? a : b;
 
-        int s0 = story_exit(g0), s1 = story_exit(g1);
-        if (!s0 && !s1) continue;                      /* X 类不动 */
+        int s0 = side_has_story(g0), s1 = side_has_story(g1);
+        if (!s0 && !s1) continue;      /* v155：两侧 region 都没有剧情 → 仍不动 */
 
         int dup = 0;
         for (int k = 0; k < g_npairs; ++k)

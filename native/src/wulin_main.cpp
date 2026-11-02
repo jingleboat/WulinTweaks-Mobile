@@ -1868,20 +1868,10 @@ static void unstranger_apply_uid(int pid, int force) {
 
 static bool hook_check_joined(void* self, int io, void* line) {
     g_team_cond_hits++;
-    flatten_try(self);                      /* v65：顺手把「分支展开」补丁套到这张图上（只做一次） */
-    /* v70：被「分支展开」接管的条件恒真。用基类实现 = 丢掉这一个条件，
-     * 但 partnerID/Negate 原值仍在，下面 mark_relaxed 才能继续为「姓名替换」开窗口。 */
-    if (flatten_cond_always_true(self)) {
-        mark_relaxed(self);
-        unstranger_relaxed(self);           /* v138：这条在队条件被跳过 → 清该角色的陌生名 */
-        if (base_check_all) return base_check_all(self, io, line);
-        return true;
-    }
-    if (F_STORY && base_check_all && !keep_original_for(self)) {
-        mark_relaxed(self);                 /* v61：记下"这次放宽放过了谁"，用于显示真名 */
-        unstranger_relaxed(self);           /* v138：同上 */
-        return base_check_all(self, io, line);
-    }
+    flatten_try(self);
+    /* v155（用户指定）：IsJoinedTeamCondition 的语义是「曾经加入过队伍」，不是「当前在队」。
+     * 它**不作为被放宽的条件**（放宽它 = 允许“从未加入”也触发本命事件）；
+     * 但仍按原版判定 —— 本命事件的这道门槛必须完整保留。 */
     return orig_check_joined ? orig_check_joined(self, io, line) : false;
 }
 
@@ -2496,9 +2486,35 @@ static bool hold_check_core(void* self) {
  * 优先级：**高于**上面「Hold 只放行一次」的压制。PC 端两个 Postfix 的生效顺序也是
  * Patch_FlattenGate 盖住 HoldOnceGuard（注册顺序决定），这里用「先核心、后强制」显式对齐。
  * 另外 flatten_gate_forced 故意不看 F_FLAT —— 线已改指，门必须继续放行，否则卡死。 */
+/* v155：门的执行轨迹（纯观测）。只在「状态变化」时打一行，避免热路径刷屏。 */
+typedef struct { void* gate; int last; } GATE_TRACE;
+static GATE_TRACE g_gtrace[128];
+static int g_gtrace_n = 0, g_gtrace_log = 0;
+
+static void gate_trace(void* self, int forced, int result) {
+    if ((uintptr_t)self < 0x10000 || g_gtrace_log >= 400) return;
+    int last = -1, slot = -1;
+    for (int i = 0; i < g_gtrace_n; ++i)
+        if (g_gtrace[i].gate == self) { last = g_gtrace[i].last; slot = i; break; }
+    if (last == result) return;                 /* 状态没变，不重复打 */
+    if (slot < 0) {
+        if (g_gtrace_n >= 128) return;
+        slot = g_gtrace_n++;
+        g_gtrace[slot].gate = self;
+    }
+    g_gtrace[slot].last = result;
+    g_gtrace_log++;
+    char gb[96]; gb[0] = 0;
+    void* g = *(void**)((char*)self + OFF_NODE_GRAPH);
+    const char* gn = ((uintptr_t)g > 0x10000) ? obj_name(g, gb, sizeof(gb)) : "?";
+    LOGI("[gate] 图=%s 门=%p forced=%s → %s", gn, self, forced ? "Y" : "N", result ? "通过" : "不通过");
+}
+
 static bool hook_hold_check(void* self) {
     bool r = hold_check_core(self);
-    if (!r && flatten_gate_forced(self)) return true;
+    int forced = flatten_gate_forced(self);
+    if (!r && forced) r = true;
+    gate_trace(self, forced, r ? 1 : 0);
     return r;
 }
 
