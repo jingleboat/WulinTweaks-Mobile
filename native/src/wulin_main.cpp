@@ -221,6 +221,7 @@ static void resolve_save() {
  * 解引用 Unity 对象）会直接崩。上面几个入口都是主线程的 UI 方法，安全。 */
 static uint64_t rule_now_ms(void);          /* 定义在剧情缓存那一节 */
 static void char_mgr_reset(void);           /* 定义在「从未入队」那一节：换档后清角色管理器缓存 */
+static void relax_once_reset(void);         /* v145：清「每图只放宽一次」（定义在放宽规则那一节） */
 
 static int save_sets_ready(void) {
     return ((uintptr_t)g_set_enable > 0x10000) || ((uintptr_t)g_set_vis > 0x10000);
@@ -252,6 +253,7 @@ static int ensure_save(int force) {
              g_last_enable ? "换档" : "已就绪", g_set_enable, g_set_vis, g_set_allow, g_set_deny);
         g_last_enable = g_set_enable;
         char_mgr_reset();       /* 换档后 GameCharacterManager 可能换实例，别用旧指针 */
+        relax_once_reset();     /* v145：读档 = 玩家主动重置，「每图只放宽一次」一并清掉 */
     }
     return ready;
 }
@@ -769,11 +771,14 @@ static int relax_once(const char* gn) {
     return 1;
 }
 
-/* v143：读档完成时把「每图只放宽一次」的状态清掉。
- * 实测（用户 2026-11-03 复现 + 日志）：读手动存档后再触发同一段剧情，日志里只有
- *   [relax] 图 R10049-2 已放宽过一次 -> 本次走原版
- * 也就是说放宽根本没发生 → mark_relaxed / unstranger_relaxed 一次都没被调 →
- * 陌生名自然没人去改。读档是玩家主动重置，这个一次性状态必须跟着重置。 */
+/* v145：读档完成时把「每图只放宽一次」的状态清掉。
+ * 调用点放在 ensure_save() 检测到「存档集合换档」的分支里（那里本来就在调 char_mgr_reset()，
+ * 实测日志 `地图: 存档集合换档 enable=0x...` 在每次读档都会出现）。
+ *
+ * ⚠️ v143 曾经为此新挂 GameCharacterManager.OnLoadFinished(0x2267FF8)，v144 进游戏即闪退：
+ *    tombstone 里 pc=libil2cpp+0x4F21BB0 —— 落在 .got 之后的**数据段**，即跳进了数据地址；
+ *    该地址属于 OnLoadFinished 自身（帧 #01 = 0x226A03C 在同一函数体内）→ 说明那个位置
+ *    不适合做 16 字节内联补丁（跳板重定位踩到 PC 相对指令）。该钩子已撤掉，改走既有信号。 */
 static void relax_once_reset(void) {
     memset(g_ro_name, 0, sizeof(g_ro_name));
     g_ro_i = 0;
@@ -1163,75 +1168,59 @@ static void obj_class_name(void* obj, char* buf, int cap) {
 }
 #endif
 
+/* 名字字符串是否"可用作真名"：非空、且不以 '@' 开头（'@' 开头是陌生名） */
+static int name_usable(void* s) {
+    if (!il2str_len_ok(s)) return 0;
+    int L = *(int*)((char*)s + OFF_IL2STR_LEN);
+    if (L <= 0) return 0;
+    const unsigned short* p = (const unsigned short*)((char*)s + OFF_IL2STR_CHARS);
+    return p[0] != 0x40;
+}
+
 /* 取「熟悉后姓名」的分层兜底，全部基于传入的角色实例 self（不查管理器、不依赖缓存）。
  *
- * v144（用户 2026-11-03 指定）：**只有 surName 与 givenName 都为空时才允许退化到 uName。**
- *   ① 实例 m_surName / m_givenName —— 只要有一侧非空就拼起来用
- *      例外：m_givenName 以 '@' 开头 = 陌生名 → 忽略实例，往下走
- *   ② 模板 surName + givenName     —— 只要有一侧非空就用（**不再提前退 uName**）
- *   ③ 模板 uName                   —— 仅当 ② 两侧都为空
- *   ④ 模板 nameAsStranger          —— 最后兜底（宁可显示陌生名也不要空）
- *   ⑤ 游戏自己的 get_RealFullName  —— 前面全空时兜底（自定义名字/称号场景靠它）
+ * v144/v145（用户 2026-11-03 指定）：**只有 surName 与 givenName 都为空时才允许退化到 uName。**
+ *   ① get_RealFullName —— 游戏自己按「姓+名」拼好，两个都有值时最准（零分配）
+ *   ② 实例 m_surName   → ③ 实例 m_givenName        （跳过 '@' 陌生名）
+ *   ④ 模板 surName     → ⑤ 模板 givenName          ★ 只要有一侧非空就用
+ *   ⑥ 模板 uName       —— 仅当 ④⑤ 都为空            ★ 才退化
+ *   ⑦ 模板 nameAsStranger —— 最后兜底
  *
  * 例子（20204）：模板 uName='大梁城知府' / surName='知府' / givenName=null
- *   → ② 命中，返回「知府」；不会再到「大梁城知府」。
- * 旧实现（v143 及以前）是 ① RealFullName → ② uName → ③ 陌生名，压根没试过 sur+giv，
- * 所以这类「只有姓、没有名」的角色会被顶成 uName —— 就是本次反馈的现象。 */
+ *   → ① 拿不到 → ② 实例为空 → ④ 命中「知府」；不会再到「大梁城知府」。
+ *
+ * ⚠️ 这里**不做任何字符串拼接/分配**：本函数挂在 get_FullName 这种每帧几十上百次的热路径上，
+ *    v144 曾在里面 snprintf + il2cpp_string_new，已改回"直接返回现成的字符串对象"。
+ *    需要"姓+名"合并的场景由 ① 的 get_RealFullName 负责。 */
 static void* real_name_of(void* self, const char** how) {
     if ((uintptr_t)self < 0x10000) { if (how) *how = "无实例"; return nullptr; }
 
-    char sb[96] = {0}, gb[96] = {0};
-
-    /* ① 实例自带名字（但 "@…" 是陌生名，不能当真人名用） */
-    void* isur = *(void**)((char*)self + OFF_GCI_SURNAME);
-    void* igiv = *(void**)((char*)self + OFF_GCI_GIVENNAME);
-    int inst_stranger = 0;
-    if (il2str_len_ok(igiv)) {
-        int L = *(int*)((char*)igiv + OFF_IL2STR_LEN);
-        const unsigned short* q = (const unsigned short*)((char*)igiv + OFF_IL2STR_CHARS);
-        if (L > 0 && q[0] == 0x40) inst_stranger = 1;
-    }
-    if (!inst_stranger) {
-        str_to_buf(isur, sb, sizeof(sb));
-        str_to_buf(igiv, gb, sizeof(gb));
-        if (sb[0] || gb[0]) {
-            static __thread char buf1[192];
-            snprintf(buf1, sizeof(buf1), "%s%s", sb, gb);
-            void* r = A_string_new ? A_string_new(buf1) : nullptr;
-            if ((uintptr_t)r > 0x10000) { if (how) *how = "实例姓名"; return r; }
-        }
-    }
-
-    void* tpl = *(void**)((char*)self + OFF_GCI_TEMPLATE);
-    if ((uintptr_t)tpl > 0x10000) {
-        /* ② 模板 姓+名：只要不全为空就用 */
-        sb[0] = gb[0] = 0;
-        str_to_buf(*(void**)((char*)tpl + OFF_CPD_SURNAME),   sb, sizeof(sb));
-        str_to_buf(*(void**)((char*)tpl + OFF_CPD_GIVENNAME), gb, sizeof(gb));
-        if (sb[0] == '@') memmove(sb, sb + 1, strlen(sb));
-        if (gb[0] == '@') memmove(gb, gb + 1, strlen(gb));
-        if (sb[0] || gb[0]) {
-            static __thread char buf2[192];
-            snprintf(buf2, sizeof(buf2), "%s%s", sb, gb);
-            void* r = A_string_new ? A_string_new(buf2) : nullptr;
-            if ((uintptr_t)r > 0x10000) { if (how) *how = "模板sur+giv"; return r; }
-        }
-
-        /* ③ 只有两侧都为空，才退到 uName */
-        void* nm = *(void**)((char*)tpl + OFF_CPD_NAME);
-        if (!str_empty(nm)) { if (how) *how = "模板uName(两侧皆空)"; return nm; }
-
-        /* ④ 陌生名兜底 */
-        void* s = *(void**)((char*)tpl + OFF_CPD_NAME_STRANGER);
-        if (!str_empty(s)) { if (how) *how = "回退陌生名"; return s; }
-    }
-
-    /* ⑤ 游戏自己的 RealFullName（自定义名/称号等场景） */
+    /* ① 游戏自己的真名（姓+名拼装） */
     if (orig_realfullname && !g_rn_busy) {
         g_rn_busy = 1;
         void* real = orig_realfullname(self);
         g_rn_busy = 0;
         if (!str_empty(real)) { if (how) *how = "RealFullName"; return real; }
+    }
+
+    void* isur = *(void**)((char*)self + OFF_GCI_SURNAME);
+    void* igiv = *(void**)((char*)self + OFF_GCI_GIVENNAME);
+    void* tpl  = *(void**)((char*)self + OFF_GCI_TEMPLATE);
+    void* psur = ((uintptr_t)tpl > 0x10000) ? *(void**)((char*)tpl + OFF_CPD_SURNAME)   : nullptr;
+    void* pgiv = ((uintptr_t)tpl > 0x10000) ? *(void**)((char*)tpl + OFF_CPD_GIVENNAME) : nullptr;
+
+    if (name_usable(isur)) { if (how) *how = "实例姓";   return isur; }
+    if (name_usable(igiv)) { if (how) *how = "实例名";   return igiv; }
+    if (name_usable(psur)) { if (how) *how = "模板姓";   return psur; }
+    if (name_usable(pgiv)) { if (how) *how = "模板名";   return pgiv; }
+
+    if ((uintptr_t)tpl > 0x10000) {
+        /* ⑥ 只有 姓/名 两侧都为空，才退到 uName */
+        void* nm = *(void**)((char*)tpl + OFF_CPD_NAME);
+        if (!str_empty(nm)) { if (how) *how = "模板uName(姓/名皆空)"; return nm; }
+        /* ⑦ 陌生名兜底 */
+        void* s = *(void**)((char*)tpl + OFF_CPD_NAME_STRANGER);
+        if (!str_empty(s)) { if (how) *how = "回退陌生名"; return s; }
     }
 
     if (how) *how = "模板为空";
@@ -1927,26 +1916,6 @@ static void unstranger_apply_uid(int pid, int force) {
         str_to_buf(*(void**)((char*)c + OFF_GCI_GIVENNAME), nb, sizeof(nb));
         LOGI("[name] 放宽在队条件 uid=%d 陌生名 \"%s\" → 写入真名 \"%s%s\"", pid, gb, sb, nb);
     }
-}
-
-/* ---- v143：读档完成 → 重置「每图只放宽一次」与全部姓名缓存 ----
- * GameCharacterManager.OnLoadFinished(object[])  RVA 0x2267FF8
- * （dump 里同类的 Clear(object[]) 是 0x2267FE4，紧邻，确认没认错类）。
- * 只有一个 object[] 参数，转调原样透传，不会出现 v116「丢参把垃圾指针传进游戏」那类问题。
- *
- * 为什么必须挂这里：读手动存档后，`g_ro_name`（放宽一次性环形表）还留着上一局的图名，
- * 于是第二次触发同一段剧情时日志只有 `[relax] 图 X 已放宽过一次 -> 本次走原版`，
- * mark_relaxed / unstranger_relaxed 一次都不被调用 → 陌生名没机会被改写。
- * 实测日志（2026-11-03，用户复现）已证实这一条。 */
-#define RVA_GCM_ONLOADFINISHED 0x2267FF8
-static void (*orig_onloadfinished)(void* self, void* paras) = nullptr;
-static int g_load_log = 0;
-
-static void hook_onloadfinished(void* self, void* paras) {
-    if (orig_onloadfinished) orig_onloadfinished(self, paras);
-    relax_once_reset();      /* 放宽一次性状态：读档 = 玩家主动重置 */
-    char_mgr_reset();        /* 内含 clear_relax_name_state()（g_rn 槽位）+ unstranger_reset() */
-    if (g_load_log++ < 10) LOGI("[name] 读档完成 → 重置放宽一次性状态与姓名缓存");
 }
 
 static bool hook_check_joined(void* self, int io, void* line) {
@@ -2808,12 +2777,6 @@ static void install_tweaks() {
     if (hook_install("剧情.伙伴离队容错", (void*)(g_base + RVA_CHANGE_PARTNER),
                      (void*)hook_change_partner, (void**)&orig_change_partner)) {
         LOGI("剧情: 伙伴离队容错 已挂 @ 0x%X", RVA_CHANGE_PARTNER);
-    }
-
-    /* v143：读档完成 → 重置放宽一次性状态与姓名缓存 */
-    if (hook_install("名字.读档完成", (void*)(g_base + RVA_GCM_ONLOADFINISHED),
-                     (void*)hook_onloadfinished, (void**)&orig_onloadfinished)) {
-        LOGI("名字: 读档完成 已挂 @ 0x%X", RVA_GCM_ONLOADFINISHED);
     }
 
     /* v51 诊断：进场区域条件的实际判定值 */

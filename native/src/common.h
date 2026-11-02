@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v144"         /* v144：真名取值链改为「surName+givenName 有一侧非空就用，两侧都空才退 uName」 */
+#define MOD_VER "v145"         /* v145：撤掉 OnLoadFinished 钩子（v144 闪退根因），改用既有换档信号；真名取值链零分配 */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
