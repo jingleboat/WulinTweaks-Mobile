@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v151"         /* v151：取消 region 相交排除 + 独立剧情节点播放日志 */
+#define MOD_VER "v152"         /* v152：撤掉 play 日志内联钩子（闪退根因）；保留「取消 region 相交排除」 */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */

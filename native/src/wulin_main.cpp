@@ -2879,7 +2879,7 @@ static void install_tweaks() {
         LOGI("名字: StoryCloseNode.OnResult 已挂 @ 0x%X", RVA_SCN_ONRESULT);
     }
     /* v151：独立剧情节点的播放日志（纯观测） */
-    install_play_log_hooks();
+    /* v152：play 日志钩子已撤（v151 内联补丁导致读档闪退），保留函数不调用 */
 
     /* v73：气泡入口直接改名 —— 这是唯一确认能把「熟悉后姓名」显示出来的位置 */
     if (hook_install("名字.气泡Init", (void*)(g_base + RVA_BUBBLE_INIT),
