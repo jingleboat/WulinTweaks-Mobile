@@ -520,13 +520,17 @@ void flatten_try(void* any_node) {
     }
 
     /* ---------------- ③ 逐对落地（先判冲突，再动手） ---------------- */
-    int expanded = 0, redirected = 0, skipped = 0;
+    int expanded = 0, redirected = 0, skipped = 0, overlaps = 0;
     for (int k = 0; k < g_npairs; ++k) {
         FLAT_PAIR* p = &g_pair[k];
         if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION || p->ex_n == 0) { skipped++; continue; }
 
-        /* 冲突：与另一对的 region 相交 → 这一对不动（另一对会在它自己那轮判）。
-         * v87 与 PC 对齐：region 超上限的对**也参与**冲突判定（PC 只跳过 reg_n==0 的）。 */
+        /* v151（用户指定）：**不再因为“与另一对门的 region 相交”而跳过**。
+         * 实测 R10049-2：10054 的 region 只有 1 个节点（R10049-2_3_2_2），却被 10063（8 节点）
+         * 完整包住 → 老规则两对都放弃 → 10054 的剧情永远不播。
+         * 而“让重叠部分只播一次”需要在每个重叠节点上做“已播过就跳过”的执行期标记，
+         * 代价和风险都远大于收益，所以这里只统计、不跳过：
+         * 两对都展开后，执行期天然只走一条路径，重叠节点不会被播两次。 */
         int clash = 0;
         for (int q = 0; q < g_npairs && !clash; ++q) {
             if (q == k) continue;
@@ -537,7 +541,7 @@ void flatten_try(void* any_node) {
             for (int i = 0; i < g_nnodes; ++i)
                 if (ra[i] == 1 && rb[i] == 1) { clash = 1; break; }
         }
-        if (clash) { skipped++; continue; }
+        if (clash) overlaps++;            /* v151：只计数，不跳过 */
 
         int ok = 0, bad = 0;
         for (int e = 0; e < p->ex_n; ++e) {
@@ -569,8 +573,8 @@ void flatten_try(void* any_node) {
 
     if (g_log_graph < FLAT_LOG_GRAPH) {
         g_log_graph++;
-        LOGI("[flat] 图 %s：节点 %d，门对 %d，展开 %d（跳过 %d），改线 %d 条，接管条件 %d 个（累计）",
-             unity_name(g, gb, sizeof(gb)), g_nnodes, g_npairs, expanded, skipped,
+        LOGI("[flat] 图 %s：节点 %d，门对 %d，展开 %d（跳过 %d，含区域相交 %d），改线 %d 条，接管条件 %d 个（累计）",
+             unity_name(g, gb, sizeof(gb)), g_nnodes, g_npairs, expanded, skipped, overlaps,
              redirected, g_flat_cond_n);
     }
 }

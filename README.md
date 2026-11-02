@@ -106,6 +106,7 @@ $env:JAVA_HOME="<jdk>"
 只列功能节点，中间的调试版本见 git 历史。
 
 | 版本 | 内容 |
+| **v151** | ① **取消「与另一对门 region 相交就跳过」这条排除**（只计数、不再跳过）—— 实测 R10049-2 里 10054 的独占节点 `R10049-2_3_2_2` 被 10063 的 8 节点区域完整包住，老规则两对都放弃 → 10054 的剧情永远不播；而“让重叠部分只播一次”需要执行期标记，代价与风险都过大，故选直接不排除。② 新增**独立剧情播放日志**：挂 `StoryOpenNode.OnActive` / `StoryStartPlayNode.OnActive`（实机扫出的真实类名，`StoryXxxAloneNode` 并不存在，端口类才叫 `StoryOpenAloneNodePort`），输出 `[play]` 行；展平汇总行增加「含区域相交 N」 |
 | **v150** | **只加诊断日志，不改逻辑**：`[once]` 压制行补上 `门=<指针> name=<节点名> times= hits=before→after flatGate=Y/N`，上限 8→60。用于判定「被压制的门是不是展平接管过的门」「压制点夹在哪两段剧情之间」。另：分支展开日志上限 40→200、逐对日志 60→300（v149） |
 | **v148** | **收敛成一句话：随剧情条件放宽一起做 clear(pid)。** ① clear 从「hook 里放宽命中时」挪到 `keep_original_for_uncached()` 里、`relax_once` **之前** —— `relax_once` 是「每图只放宽一次」的计数器，只该限制放宽、不该限制清名字，否则同一张图（R10049-2 有 19 个 partnerID）第一个条件用掉那一次后其余角色全清不到（凌梦蝶即此例）；放在结缘图 / never_joined 守卫**之后**，这两类是故意不放宽、清名字会剧透。② 停用临时改名（`rn_sync()` 直接 return）。③ 停用显示层接管（`hook_fullname` / `hook_fullname_title` 直接返回游戏原值）。现在 mod 只做「清 @」，显示完全交回游戏 |
 | **v147** | **删除姓名回落机制**：`real_name_of` 只保留最直接的一级来源 —— 模板 `surName`+`givenName`（去前导 `@`）；不再回落 `get_RealFullName`（实测对「只有姓没有名」的角色只返回姓，对 20204 返回「大梁城·知府」）、不再回落 `uName`、不再回落 `nameAsStranger`。另：`unstranger` 只清 `m_givenName` 的 `@`，`m_surName` 的 `@` 判断删除（4 份存档核对：surName 带 `@` 的 0 条） |

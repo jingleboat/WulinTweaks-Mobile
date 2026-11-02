@@ -2628,6 +2628,98 @@ static void hook_steal_init(void* self) {
 }
 
 /* ================================================================ 安装 */
+
+/* ---- v151：独立剧情 / 头部独立剧情节点的播放日志 -------------------------
+ * 背景：`StoryScenarioNode.OnActive`（我们已有日志）只覆盖普通「播放剧情」节点；
+ * R10049-2 里还有 `StoryOpenAloneNodePort ×2` / `StoryHeadAloneNodePort ×2` 这类
+ * 独立剧情节点，它们**不走同一个方法** → PC 上看到 10061 的剧情，但我们日志里一条
+ * `R10049-2-1_*` 都没有，无法验证到底是哪条路径播的。
+ * 这里按类名在运行期解析出它们的 OnActive 并挂一条纯日志钩子（找不到就跳过，不影响功能）。 */
+static void* (*orig_alone_onactive)(void* self) = nullptr;
+static void* (*orig_head_onactive)(void* self)  = nullptr;
+static int g_playlog_n = 0;
+static int g_diag_alone = 0, g_diag_story = 0;   /* v151：类名诊断计数 */
+
+static void log_play_kind(const char* kind, void* self) {
+    if ((uintptr_t)self < 0x10000 || g_playlog_n >= 300) return;
+    char kb[192]; kb[0] = 0;
+    void* sk = *(void**)((char*)self + OFF_SCENARIO_KEY);
+    str_to_buf(sk, kb, sizeof(kb));
+    if (!kb[0]) return;
+    char gb2[96]; gb2[0] = 0;
+    void* g = *(void**)((char*)self + OFF_NODE_GRAPH);
+    const char* gn = ((uintptr_t)g > 0x10000) ? obj_name(g, gb2, sizeof(gb2)) : "?";
+    g_playlog_n++;
+    LOGI("[play] %s key=%s（图 %s）", kind, kb, gn);
+}
+static void* hook_alone_onactive(void* self) {
+    log_play_kind("OpenAlone", self);
+    return orig_alone_onactive ? orig_alone_onactive(self) : nullptr;
+}
+static void* hook_head_onactive(void* self) {
+    log_play_kind("HeadAlone", self);
+    return orig_head_onactive ? orig_head_onactive(self) : nullptr;
+}
+
+static void* method_ptr_of_class(void* klass, const char* name, int argc) {
+    if ((uintptr_t)klass < 0x10000) return nullptr;
+    static void* (*getm)(void*, const char*, int) = nullptr;
+    if (!getm && g_i2cpp) getm = (void* (*)(void*, const char*, int))dlsym(g_i2cpp, "il2cpp_class_get_method_from_name");
+    if (!getm) return nullptr;
+    void* mi = getm(klass, name, argc);
+    if ((uintptr_t)mi < 0x10000) return nullptr;
+    void* fp = *(void**)mi;
+    return ((uintptr_t)fp > 0x10000) ? fp : nullptr;
+}
+
+static void install_play_log_hooks(void) {
+    /* v151：不猜类名。遍历所有程序集里的类，名字含 "Alone" 且有无参 OnActive 的，全部挂日志钩子。
+     * 先跑一遍实机确认过 `WuLin.StateMachine.StoryOpenAloneNode` 这个名字找不到，
+     * 所以改成按特征扫描；顺手把命中的类名打出来，便于以后精确定位。 */
+    typedef void* (*fn_img_cls_count)(void*);
+    typedef void* (*fn_img_get_cls)(void*, size_t);
+    static fn_img_cls_count A_img_cls_count = nullptr;
+    static fn_img_get_cls   A_img_get_cls   = nullptr;
+    if (!A_img_cls_count && g_i2cpp) A_img_cls_count = (fn_img_cls_count)dlsym(g_i2cpp, "il2cpp_image_get_class_count");
+    if (!A_img_get_cls && g_i2cpp)   A_img_get_cls   = (fn_img_get_cls)dlsym(g_i2cpp, "il2cpp_image_get_class");
+    if (!A_img_cls_count || !A_img_get_cls || !A_class_get_name) {
+        LOGI("[play] 缺少类枚举 API，跳过播放日志钩子");
+        return;
+    }
+
+    int hooked = 0, found = 0;
+    for (size_t im = 0; im < g_nimg; ++im) {
+        if (!g_imgs[im]) continue;
+        size_t n = (size_t)(uintptr_t)A_img_cls_count(g_imgs[im]);
+        if (n == 0 || n > 20000) continue;
+        for (size_t ci = 0; ci < n; ++ci) {
+            void* k = A_img_get_cls(g_imgs[im], ci);
+            if ((uintptr_t)k < 0x10000) continue;
+            const char* nm = A_class_get_name(k);
+            if (!nm) continue;
+            /* v151：实机扫出来的真实类名 —— 「独立剧情」并不是 StoryXxxAloneNode，
+             * 而是 StoryOpenNode（独立剧情）与 StoryStartPlayNode（开始播放）；
+             * Slg* 变体与它们共用同一个方法地址，挂一次即覆盖。 */
+            int slot = -1;
+            if (strcmp(nm, "StoryOpenNode") == 0) slot = 0;
+            else if (strcmp(nm, "StoryStartPlayNode") == 0) slot = 1;
+            if (slot < 0) continue;
+
+            void* fp = method_ptr_of_class(k, "OnActive", 0);
+            if (!fp) continue;
+            found++;
+            if (slot == 0 && !orig_alone_onactive) {
+                if (hook_install("名字.独立剧情", fp, (void*)hook_alone_onactive, (void**)&orig_alone_onactive))
+                    LOGI("[play] %s.OnActive 已挂 @ %p（播放日志）", nm, fp);
+            } else if (slot == 1 && !orig_head_onactive) {
+                if (hook_install("名字.开始播放", fp, (void*)hook_head_onactive, (void**)&orig_head_onactive))
+                    LOGI("[play] %s.OnActive 已挂 @ %p（播放日志）", nm, fp);
+            }
+        }
+    }
+    if (!found) LOGI("[play] 没有找到 StoryOpenNode / StoryStartPlayNode（播放日志未挂）");
+}
+
 static void install_tweaks() {
     g_i2cpp = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
     if (g_i2cpp) {
@@ -2786,6 +2878,8 @@ static void install_tweaks() {
                      (void*)hook_scn_onresult, (void**)&orig_scn_onresult)) {
         LOGI("名字: StoryCloseNode.OnResult 已挂 @ 0x%X", RVA_SCN_ONRESULT);
     }
+    /* v151：独立剧情节点的播放日志（纯观测） */
+    install_play_log_hooks();
 
     /* v73：气泡入口直接改名 —— 这是唯一确认能把「熟悉后姓名」显示出来的位置 */
     if (hook_install("名字.气泡Init", (void*)(g_base + RVA_BUBBLE_INIT),
