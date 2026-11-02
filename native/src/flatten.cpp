@@ -241,7 +241,10 @@ static void flat_mark_done(void* g) {
 
 /* ================================================================ 单图工作区 */
 typedef struct { int src; int tgt; int slot; void* port; } FLAT_EDGE;
-typedef struct { int g0, g1; int pid; int both_story; int reg_n; int ex_start; int ex_n; } FLAT_PAIR;
+typedef struct { int g0, g1; int pid; int both_story; int reg_n; int ex_start; int ex_n;
+                 int first_is_g0;   /* v156：父端口第一条连接是不是「在队」侧（决定引擎先问谁） */
+                 int f, s;          /* v156：按连接顺序的 first / second */
+} FLAT_PAIR;
 
 /* v153：改线事务日志。undo 上限 1024（实测单图最多 51 条改线，余量充足）；
  * 超过上限 → 整图放弃展开，绝不留半改状态。 */
@@ -688,8 +691,9 @@ static void flatten_try_inner(void* any_node) {
         expanded++;
         if (g_log_pair < 300) {
             g_log_pair++;
-            LOGI("[flat]   pid=%d (%s) 内容 %d 节点，改线 %d 条%s",
-                 p->pid, p->both_story ? "B 类" : "A 类", p->reg_n, ok, bad ? " ⚠部分失败" : "");
+            LOGI("[flat]   pid=%d (%s) 先问=%s 内容 %d 节点，改线 %d 条%s",
+                 p->pid, p->both_story ? "B 类" : "A 类",
+                 p->first_is_g0 ? "在队" : "不在队", p->reg_n, ok, bad ? " ⚠部分失败" : "");
         }
     }
 
