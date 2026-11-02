@@ -2475,10 +2475,12 @@ static bool hold_check_core(void* self) {
          *   hits=before→after            —— 本次 CheckCondition 期间队友条件的判定次数增量
          *   flatGate=Y/N                 —— 这个门是否被「剧情分支展开」接管过
          *   step                         —— 交给「跳过之后去了哪」的后续分析（当前只占位） */
-        LOGI("[once] 图 %s 门=%p name=\"%s\" times=%d hits=%d→%d flatGate=%s → 压制",
+        int rescued = flatten_gate_forced(self);
+        LOGI("[once] 图 %s 门=%p name=\"%s\" times=%d hits=%d→%d flatGate=%s → %s",
              gn, self, obj_name(self, nb, sizeof(nb)), times,
              before, g_team_cond_hits,
-             flatten_gate_forced(self) ? "Y" : "N");
+             rescued ? "Y" : "N",
+             rescued ? "压制，但随后被展平强制放行救回（times 仍被真实 +1）" : "压制（本次真的判假）");
     }
     return false;
 }
@@ -2516,10 +2518,11 @@ static void gate_trace(void* self, int forced, int result) {
     const char* gn = ((uintptr_t)g > 0x10000) ? obj_name(g, gb, sizeof(gb)) : "?";
     int in_team = -1;
     int pid = flatten_gate_pid(self, &in_team);
-    LOGI("[gate] 图=%s 门=%p pid=%d 类=%s 侧=%s forced=%s → %s", gn, self, pid,
+    int times = *(int*)((char*)self + OFF_HOLD_TIMES);
+    LOGI("[gate] 图=%s 门=%p pid=%d 类=%s 侧=%s times=%d forced=%s → %s", gn, self, pid,
          flatten_gate_cls(self),
          pid <= 0 ? "?" : (in_team ? "在队" : "不在队"),
-         forced ? "Y" : "N", result ? "通过" : "不通过");
+         times, forced ? "Y" : "N", result ? "通过" : "不通过");
 }
 
 static bool hook_hold_check(void* self) {
