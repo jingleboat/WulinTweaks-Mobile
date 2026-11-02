@@ -1163,28 +1163,77 @@ static void obj_class_name(void* obj, char* buf, int cap) {
 }
 #endif
 
-/* 取「熟悉后姓名」的分层兜底，全部基于传入的角色实例 self（不查管理器、不依赖缓存）：
- *   ① get_RealFullName —— 陌生状态下从模板拼 SurName + GivenName（「姓+名」，不带称号）
- *   ② 模板正式名 CharacterPoolData.name(+0x18)
- *   ③ 陌生名本身（宁可显示 @xxx 也不要空）
- * v71：补了 ② —— 老版本 ① 空就直接退 ③，等于什么都没换。
- * v86：「称号·姓名」已回退，这里恢复成 RealFullName。 */
+/* 取「熟悉后姓名」的分层兜底，全部基于传入的角色实例 self（不查管理器、不依赖缓存）。
+ *
+ * v144（用户 2026-11-03 指定）：**只有 surName 与 givenName 都为空时才允许退化到 uName。**
+ *   ① 实例 m_surName / m_givenName —— 只要有一侧非空就拼起来用
+ *      例外：m_givenName 以 '@' 开头 = 陌生名 → 忽略实例，往下走
+ *   ② 模板 surName + givenName     —— 只要有一侧非空就用（**不再提前退 uName**）
+ *   ③ 模板 uName                   —— 仅当 ② 两侧都为空
+ *   ④ 模板 nameAsStranger          —— 最后兜底（宁可显示陌生名也不要空）
+ *   ⑤ 游戏自己的 get_RealFullName  —— 前面全空时兜底（自定义名字/称号场景靠它）
+ *
+ * 例子（20204）：模板 uName='大梁城知府' / surName='知府' / givenName=null
+ *   → ② 命中，返回「知府」；不会再到「大梁城知府」。
+ * 旧实现（v143 及以前）是 ① RealFullName → ② uName → ③ 陌生名，压根没试过 sur+giv，
+ * 所以这类「只有姓、没有名」的角色会被顶成 uName —— 就是本次反馈的现象。 */
 static void* real_name_of(void* self, const char** how) {
     if ((uintptr_t)self < 0x10000) { if (how) *how = "无实例"; return nullptr; }
 
+    char sb[96] = {0}, gb[96] = {0};
+
+    /* ① 实例自带名字（但 "@…" 是陌生名，不能当真人名用） */
+    void* isur = *(void**)((char*)self + OFF_GCI_SURNAME);
+    void* igiv = *(void**)((char*)self + OFF_GCI_GIVENNAME);
+    int inst_stranger = 0;
+    if (il2str_len_ok(igiv)) {
+        int L = *(int*)((char*)igiv + OFF_IL2STR_LEN);
+        const unsigned short* q = (const unsigned short*)((char*)igiv + OFF_IL2STR_CHARS);
+        if (L > 0 && q[0] == 0x40) inst_stranger = 1;
+    }
+    if (!inst_stranger) {
+        str_to_buf(isur, sb, sizeof(sb));
+        str_to_buf(igiv, gb, sizeof(gb));
+        if (sb[0] || gb[0]) {
+            static __thread char buf1[192];
+            snprintf(buf1, sizeof(buf1), "%s%s", sb, gb);
+            void* r = A_string_new ? A_string_new(buf1) : nullptr;
+            if ((uintptr_t)r > 0x10000) { if (how) *how = "实例姓名"; return r; }
+        }
+    }
+
+    void* tpl = *(void**)((char*)self + OFF_GCI_TEMPLATE);
+    if ((uintptr_t)tpl > 0x10000) {
+        /* ② 模板 姓+名：只要不全为空就用 */
+        sb[0] = gb[0] = 0;
+        str_to_buf(*(void**)((char*)tpl + OFF_CPD_SURNAME),   sb, sizeof(sb));
+        str_to_buf(*(void**)((char*)tpl + OFF_CPD_GIVENNAME), gb, sizeof(gb));
+        if (sb[0] == '@') memmove(sb, sb + 1, strlen(sb));
+        if (gb[0] == '@') memmove(gb, gb + 1, strlen(gb));
+        if (sb[0] || gb[0]) {
+            static __thread char buf2[192];
+            snprintf(buf2, sizeof(buf2), "%s%s", sb, gb);
+            void* r = A_string_new ? A_string_new(buf2) : nullptr;
+            if ((uintptr_t)r > 0x10000) { if (how) *how = "模板sur+giv"; return r; }
+        }
+
+        /* ③ 只有两侧都为空，才退到 uName */
+        void* nm = *(void**)((char*)tpl + OFF_CPD_NAME);
+        if (!str_empty(nm)) { if (how) *how = "模板uName(两侧皆空)"; return nm; }
+
+        /* ④ 陌生名兜底 */
+        void* s = *(void**)((char*)tpl + OFF_CPD_NAME_STRANGER);
+        if (!str_empty(s)) { if (how) *how = "回退陌生名"; return s; }
+    }
+
+    /* ⑤ 游戏自己的 RealFullName（自定义名/称号等场景） */
     if (orig_realfullname && !g_rn_busy) {
         g_rn_busy = 1;
         void* real = orig_realfullname(self);
         g_rn_busy = 0;
         if (!str_empty(real)) { if (how) *how = "RealFullName"; return real; }
     }
-    void* tpl = *(void**)((char*)self + OFF_GCI_TEMPLATE);
-    if ((uintptr_t)tpl > 0x10000) {
-        void* nm = *(void**)((char*)tpl + OFF_CPD_NAME);
-        if (!str_empty(nm)) { if (how) *how = "模板正式名"; return nm; }
-        void* s = *(void**)((char*)tpl + OFF_CPD_NAME_STRANGER);
-        if (!str_empty(s)) { if (how) *how = "回退陌生名"; return s; }
-    }
+
     if (how) *how = "模板为空";
     return nullptr;
 }

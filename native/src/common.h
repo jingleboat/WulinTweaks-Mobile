@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v143"         /* v143：读档完成重置「每图只放宽一次」与姓名缓存；播放时强制重判 */
+#define MOD_VER "v144"         /* v144：真名取值链改为「surName+givenName 有一侧非空就用，两侧都空才退 uName」 */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
