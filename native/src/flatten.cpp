@@ -67,7 +67,7 @@ extern volatile int F_STORY;     /* 剧情条件放宽（姓名窗口也受它�
 #define FLAT_MAX_GATES   512         /* v87：被接管的门（HoldNode）指针表，与 PC 的 HashSet 对齐 */
 #define FLAT_MAX_REGION  512         /* region 节点上限 */
 #define FLAT_DONE_MAX    96          /* 处理过的图指针（环形） */
-#define FLAT_LOG_GRAPH   40
+#define FLAT_LOG_GRAPH   200   /* v149：40 → 200（本次诊断发现 40 条上限把 R10049-2 的结果吞掉了） */
 
 /* ---------------------------------------------------------------- 列表访问 */
 /* ⚠️ il2cpp 数组（T[]）的元素不是从数组对象头开始，而是 +0x20：
@@ -557,7 +557,7 @@ void flatten_try(void* any_node) {
         if (F_STORY) relax_name_open(p->pid, g);
 
         expanded++;
-        if (g_log_pair < 60) {
+        if (g_log_pair < 300)   /* v149：逐对日志 60 → 300 */ {
             g_log_pair++;
             LOGI("[flat]   pid=%d (%s) 内容 %d 节点，改线 %d 条%s",
                  p->pid, p->both_story ? "B 类" : "A 类", p->reg_n, ok,

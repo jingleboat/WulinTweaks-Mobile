@@ -2468,11 +2468,20 @@ static bool hold_check_core(void* self) {
     if (story_blacklisted(gn)) return true;
 
     /* 其余：队友条件被放宽后，这个 Hold 已经通过过还要再过 → 压回 false。 */
-    if (g_hold_once_warn < 8) {
+    if (g_hold_once_warn < 60) {          /* v150：8 → 60（诊断用） */
         g_hold_once_warn++;
         char nb[128];
-        LOGI("[once] 剧情图 %s 的 Hold \"%s\" times=%d 已通过过，压制本次（放宽引起的重复触发）",
-             gn, obj_name(self, nb, sizeof(nb)), times);
+        /* v150 诊断字段：
+         *   门=<HoldNode 指针>            —— 用来和 [flat] 里登记的“接管门”对照
+         *   name=<节点名>                 —— XNode 节点名（一般是「流程判断」）
+         *   times                        —— checkSucessTimes
+         *   hits=before→after            —— 本次 CheckCondition 期间队友条件的判定次数增量
+         *   flatGate=Y/N                 —— 这个门是否被「剧情分支展开」接管过
+         *   step                         —— 交给「跳过之后去了哪」的后续分析（当前只占位） */
+        LOGI("[once] 图 %s 门=%p name=\"%s\" times=%d hits=%d→%d flatGate=%s → 压制",
+             gn, self, obj_name(self, nb, sizeof(nb)), times,
+             before, g_team_cond_hits,
+             flatten_gate_forced(self) ? "Y" : "N");
     }
     return false;
 }
