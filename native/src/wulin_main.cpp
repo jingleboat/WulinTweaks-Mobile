@@ -582,6 +582,7 @@ static fn_check base_check_all = nullptr;
 /* 下面两个函数定义在后面，这里先声明 */
 static const char* obj_name(void* o, char* buf, int cap);
 static int story_blacklisted(const char* g);
+static int story_blacklisted_pair(const char* g, int pid);   /* v141：门对级 */
 
 /* 主线和师父的故事线：固定按原版判断（不放宽）。
  * 末尾两条是「用户点名要压住」的个别剧情（条件是别人角色，按彩蛋规则会放宽）。 */
@@ -599,7 +600,64 @@ static const char* k_fixed_original[] = {
                                       * 属于「别的角色」→ 按彩蛋规则必放宽；而图里有 3 个
                                       * ChangePartnerNode(state=1, partnerID=20004) = 把包打听踢出队。
                                       * 放宽后这段在不该播的时候播了（结缘花四娘 + 同队时"包打听离队"）。*/
+    /* ---- 2026-11-02：R10049-10 / Fame-10 已改为「只压单个场景」----
+     * 它们从本名单（整图级）移出，改由下方 k_fixed_scene[] 按 ScenarioKey 精确压制；
+     * 同图其它场景仍按放宽规则走。 */
 };
+
+/* 「场景级」固定不放宽名单：按 **ScenarioKey**（StoryScenarioNode.ScenarioKey，偏移 0x60）匹配。
+ * 粒度比图名名单更细 —— 只压某一个场景，同图其它场景照旧按放宽规则走。
+ * 末尾带 * 表示前缀匹配（例如 "R10049-10_*"）。
+ *
+ * 2026-11-02 二次修正：R10049-10_0_0 / Fame-10_72 的实际病因是「剧情分支展开」
+ * 把互补门对摊平（不是条件放宽），所以它们已移到 flatten.cpp 的 k_flatten_skip 跳过名单，
+ * 本表不再放这两项。此表继续保留给"确实需要压住条件放宽"的场景使用。 */
+static const char* k_fixed_scene[] = {
+    /* 目前为空。写法示例："R10049-10_0_0" 或 "Fame-10_*" */
+    "",
+};
+
+/* 每张图「最近播放的 ScenarioKey」小表（32 槽，环形覆盖） */
+#define SCENE_SLOTS 32
+static void* g_scene_g[SCENE_SLOTS];
+static char  g_scene_k[SCENE_SLOTS][128];
+static int   g_scene_i = 0;
+
+static void scene_record(void* graph, const char* key) {
+    if ((uintptr_t)graph < 0x10000 || !key || !key[0]) return;
+    for (int i = 0; i < SCENE_SLOTS; ++i) {
+        if (g_scene_g[i] == graph) {
+            snprintf(g_scene_k[i], sizeof(g_scene_k[i]), "%s", key);
+            return;
+        }
+    }
+    g_scene_g[g_scene_i] = graph;
+    snprintf(g_scene_k[g_scene_i], sizeof(g_scene_k[g_scene_i]), "%s", key);
+    g_scene_i = (g_scene_i + 1) % SCENE_SLOTS;
+}
+
+static const char* scene_last(void* graph) {
+    if ((uintptr_t)graph < 0x10000) return nullptr;
+    for (int i = 0; i < SCENE_SLOTS; ++i)
+        if (g_scene_g[i] == graph) return g_scene_k[i];
+    return nullptr;
+}
+
+/* 场景键是否命中 k_fixed_scene（允许末尾 * 前缀匹配） */
+static int fixed_scene_key(const char* key) {
+    if (!key || !key[0]) return 0;
+    for (size_t i = 0; i < sizeof(k_fixed_scene) / sizeof(k_fixed_scene[0]); ++i) {
+        const char* p = k_fixed_scene[i];
+        size_t n = strlen(p);
+        if (n == 0) continue;
+        if (p[n - 1] == '*') {
+            if (n > 1 && strncmp(key, p, n - 1) == 0) return 1;
+        } else if (strcmp(key, p) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
 
 /* R10005-11 -> 10005；不是 "R数字-" 形式返回 -1 */
 static int parse_r_id(const char* gn) {
@@ -621,12 +679,14 @@ static uint64_t g_char_mgr_t = 0;
 #define CHAR_MGR_TTL_MS 60000
 
 static void clear_relax_name_state(void);   /* 定义在「姓名」那一节 */
+static void unstranger_reset(void);         /* v138：「放宽在队条件→清陌生名」的缓存 */
 static void char_mgr_reset(void) {
     g_char_mgr = nullptr;
     g_char_mgr_t = 0;
     /* v63：换档/读档后旧的角色实例与它持有的字符串全部作废，名字缓存必须一起清，
      * 否则 g_relax_stranger / g_relax_real 变悬空指针，而 90 秒窗口可能还开着。 */
     clear_relax_name_state();
+    unstranger_reset();                     /* v138：实例整批重建，处理缓存一并作废 */
 }
 
 static void* char_mgr() {
@@ -740,6 +800,7 @@ static void* g_bond_g[BOND_CACHE_N];
 static int   g_bond_v[BOND_CACHE_N];
 static int   g_bond_i = 0;
 static int   g_bond_log = 0;
+static int   g_scene_log = 0;   /* v133：场景级固定名单命中日志 */
 
 static const char* node_class_name(void* node);   /* 定义在「ContinueArrange 递归」那一节 */
 
@@ -805,6 +866,28 @@ static int keep_original_for_uncached(void* condNode) {
         if (strcmp(gn, k_fixed_original[i]) == 0) return 1;
 
     if (story_blacklisted(gn)) return 1;
+
+    /* v141：门对级名单 —— 只压这张图里「这个 partnerID」的在队条件。
+     * 之所以要这一层：Fame-10（红颜劫）一张图里有 30 多个 partnerID，
+     * 图名级名单会把整张图的放宽全压掉。 */
+    {
+        int pid0 = *(int*)((char*)condNode + OFF_PARTNER_ID);
+        if (story_blacklisted_pair(gn, pid0)) {
+            if (g_scene_log++ < 20)
+                LOGI("[team] 图 %s 门对 %d 在放宽名单 → 不放宽（原版）", gn, pid0);
+            return 1;
+        }
+    }
+
+    /* v133：场景级固定名单 —— 这张图「最近播的那个 ScenarioKey」命中 k_fixed_scene 就按原版。
+     * 粒度只到该场景，同图其它场景仍走放宽规则。 */
+    {
+        const char* sk = scene_last(g);
+        if (sk && fixed_scene_key(sk)) {
+            if (g_scene_log++ < 20) LOGI("[team] 图 %s 场景 %s 在场景名单 → 不放宽（原版）", gn, sk);
+            return 1;
+        }
+    }
     /* v110：固定图改用正则 —— ^Guide10099-（师父线整族）+ ^Fame-2$（仅这一张）；
      * 烈酒与故事(R10112-2)、伙伴的故事(R20004-6) 已移除，交给「每图只放宽一次」。 */
     if (strncmp(gn, "Guide10099-", 11) == 0 || strcmp(gn, "Fame-2") == 0
@@ -1603,11 +1686,21 @@ static void* hook_ssn_onactive(void* self) {
     /* v80：先改名再调原函数 —— 气泡是在 OnActive 里生成的，放到之后就会先渲染一遍陌生名 */
     story_play_begin(self);
     void* r = orig_ssn_onactive ? orig_ssn_onactive(self) : nullptr;
-    if (g_play_hook_log++ < 15) {
-        char kb[64] = {0};
-        void* sk = ((uintptr_t)self > 0x10000) ? *(void**)((char*)self + 0x60) : nullptr;
+
+    /* v133：记录「这张图正在播的 ScenarioKey」，供场景级固定名单判定（不看 F_STORY） */
+    if ((uintptr_t)self > 0x10000) {
+        char kb[128] = {0};
+        void* sk = *(void**)((char*)self + OFF_SCENARIO_KEY);
         if ((uintptr_t)sk > 0x10000) str_to_buf(sk, kb, sizeof(kb));
-        LOGI("[name] 播放开始 ScenarioKey=%s", kb);
+        if (kb[0]) {
+            void* g = *(void**)((char*)self + OFF_NODE_GRAPH);
+            scene_record(g, kb);
+            if (g_play_hook_log++ < 15) {
+                char gb[96] = {0};
+                if ((uintptr_t)g > 0x10000) obj_name(g, gb, sizeof(gb));
+                LOGI("[name] 播放开始 ScenarioKey=%s（图 %s）", kb, gb);
+            }
+        }
     }
     return r;
 }
@@ -1633,6 +1726,122 @@ static void hook_scn_onresult(void* self) {
     story_play_end_now();
 }
 
+/* ---- v138：放宽「角色在队」判定 → 把这条条件涉及的角色从陌生名改回真名 ----
+ *
+ * 用户要求（2026-11-02）：不按名单、不扫全档 —— 精确到「刚被跳过的那条在队条件」
+ * 里的 partnerID（Negate=0 那一侧，即"要求某人在队"）。
+ *
+ * 为什么这样做（反汇编 libil2cpp.so 得出）：
+ *   get_IsUsingStangerName 0x223B8AC = m_givenName 非空 && StartsWith("@")
+ *   get_FullName           0x223B950 = 陌生 ? 模板 NameAsStranger : 实例 m_surName+m_givenName
+ * 所以必须先让 IsUsingStangerName 变假（清掉 '@'），再让实例里**有**真名。
+ * ⚠️ 不能只清空：手机版在实例名字为空时回落到 uName（PC 版回落到模板 surName+givenName），
+ *    实测 20006 会从「王大锤」退化成「无名小村铁匠」。所以这里直接写模板真姓真名。
+ *
+ * 存档安全性：只改两个 string 字段（"" —— 存档里本来就有 3732 条是这个值），
+ * 不增删任何字典键、不碰 relationShip / m_additionProps / m_TeamMemberState，
+ * 因此不改变 SaveObjectGameCharacter 的结构。写前按 v91 规矩验类名与 uid。
+ *
+ * 性能：游戏会以几十上百次/秒重判 Hold 条件，所以按「uid → 实例指针」缓存；
+ * 指针没变就直接返回（@ 只在实例初始化时写一次，同一实例不会再次带上）。
+ * 换档/换图时 char_mgr_reset() 会清掉缓存，重新判定。
+ */
+#define US_SLOTS 64
+static int   g_us_n = 0;
+static int   g_us_uid[US_SLOTS];
+static void* g_us_inst[US_SLOTS];
+static int   g_us_log = 0;
+
+static void unstranger_reset(void) { g_us_n = 0; }
+
+static void* us_cached(int uid) {
+    for (int i = 0; i < g_us_n; ++i) if (g_us_uid[i] == uid) return g_us_inst[i];
+    return nullptr;
+}
+static void us_cache(int uid, void* inst) {
+    for (int i = 0; i < g_us_n; ++i) if (g_us_uid[i] == uid) { g_us_inst[i] = inst; return; }
+    if (g_us_n < US_SLOTS) { g_us_uid[g_us_n] = uid; g_us_inst[g_us_n] = inst; ++g_us_n; }
+}
+
+static void unstranger_relaxed(void* condNode) {
+    if (!F_STORY || (uintptr_t)condNode < 0x10000) return;
+    int pid = *(int*)((char*)condNode + OFF_PARTNER_ID);
+    int neg = (int)*(unsigned char*)((char*)condNode + OFF_PARTNER_NEGATE);
+    if (pid <= 0 || neg) return;                  /* 只处理「要求某人在队」那一侧 */
+
+    void* m = char_mgr();
+    if ((uintptr_t)m < 0x10000) return;
+    typedef void* (*fn_getchar)(void*, int);
+    void* c = ((fn_getchar)(g_base + RVA_GET_CHARACTER))(m, pid);
+    if ((uintptr_t)c < 0x10000) return;
+    if (us_cached(pid) == c) return;              /* 这个实例已经判定过 */
+
+    /* v91 式校验：地址可能被销毁/复用，先验类名与模板 uid 再动字段 */
+    if (!obj_is_class(c, "GameCharacterInstance") ||
+        *(int*)((char*)c + OFF_GCI_TPL_UID) != pid) return;
+
+    void* g0 = *(void**)((char*)c + OFF_GCI_GIVENNAME);
+    int stranger = 0;
+    if (il2str_len_ok(g0)) {
+        int L = *(int*)((char*)g0 + OFF_IL2STR_LEN);
+        const unsigned short* q = (const unsigned short*)((char*)g0 + OFF_IL2STR_CHARS);
+        if (L > 0 && q[0] == 0x40) stranger = 1;  /* '@' */
+    }
+    if (!stranger) { us_cache(pid, c); return; }  /* 本就不是陌生名：记下，别再查 */
+
+    /* ⚠️ 手机端不能"清空"，必须"写模板真名"。
+     * 实测（用户 2026-11-02 反馈，角色 20006 无名小村铁匠）：
+     *   实例 sur/giv 都为空时 —— PC 版显示「王大锤」= 模板 surName+givenName，
+     *   手机版显示「无名小村铁匠」= CharacterPoolData.uName。
+     * 也就是两端的取名回落不一样：清空在 PC 上能拿到真名，在手机上只会退成 uName。
+     * 所以这里照 v75 的做法，把模板的 surName / givenName 直接写进实例。 */
+    void* tpl = *(void**)((char*)c + OFF_GCI_TEMPLATE);
+    if ((uintptr_t)tpl < 0x10000) { us_cache(pid, c); return; }
+    if (!obj_is_class(tpl, "CharacterPoolData") ||
+        *(int*)((char*)tpl + OFF_CPD_UID) != pid) { us_cache(pid, c); return; }
+
+    void* ts = *(void**)((char*)tpl + OFF_CPD_SURNAME);
+    void* tg = *(void**)((char*)tpl + OFF_CPD_GIVENNAME);
+    int has_sur = !str_empty(ts);
+    int has_giv = !str_empty(tg);
+
+    /* v90 教训：先把旧文本拷出来，**再**改字段。
+     * 字段一被覆盖，g0 指向的字符串就没有引用了，GC 一回收再读就是 use-after-free。 */
+    char gb[96] = {0};
+    str_to_buf(g0, gb, sizeof(gb));
+
+    if (!has_sur && !has_giv) {
+        /* 模板里也没有真姓真名（无名之辈）：保留原样，别把它退化成无名 */
+        us_cache(pid, c);
+        if (g_us_log++ < 20)
+            LOGI("[name] 放宽在队条件 uid=%d 模板无真名，保留陌生名 \"%s\"", pid, gb);
+        return;
+    }
+
+    void* empty = A_string_new ? A_string_new("") : nullptr;
+    if ((uintptr_t)empty < 0x10000) return;
+    *(void**)((char*)c + OFF_GCI_SURNAME)   = has_sur ? ts : empty;
+    *(void**)((char*)c + OFF_GCI_GIVENNAME) = has_giv ? tg : empty;
+    us_cache(pid, c);
+
+    /* v140：与老的「剧情期间临时改名」解耦。
+     * 实测日志（v138）出现过这个顺序：
+     *   [name] 放宽在队条件 uid=20006 原陌生名="@相貌丑陋的汉子" → 已清空
+     *   [name] uid=20006 已把实例姓名改成 "王大锤"（数据层）     ← rn_apply_rename 把清空后的值当"原值"存了
+     *   [name] uid=20006 姓名已还原                              ← 于是还原成空 → 显示退化成 uName
+     * 我们已经把真名写死，就不该再让 rn 槽位在剧情结束时回写。
+     * restore=0：直接丢弃槽位，不还原。 */
+    int ri = rn_find(pid);
+    if (ri >= 0) rn_clear_slot(ri, 0);
+
+    if (g_us_log++ < 40) {
+        char sb[64] = {0}, nb[64] = {0};
+        str_to_buf(*(void**)((char*)c + OFF_GCI_SURNAME), sb, sizeof(sb));
+        str_to_buf(*(void**)((char*)c + OFF_GCI_GIVENNAME), nb, sizeof(nb));
+        LOGI("[name] 放宽在队条件 uid=%d 陌生名 \"%s\" → 写入真名 \"%s%s\"", pid, gb, sb, nb);
+    }
+}
+
 static bool hook_check_joined(void* self, int io, void* line) {
     g_team_cond_hits++;
     flatten_try(self);                      /* v65：顺手把「分支展开」补丁套到这张图上（只做一次） */
@@ -1640,11 +1849,13 @@ static bool hook_check_joined(void* self, int io, void* line) {
      * 但 partnerID/Negate 原值仍在，下面 mark_relaxed 才能继续为「姓名替换」开窗口。 */
     if (flatten_cond_always_true(self)) {
         mark_relaxed(self);
+        unstranger_relaxed(self);           /* v138：这条在队条件被跳过 → 清该角色的陌生名 */
         if (base_check_all) return base_check_all(self, io, line);
         return true;
     }
     if (F_STORY && base_check_all && !keep_original_for(self)) {
         mark_relaxed(self);                 /* v61：记下"这次放宽放过了谁"，用于显示真名 */
+        unstranger_relaxed(self);           /* v138：同上 */
         return base_check_all(self, io, line);
     }
     return orig_check_joined ? orig_check_joined(self, io, line) : false;
@@ -1655,11 +1866,13 @@ static bool hook_check_partner(void* self, int io, void* line) {
     flatten_try(self);
     if (flatten_cond_always_true(self)) {
         mark_relaxed(self);
+        unstranger_relaxed(self);           /* v138 */
         if (base_check_all) return base_check_all(self, io, line);
         return true;
     }
     if (F_STORY && base_check_all && !keep_original_for(self)) {
         mark_relaxed(self);
+        unstranger_relaxed(self);           /* v138 */
         return base_check_all(self, io, line);
     }
     return orig_check_partner ? orig_check_partner(self, io, line) : false;
@@ -2145,12 +2358,23 @@ static const char* obj_name(void* o, char* buf, int cap) {
 /* 非拦截名单：名单内的剧情图，不做放宽、也不做 times 压制 —— 完全按原版判断。
  * 名单外：正常放宽（只放宽「角色在队」这一条），并对 times 非 0 的 Hold 做压制兜底。
  *
- * 留空 = 全部按「放宽 + 兜底压制」跑。
+ * 两种写法：
+ *   ① 图名级      "R10049-0"      整张图都不放宽
+ *   ② 门对级      "Fame-10:10049" 只压这张图里 partnerID=10049 的那几条在队条件
+ *                 （与 flatten.cpp 的 k_flatten_skip 同一套语法，方便两套名单对齐）
+ * 条目末尾带 * 时按前缀匹配（例如 "R10060-2-*"）；含 ':' 的条目只认门对级匹配，
+ * 不会被图名级判定误当成图名。
+ *
  * 已知候选（PC 端全量对比得出，存档里确实因为「角色在队」才通过的图）：
  *   R10049-0 / R10112-2 / R10136-5 / R20004-4 / Role3-1 / R10036-3 / R10060-2-1..6
- * 条目末尾带 * 时按前缀匹配（例如 "R10060-2-*"）。 */
+ *
+ * v141：加入「剧情分支展开跳过名单」里的那两个场景，让它们**完全按原版**走
+ *   （展开不接管 + 在队条件不放宽）。
+ *   注意 Fame-10 一张图里有 30 多个 partnerID（红颜劫），所以这里必须写门对级，
+ *   写成图名级会把整张图的放宽全压掉；R10049-10 里只有 10049，两种写法等价。 */
 static const char* k_story_blacklist[] = {
-    "",
+    "R10049-10:10049",
+    "Fame-10:10049",
 };
 static const int k_story_blacklist_n =
     (int)(sizeof(k_story_blacklist) / sizeof(k_story_blacklist[0]));
@@ -2161,11 +2385,31 @@ static int story_blacklisted(const char* g) {
         const char* e = k_story_blacklist[i];
         size_t L = strlen(e);
         if (L == 0) continue;
+        if (strchr(e, ':')) continue;            /* v141：门对级条目不在图名级判定里命中 */
         if (e[L - 1] == '*') {
             if (strncmp(g, e, L - 1) == 0) return 1;
         } else if (strcmp(g, e) == 0) {
             return 1;
         }
+    }
+    return 0;
+}
+
+/* v141：门对级判定 —— 只认 "图名:partnerID" 形式的条目。
+ * 例：Fame-10 一张图里有 30 多个 partnerID（红颜劫），图名级会把整张图的放宽全压掉，
+ *     所以那两个「分支展开跳过」的场景这里必须精确到 partnerID。 */
+static int story_blacklisted_pair(const char* g, int pid) {
+    if (!g || !g[0] || g[0] == '?') return 0;
+    for (int i = 0; i < k_story_blacklist_n; ++i) {
+        const char* e = k_story_blacklist[i];
+        size_t L = strlen(e);
+        if (L == 0) continue;
+        const char* colon = strchr(e, ':');
+        if (!colon) continue;
+        size_t gl = (size_t)(colon - e);
+        if (gl == 0 || strlen(g) != gl) continue;
+        if (strncmp(g, e, gl) != 0) continue;
+        if (atoi(colon + 1) == pid) return 1;
     }
     return 0;
 }

@@ -366,6 +366,61 @@ static int flat_region(int k) {
 }
 
 /* ================================================================ 主流程 */
+
+/* 「剧情分支展开」跳过名单。两种写法（末尾都可带 * 做前缀匹配）：
+ *
+ *   "Fame-10"          整图跳过 —— 这张图完全不展开，保持原版 if/else 走线
+ *   "Fame-10:10049"    只跳过该图里 **partnerID=10049 的那一对门**，其余门对照常展开
+ *
+ * 为什么需要门对级：展平改的是「门」的出边接线，一张图里通常有几十对门
+ * （例如 Fame-10：门对 40，展开 27，跳过 13）。整图跳过会连带放弃本来安全的那些；
+ * 门对级可以只压住出问题的那一对。
+ *
+ * 2026-11-02（用户点名，已改为门对级）：
+ *   R10049-10 / Fame-10 —— 出问题的都是 partnerID=10049（月咏樱羽）那对「在队 / 不在队」门，
+ *   摊平后剧情停在叉口不动。 */
+static const char* k_flatten_skip[] = {
+    "R10049-10:10049",
+    "Fame-10:10049",
+};
+
+/* 名单项是否命中「整图」：只比 ':' 前面的图名部分（带 * 前缀支持） */
+static int flatten_skip(const char* gn) {
+    if (!gn || !gn[0]) return 0;
+    for (size_t i = 0; i < sizeof(k_flatten_skip) / sizeof(k_flatten_skip[0]); ++i) {
+        const char* p = k_flatten_skip[i];
+        const char* colon = strchr(p, ':');
+        size_t n = colon ? (size_t)(colon - p) : strlen(p);
+        if (n == 0) continue;
+        if (p[n - 1] == '*') {
+            if (n > 1 && strncmp(gn, p, n - 1) == 0) return 1;
+        } else if (strlen(gn) == n && strncmp(gn, p, n) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* 名单项是否命中「这对门」：图名匹配 且 ':partnerID' 等于 pid */
+static int flatten_skip_pair(const char* gn, int pid) {
+    if (!gn || !gn[0]) return 0;
+    for (size_t i = 0; i < sizeof(k_flatten_skip) / sizeof(k_flatten_skip[0]); ++i) {
+        const char* p = k_flatten_skip[i];
+        const char* colon = strchr(p, ':');
+        if (!colon) continue;                        /* 没写 :pid = 整图项，不参与门对判定 */
+        size_t n = (size_t)(colon - p);
+        if (n == 0) continue;
+        int gok;
+        if (p[n - 1] == '*') gok = (n > 1 && strncmp(gn, p, n - 1) == 0);
+        else gok = (strlen(gn) == n && strncmp(gn, p, n) == 0);
+        if (!gok) continue;
+        int want = 0;
+        for (const char* q = colon + 1; *q >= '0' && *q <= '9'; ++q) want = want * 10 + (*q - '0');
+        if (want > 0 && want == pid) return 1;
+    }
+    return 0;
+}
+
 void flatten_try(void* any_node) {
     if (!F_FLAT) return;
     if ((uintptr_t)any_node < 0x10000) return;
@@ -375,6 +430,15 @@ void flatten_try(void* any_node) {
     if (flat_done(g)) return;
 
     char gb[96];
+    const char* gn = unity_name(g, gb, sizeof(gb));
+    if (flatten_skip(gn)) {
+        flat_mark_done(g);
+        if (g_log_graph < FLAT_LOG_GRAPH) {
+            g_log_graph++;
+            LOGI("[flat] 图 %s 在跳过名单 → 整图不展开（原版 if/else 走线）", gn);
+        }
+        return;
+    }
     if (!flat_build(g)) {
         flat_mark_done(g);
         if (g_log_graph < FLAT_LOG_GRAPH) {
@@ -387,6 +451,7 @@ void flatten_try(void* any_node) {
 
     /* ---------------- ① 找互补门对 ---------------- */
     g_npairs = 0;
+    int pair_skipped = 0;
     for (int i = 0; i < g_nnodes && g_npairs < FLAT_MAX_PAIRS; ++i) {
         if (g_ec[i] != 2) continue;                    /* 只认「一个端口两条连接」 */
         int a = g_edge[g_e0[i]].tgt;
@@ -400,6 +465,9 @@ void flatten_try(void* any_node) {
         int pa = *(int*)((char*)ca + OFF_HP_PARTNER_ID);
         int pb = *(int*)((char*)cb + OFF_HP_PARTNER_ID);
         if (pa <= 0 || pa != pb) continue;             /* partnerID<=0 不是「需要伙伴」 */
+
+        /* 门对级跳过名单：只压 partnerID 命中的那一对，同图其它门对照常展开 */
+        if (flatten_skip_pair(gn, pa)) { pair_skipped++; continue; }
 
         int na = (*(unsigned char*)((char*)ca + OFF_HP_NEGATE) != 0);
         int nb = (*(unsigned char*)((char*)cb + OFF_HP_NEGATE) != 0);
@@ -422,6 +490,11 @@ void flatten_try(void* any_node) {
         p->reg_n = 0; p->ex_start = 0; p->ex_n = 0;
     }
 
+    if (pair_skipped && g_log_graph < FLAT_LOG_GRAPH) {
+        g_log_graph++;
+        LOGI("[flat] 图 %s 按门对名单跳过 %d 对（partnerID 命中，其余照常展开）",
+             gn, pair_skipped);
+    }
     if (g_npairs == 0) { flat_mark_done(g); return; }
 
     /* ---------------- ② 每对算独占 region 与对外出口 ---------------- */
