@@ -680,6 +680,7 @@ static uint64_t g_char_mgr_t = 0;
 
 static void clear_relax_name_state(void);   /* 定义在「姓名」那一节 */
 static void unstranger_reset(void);         /* v138：「放宽在队条件→清陌生名」的缓存 */
+static void unstranger_on_play(void* graph);/* v142：剧情播放时按本图名单补一次 */
 static void char_mgr_reset(void) {
     g_char_mgr = nullptr;
     g_char_mgr_t = 0;
@@ -1503,6 +1504,9 @@ void story_play_begin(void* playNode) {
     g_play_state = 1;
     g_sync_last = rn_now_ms();
     if (g_play_log++ < 20) LOGI("[name] 开始播放剧情，名字切换只作用于这张图");
+    /* v142（B）：先按本图名单补一次「陌生名 → 真名」，再 rn_sync。
+     * 顺序不能反：rn_sync 会拍下实例"原值"，先清掉 @ 才不会在收尾时被还原回去。 */
+    unstranger_on_play(g);
     rn_sync();
 }
 
@@ -1763,12 +1767,36 @@ static void us_cache(int uid, void* inst) {
     if (g_us_n < US_SLOTS) { g_us_uid[g_us_n] = uid; g_us_inst[g_us_n] = inst; ++g_us_n; }
 }
 
+static void unstranger_apply_uid(int pid);   /* 定义在下面 */
+
 static void unstranger_relaxed(void* condNode) {
     if (!F_STORY || (uintptr_t)condNode < 0x10000) return;
     int pid = *(int*)((char*)condNode + OFF_PARTNER_ID);
     int neg = (int)*(unsigned char*)((char*)condNode + OFF_PARTNER_NEGATE);
     if (pid <= 0 || neg) return;                  /* 只处理「要求某人在队」那一侧 */
+    unstranger_apply_uid(pid);
+}
 
+/* v142（B）：剧情真正开始播放时，按「本图被放宽过的 uid」再补一次。
+ * 为什么需要：放宽判定常远早于真正播放（Hold 条件被反复预判），那一刻角色可能还没实例化、
+ * 或者名字还没带上 '@'；而「每图只放宽一次」不给我们第二次机会。播放是必然发生的时机。
+ * ⚠️ 必须排在 rn_sync() 之前：先清掉 '@'，rn 拍到的"原值"才是真名/空，
+ * 收尾还原后仍是真名，而不是把 '@' 还回去。 */
+static void unstranger_on_play(void* graph) {
+    if (!F_STORY || (uintptr_t)graph < 0x10000) return;
+    int list[16];
+    int n = 0;
+    for (int i = 0; i < RN_SLOTS && n < 16; ++i) {
+        if (g_rn[i].uid <= 0) continue;
+        if (g_rn[i].graph != graph) continue;
+        int dup = 0;
+        for (int k = 0; k < n; ++k) if (list[k] == g_rn[i].uid) { dup = 1; break; }
+        if (!dup) list[n++] = g_rn[i].uid;
+    }
+    for (int i = 0; i < n; ++i) unstranger_apply_uid(list[i]);
+}
+
+static void unstranger_apply_uid(int pid) {
     void* m = char_mgr();
     if ((uintptr_t)m < 0x10000) return;
     typedef void* (*fn_getchar)(void*, int);
@@ -1787,7 +1815,7 @@ static void unstranger_relaxed(void* condNode) {
         const unsigned short* q = (const unsigned short*)((char*)g0 + OFF_IL2STR_CHARS);
         if (L > 0 && q[0] == 0x40) stranger = 1;  /* '@' */
     }
-    if (!stranger) { us_cache(pid, c); return; }  /* 本就不是陌生名：记下，别再查 */
+    if (!stranger) return;                        /* v142：不缓存"非@"——@ 可能在初始化稍后才写上来 */
 
     /* ⚠️ 手机端不能"清空"，必须"写模板真名"。
      * 实测（用户 2026-11-02 反馈，角色 20006 无名小村铁匠）：
@@ -1796,9 +1824,9 @@ static void unstranger_relaxed(void* condNode) {
      * 也就是两端的取名回落不一样：清空在 PC 上能拿到真名，在手机上只会退成 uName。
      * 所以这里照 v75 的做法，把模板的 surName / givenName 直接写进实例。 */
     void* tpl = *(void**)((char*)c + OFF_GCI_TEMPLATE);
-    if ((uintptr_t)tpl < 0x10000) { us_cache(pid, c); return; }
+    if ((uintptr_t)tpl < 0x10000) return;         /* v142：不缓存失败分支 */
     if (!obj_is_class(tpl, "CharacterPoolData") ||
-        *(int*)((char*)tpl + OFF_CPD_UID) != pid) { us_cache(pid, c); return; }
+        *(int*)((char*)tpl + OFF_CPD_UID) != pid) return;
 
     void* ts = *(void**)((char*)tpl + OFF_CPD_SURNAME);
     void* tg = *(void**)((char*)tpl + OFF_CPD_GIVENNAME);
@@ -1811,8 +1839,8 @@ static void unstranger_relaxed(void* condNode) {
     str_to_buf(g0, gb, sizeof(gb));
 
     if (!has_sur && !has_giv) {
-        /* 模板里也没有真姓真名（无名之辈）：保留原样，别把它退化成无名 */
-        us_cache(pid, c);
+        /* 模板里也没有真姓真名（无名之辈）：保留原样，别把它退化成无名。
+         * v142：这里也不再缓存 —— 失败分支一律不记，下次（播放时）还会再看一眼。 */
         if (g_us_log++ < 20)
             LOGI("[name] 放宽在队条件 uid=%d 模板无真名，保留陌生名 \"%s\"", pid, gb);
         return;

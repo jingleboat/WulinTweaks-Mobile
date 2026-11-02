@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v141"         /* v141：放宽名单支持门对级（图名:partnerID），并把两个展平跳过场景并入 */
+#define MOD_VER "v142"         /* v142：陌生名不在"非@"时缓存 + 剧情播放时按本图名单补一次 */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
