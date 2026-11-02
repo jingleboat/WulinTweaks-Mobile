@@ -249,8 +249,13 @@ typedef struct { int g0, g1; int pid; int both_story; int reg_n; int ex_start; i
 typedef struct { int ei; int old_tgt; int g1; } FLAT_UNDO;
 static FLAT_UNDO      g_undo[FLAT_MAX_UNDO];     /* 12 KB */
 static int            g_undo_n = 0;
-static unsigned char  g_reach_before[FLAT_MAX_NODES];   /* 改线前 Reach(g1) 并集 */
+static unsigned char  g_reach_before[FLAT_MAX_NODES];   /* 兼容保留（不再用于判定） */
 static unsigned char  g_tmp_reach[FLAT_MAX_NODES];      /* 临时位图 */
+/* v154：可达性守恒必须**按对**比较 —— v153 错在把“所有对 g1 可达集的并集”当作每对的门槛，
+ * 于是一对 g1 只要到不了别的对的内容就误判失败（实测 20+ 张图被误回滚，R10049-2 全灭）。
+ * 这里给每对存一份改线前的 Reach(g1) 位集：48 对 × 257 字节 ≈ 12 KB。 */
+#define FLAT_BITS ((FLAT_MAX_NODES + 7) / 8)
+static unsigned char  g_before_bits[FLAT_MAX_PAIRS][FLAT_BITS];
 static int            g_log_rollback = 0;
 
 static void*          g_nd[FLAT_MAX_NODES];      /* 节点指针 */
@@ -607,13 +612,14 @@ static void flatten_try_inner(void* any_node) {
     /* 记录改线前 Reach(g1) 的并集（用于第 ② 条），按对分别记太占内存，这里只记并集 */
     memset(g_reach_before, 0, (size_t)g_nnodes);
 
-    /* 预扫：先算“改线前 Reach(g1) 的并集”，必须在任何改线之前算，否则测到的已经是半改的图 */
-    memset(g_reach_before, 0, (size_t)g_nnodes);
+    /* 预扫：按对记录“改线前 Reach(g1)”，必须在任何改线之前算 */
+    memset(g_before_bits, 0, sizeof(g_before_bits));
     for (int k = 0; k < g_npairs; ++k) {
         FLAT_PAIR* p = &g_pair[k];
         if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION || p->ex_n == 0) continue;
         flat_mark_reach(p->g1, g_tmp_reach);
-        for (int i = 0; i < g_nnodes; ++i) if (g_tmp_reach[i]) g_reach_before[i] = 1;
+        for (int i = 0; i < g_nnodes; ++i)
+            if (g_tmp_reach[i]) g_before_bits[k][i >> 3] |= (unsigned char)(1u << (i & 7));
     }
 
     for (int k = 0; k < g_npairs; ++k) {
@@ -670,15 +676,15 @@ static void flatten_try_inner(void* any_node) {
         }
     }
     if (!rolled) {
-        /* Reach(g1) 并集必须仍在 —— 用每个 pair 的 g1 各算一次 */
-        for (int k = 0; k < g_npairs; ++k) {
+        /* 按对比较：第 k 对改线前的 Reach(g1) 必须仍是改线后的子集 */
+        for (int k = 0; k < g_npairs && !rolled; ++k) {
             FLAT_PAIR* p = &g_pair[k];
             if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION || p->ex_n == 0) continue;
-            if (p->g1 < 0 || p->g1 >= g_nnodes) continue;
             flat_mark_reach(p->g1, g_tmp_reach);
-            for (int i = 0; i < g_nnodes; ++i)
-                if (g_reach_before[i] && !g_tmp_reach[i]) { rolled = 1; break; }
-            if (rolled) break;
+            for (int i = 0; i < g_nnodes; ++i) {
+                if (!(g_before_bits[k][i >> 3] & (1u << (i & 7)))) continue;
+                if (!g_tmp_reach[i]) { rolled = 1; break; }
+            }
         }
     }
 
@@ -691,7 +697,7 @@ static void flatten_try_inner(void* any_node) {
         }
         g_flat_cond_n = wm_cond;
         g_flat_gate_n = wm_gate;
-        if (g_log_rollback++ < 20)
+        if (g_log_rollback++ < 200)
             LOGI("[flat] 图 %s 回滚：改线 %d 条后校验不通过（环或可达性），已全部还原",
                  unity_name(g, gb, sizeof(gb)), g_undo_n);
         expanded = 0; redirected = 0;
