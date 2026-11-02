@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v152"         /* v152：撤掉 play 日志内联钩子（闪退根因）；保留「取消 region 相交排除」 */
+#define MOD_VER "v153"         /* v153：展平事务化（改线→环检测/可达性→失败整体回滚）+ 去重表不可淘汰 + 重入保护 */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */

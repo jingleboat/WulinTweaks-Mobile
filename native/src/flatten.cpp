@@ -198,28 +198,60 @@ int flatten_cond_always_true(void* cond) {
 /* ================================================================ 图处理状态 */
 /* 处理过的图指针（环形）。通用规则下「任何图都要扫一次」，所以比原来大得多，
  * 否则指针一被挤出环形就会被反复重扫（每次都是几千次 il2cpp 调用）。 */
-static void* g_done[FLAT_DONE_MAX];
-static int g_done_n = 0;
-static int g_done_rr = 0;
-static int g_log_graph = 0;
-static int g_log_pair = 0;
+/* v153：处理过的图改为**不可淘汰**的开放寻址表。
+ * 原来 96 条环形表会被挤掉 → 同一张图被二次展开（实测「门对 15，展开 13」紧接着
+ * 「门对 15，展开 0（跳过 15）」）。表满时 fail-open：只报警不再登记 —— 重复处理
+ * 会因为算不出可展开的 region/exits 而全部跳过，无害。 */
+#define FLAT_DONE_TBL 2048
+static void* g_done_tbl[FLAT_DONE_TBL];        /* 16 KB */
+static int   g_done_used = 0, g_done_warned = 0;
+static int   g_log_graph = 0;
+static int   g_log_pair = 0;
 
+static unsigned done_hash(void* p) {
+    uintptr_t x = (uintptr_t)p; x ^= x >> 13; x *= 0x9E3779B1u; x ^= x >> 15;
+    return (unsigned)x & (FLAT_DONE_TBL - 1);
+}
 static int flat_done(void* g) {
-    for (int i = 0; i < g_done_n; ++i)
-        if (g_done[i] == g) return 1;
+    if ((uintptr_t)g < 0x10000) return 0;
+    unsigned h = done_hash(g);
+    for (int i = 0; i < 8; ++i) {
+        unsigned k = (h + i) & (FLAT_DONE_TBL - 1);
+        if (!g_done_tbl[k]) return 0;
+        if (g_done_tbl[k] == g) return 1;
+    }
     return 0;
 }
-
 static void flat_mark_done(void* g) {
     if ((uintptr_t)g < 0x10000) return;
-    g_done[g_done_rr] = g;
-    g_done_rr = (g_done_rr + 1) % FLAT_DONE_MAX;
-    if (g_done_n < FLAT_DONE_MAX) g_done_n++;
+    if (g_done_used >= FLAT_DONE_TBL * 3 / 4) {
+        if (!g_done_warned) {
+            g_done_warned = 1;
+            LOGI("[flat] 已处理图表已用 %d 条，后续不再登记（重复处理会全部跳过）", g_done_used);
+        }
+        return;
+    }
+    unsigned h = done_hash(g);
+    for (int i = 0; i < 8; ++i) {
+        unsigned k = (h + i) & (FLAT_DONE_TBL - 1);
+        if (!g_done_tbl[k]) { g_done_tbl[k] = g; g_done_used++; return; }
+        if (g_done_tbl[k] == g) return;
+    }
 }
 
 /* ================================================================ 单图工作区 */
 typedef struct { int src; int tgt; int slot; void* port; } FLAT_EDGE;
 typedef struct { int g0, g1; int pid; int both_story; int reg_n; int ex_start; int ex_n; } FLAT_PAIR;
+
+/* v153：改线事务日志。undo 上限 1024（实测单图最多 51 条改线，余量充足）；
+ * 超过上限 → 整图放弃展开，绝不留半改状态。 */
+#define FLAT_MAX_UNDO 1024
+typedef struct { int ei; int old_tgt; int g1; } FLAT_UNDO;
+static FLAT_UNDO      g_undo[FLAT_MAX_UNDO];     /* 12 KB */
+static int            g_undo_n = 0;
+static unsigned char  g_reach_before[FLAT_MAX_NODES];   /* 改线前 Reach(g1) 并集 */
+static unsigned char  g_tmp_reach[FLAT_MAX_NODES];      /* 临时位图 */
+static int            g_log_rollback = 0;
 
 static void*          g_nd[FLAT_MAX_NODES];      /* 节点指针 */
 static int            g_e0[FLAT_MAX_NODES];      /* 该节点第一条出边下标 */
@@ -258,6 +290,48 @@ static int hash_get(void* p) {
         if (g_hk[k] == p) return g_hv[k];
     }
     return -1;
+}
+
+/* ---- v153：两个迭代式图算法（绝不用递归，避免 2000+ 节点爆栈） ---- */
+
+/* 从下标 start 出发能到达的所有节点 → 写进 out（长度 g_nnodes） */
+static void flat_mark_reach(int start, unsigned char* out) {
+    static int stk[FLAT_MAX_NODES];
+    memset(out, 0, (size_t)g_nnodes);
+    if (start < 0 || start >= g_nnodes) return;
+    int sp = 0;
+    out[start] = 1;
+    stk[sp++] = start;
+    while (sp > 0) {
+        int c = stk[--sp];
+        for (int e = 0; e < g_ec[c]; ++e) {
+            int t = g_edge[g_e0[c] + e].tgt;
+            if (t < 0 || t >= g_nnodes || out[t]) continue;
+            out[t] = 1;
+            if (sp < FLAT_MAX_NODES) stk[sp++] = t;
+        }
+    }
+}
+
+/* src 能否到达 want（按当前 g_edge 镜像，含已改的边） */
+static int flat_reach(int src, int want, unsigned char* seen) {
+    static int stk[FLAT_MAX_NODES];
+    if (src < 0 || src >= g_nnodes || want < 0 || want >= g_nnodes) return 0;
+    memset(seen, 0, (size_t)g_nnodes);
+    int sp = 0;
+    seen[src] = 1;
+    stk[sp++] = src;
+    while (sp > 0) {
+        int c = stk[--sp];
+        if (c == want) return 1;
+        for (int e = 0; e < g_ec[c]; ++e) {
+            int t = g_edge[g_e0[c] + e].tgt;
+            if (t < 0 || t >= g_nnodes || seen[t]) continue;
+            seen[t] = 1;
+            if (sp < FLAT_MAX_NODES) stk[sp++] = t;
+        }
+    }
+    return 0;
 }
 
 /* 扫图：收节点 + 出边 + 门→条件节点 */
@@ -421,7 +495,7 @@ static int flatten_skip_pair(const char* gn, int pid) {
     return 0;
 }
 
-void flatten_try(void* any_node) {
+static void flatten_try_inner(void* any_node) {
     if (!F_FLAT) return;
     if ((uintptr_t)any_node < 0x10000) return;
 
@@ -519,18 +593,34 @@ void flatten_try(void* any_node) {
         }
     }
 
-    /* ---------------- ③ 逐对落地（先判冲突，再动手） ---------------- */
-    int expanded = 0, redirected = 0, skipped = 0, overlaps = 0;
+    /* ---------------- ③ 逐对落地（事务化：改线 → 校验 → 提交或全部回滚） ----------------
+     * v153：把“边算边改”改成“先全改、再校验、不合格整体回滚”。
+     * 校验两条（缺一不可，都会造成「剧情卡死」）：
+     *   ① 无新增环：新环必然经过某条被改的边 (u→g1)，所以只要检查 g1 能否回到 u；
+     *   ② 可达性守恒：改线后 Reach(g1) 必须仍然包含改线前的 Reach(g1)（汇合点不能丢）。
+     * 任一不过 → 按 journal 逆序还原所有边 + 回退条件/门登记水位。 */
+    int expanded = 0, redirected = 0, skipped = 0, overlaps = 0, rolled = 0;
+    g_undo_n = 0;
+    int wm_cond = g_flat_cond_n, wm_gate = g_flat_gate_n;
+    int commit_fail = 0;
+
+    /* 记录改线前 Reach(g1) 的并集（用于第 ② 条），按对分别记太占内存，这里只记并集 */
+    memset(g_reach_before, 0, (size_t)g_nnodes);
+
+    /* 预扫：先算“改线前 Reach(g1) 的并集”，必须在任何改线之前算，否则测到的已经是半改的图 */
+    memset(g_reach_before, 0, (size_t)g_nnodes);
+    for (int k = 0; k < g_npairs; ++k) {
+        FLAT_PAIR* p = &g_pair[k];
+        if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION || p->ex_n == 0) continue;
+        flat_mark_reach(p->g1, g_tmp_reach);
+        for (int i = 0; i < g_nnodes; ++i) if (g_tmp_reach[i]) g_reach_before[i] = 1;
+    }
+
     for (int k = 0; k < g_npairs; ++k) {
         FLAT_PAIR* p = &g_pair[k];
         if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION || p->ex_n == 0) { skipped++; continue; }
 
-        /* v151（用户指定）：**不再因为“与另一对门的 region 相交”而跳过**。
-         * 实测 R10049-2：10054 的 region 只有 1 个节点（R10049-2_3_2_2），却被 10063（8 节点）
-         * 完整包住 → 老规则两对都放弃 → 10054 的剧情永远不播。
-         * 而“让重叠部分只播一次”需要在每个重叠节点上做“已播过就跳过”的执行期标记，
-         * 代价和风险都远大于收益，所以这里只统计、不跳过：
-         * 两对都展开后，执行期天然只走一条路径，重叠节点不会被播两次。 */
+        /* v151（用户指定）：不再因为“与另一对门的 region 相交”而跳过，只计数 */
         int clash = 0;
         for (int q = 0; q < g_npairs && !clash; ++q) {
             if (q == k) continue;
@@ -541,33 +631,78 @@ void flatten_try(void* any_node) {
             for (int i = 0; i < g_nnodes; ++i)
                 if (ra[i] == 1 && rb[i] == 1) { clash = 1; break; }
         }
-        if (clash) overlaps++;            /* v151：只计数，不跳过 */
+        if (clash) overlaps++;
 
         int ok = 0, bad = 0;
         for (int e = 0; e < p->ex_n; ++e) {
-            FLAT_EDGE* ed = &g_edge[g_exit[p->ex_start + e]];
-            if (port_set_conn_node(ed->port, ed->slot, g_nd[p->g1])) ok++;
-            else bad++;
+            int ei = g_exit[p->ex_start + e];
+            FLAT_EDGE* ed = &g_edge[ei];
+            if (g_undo_n >= FLAT_MAX_UNDO) { commit_fail = 1; break; }
+            if (!port_set_conn_node(ed->port, ed->slot, g_nd[p->g1])) { commit_fail = 1; break; }
+            g_undo[g_undo_n].ei = ei;
+            g_undo[g_undo_n].old_tgt = ed->tgt;
+            g_undo[g_undo_n].g1 = p->g1;
+            g_undo_n++;
+            ed->tgt = p->g1;          /* 镜像到内存表，后面的 DFS 才看得到新边 */
+            ok++;
         }
         redirected += ok;
+        if (commit_fail) { rolled = 1; break; }
 
         flat_add_cond(g_cond[p->g0]);
         flat_add_cond(g_cond[p->g1]);
-        /* v87：门指针也记一份 —— hook_hold_check 用它整门判真（对齐 PC） */
         flat_add_gate(g_nd[p->g0]);
         flat_add_gate(g_nd[p->g1]);
 
-        /* 只登记姓名窗口（改名的时机由播放状态驱动，见 story_play_begin/end） */
-        if (F_STORY) relax_name_open(p->pid, g);
-
         expanded++;
-        if (g_log_pair < 300)   /* v149：逐对日志 60 → 300 */ {
+        if (g_log_pair < 300) {
             g_log_pair++;
             LOGI("[flat]   pid=%d (%s) 内容 %d 节点，改线 %d 条%s",
-                 p->pid, p->both_story ? "B 类" : "A 类", p->reg_n, ok,
-                 bad ? " ⚠部分失败" : "");
+                 p->pid, p->both_story ? "B 类" : "A 类", p->reg_n, ok, bad ? " ⚠部分失败" : "");
         }
     }
+
+    /* ---- 校验 ---- */
+    if (!rolled) {
+        for (int i = 0; i < g_undo_n; ++i) {
+            int s = g_edge[g_undo[i].ei].src;
+            if (flat_reach(g_undo[i].g1, s, g_tmp_reach)) { rolled = 1; break; }
+        }
+    }
+    if (!rolled) {
+        /* Reach(g1) 并集必须仍在 —— 用每个 pair 的 g1 各算一次 */
+        for (int k = 0; k < g_npairs; ++k) {
+            FLAT_PAIR* p = &g_pair[k];
+            if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION || p->ex_n == 0) continue;
+            if (p->g1 < 0 || p->g1 >= g_nnodes) continue;
+            flat_mark_reach(p->g1, g_tmp_reach);
+            for (int i = 0; i < g_nnodes; ++i)
+                if (g_reach_before[i] && !g_tmp_reach[i]) { rolled = 1; break; }
+            if (rolled) break;
+        }
+    }
+
+    if (rolled) {
+        /* 全部回滚：边 → 旧目标；条件/门登记 → 水位 */
+        for (int i = g_undo_n - 1; i >= 0; --i) {
+            FLAT_EDGE* ed = &g_edge[g_undo[i].ei];
+            port_set_conn_node(ed->port, ed->slot, g_nd[g_undo[i].old_tgt]);
+            ed->tgt = g_undo[i].old_tgt;
+        }
+        g_flat_cond_n = wm_cond;
+        g_flat_gate_n = wm_gate;
+        if (g_log_rollback++ < 20)
+            LOGI("[flat] 图 %s 回滚：改线 %d 条后校验不通过（环或可达性），已全部还原",
+                 unity_name(g, gb, sizeof(gb)), g_undo_n);
+        expanded = 0; redirected = 0;
+    } else if (F_STORY) {
+        for (int k = 0; k < g_npairs; ++k) {
+            FLAT_PAIR* p = &g_pair[k];
+            if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION || p->ex_n == 0) continue;
+            relax_name_open(p->pid, g);
+        }
+    }
+    g_undo_n = 0;
 
     flat_mark_done(g);
 
@@ -577,4 +712,15 @@ void flatten_try(void* any_node) {
              unity_name(g, gb, sizeof(gb)), g_nnodes, g_npairs, expanded, skipped, overlaps,
              redirected, g_flat_cond_n);
     }
+}
+
+/* v153：重入保护。条件判定会跑在加载线程（tombstone 里是 Loading.Preload），
+ * 而整个展平用的是一组静态暂存 —— 并发进入会互相踩。抢不到就直接放弃本次。 */
+static volatile int g_flat_busy = 0;
+
+void flatten_try(void* any_node) {
+    if (!F_FLAT) return;
+    if (__atomic_exchange_n(&g_flat_busy, 1, __ATOMIC_ACQ_REL)) return;
+    flatten_try_inner(any_node);
+    __atomic_store_n(&g_flat_busy, 0, __ATOMIC_RELEASE);
 }
