@@ -894,6 +894,11 @@ static int keep_original_for_uncached(void* condNode) {
 
     /* v171：门对没被展平接管（region=0 / 安全跳过）→ 一律按原版，不做放宽。
      * 否则宽松会把流程拐进该角色的支线，而那条支线没有改线接回主线。 */
+    if (!flatten_relax_allowed(condNode)) {
+        if (g_scene_log++ < 20)
+            LOGI("[team] 图 %s 该条件不属于门对 → 不放宽（v178）", gn);
+        return 1;
+    }
     if (flatten_relax_forbidden(condNode)) {
         if (g_scene_log++ < 20)
             LOGI("[team] 图 %s 该条件所属门对未被展平接管 → 不放宽（原版）", gn);

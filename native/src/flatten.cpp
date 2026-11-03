@@ -508,6 +508,24 @@ static void flat_apply_force(const char* gn, const int* pids, int n) {
     LOGI("[flat] 图 %s 仅强制放行 %d 道在队门（不改线）", gn, hit);
     g_log_graph++;
 }
+
+/* v178：只有「属于某个门对」的条件才允许放宽。
+ * 原因（实测）：R10005-11 里挂「大地图区域」的门，其条件链里含一个队友条件，
+ * 我们对那个队友节点放宽后，**整道门仍然通过**（链是“任一条真即过”），
+ * 于是同一段剧情被反复拉起（实测连播 3~4 遍）。收窄到“门对成员”即可避免。 */
+#define FLAT_RELAX_OK 2048
+static void* g_relax_ok[FLAT_RELAX_OK];
+static int   g_relax_ok_n = 0;
+static void relax_ok_add(void* c) {
+    if ((uintptr_t)c < 0x10000) return;
+    for (int i = 0; i < g_relax_ok_n; ++i) if (g_relax_ok[i] == c) return;
+    if (g_relax_ok_n < FLAT_RELAX_OK) g_relax_ok[g_relax_ok_n++] = c;
+}
+int flatten_relax_allowed(void* c) {
+    if ((uintptr_t)c < 0x10000) return 0;
+    for (int i = 0; i < g_relax_ok_n; ++i) if (g_relax_ok[i] == c) return 1;
+    return 0;
+}
 /* 扫图：收节点 + 出边 + 门→条件节点 */
 static int flat_build(void* g) {
     void* nodes = *(void**)((char*)g + OFF_GRAPH_NODES);
@@ -834,7 +852,16 @@ static void flatten_try_inner(void* any_node) {
         LOGI("[flat] 图 %s 按门对名单跳过 %d 对（partnerID 命中，其余照常展开）",
              gn, pair_skipped);
     }
-    if (g_npairs == 0) { flat_mark_done(g); return; }
+    if (g_npairs == 0) {
+        /* v178：图里没有门对时，允许放宽“门直接挂着的那个队友条件” */
+        for (int i = 0; i < g_nnodes; ++i) {
+            void* c = g_cond[i];
+            if ((uintptr_t)c < 0x10000) continue;
+            char cb[40];
+            if (is_story_cond(cls_name(c, cb, sizeof(cb)))) relax_ok_add(c);
+        }
+        flat_mark_done(g); return;
+    }
 
     /* ---------------- ② 每对算独占 region 与对外出口 ---------------- */
     for (int k = 0; k < g_npairs; ++k) {
@@ -972,6 +999,8 @@ static void flatten_try_inner(void* any_node) {
         flat_add_cond(g_cond[p->s]);
         flat_add_gate(g_nd[p->f]);
         flat_add_gate(g_nd[p->s]);
+        relax_ok_add(g_cond[p->f]);
+        relax_ok_add(g_cond[p->s]);
         /* v161：强制表登记的是 f/s，日志查询的也是 f/s —— 这里必须按 f/s 登记，
          * 否则 forced=Y 的门查不到 pid（v160 的 pid=0 就是这么来的）。
          * 侧别仍按 Negate 语义标注（Negate=0 = 在队侧）。 */

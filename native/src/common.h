@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v177"         /* v177：放宽只覆盖条件节点自身返回值，不再调基类（避免连带放行区域/标记门） */
+#define MOD_VER "v178"         /* v178：只有属于门对的条件才允许放宽（治重复播放） */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
@@ -52,7 +52,8 @@ int flatten_gate_forced(void* gate);
 int flatten_gate_pid(void* gate, int* in_team);
 const char* flatten_gate_cls(void* gate);
 const char* flat_node_name(void* nd);
-int flatten_relax_forbidden(void* cond);   /* v171：该条件所属门对未被展平接管 → 禁止放宽 */   /* v167 */
+int flatten_relax_forbidden(void* cond);
+int flatten_relax_allowed(void* cond);     /* v178：是否属于门对（允许放宽） */   /* v171：该条件所属门对未被展平接管 → 禁止放宽 */   /* v167 */
 int cond_pid_by_field(void* cond);      /* v163：按字段名读 partnerID */
 int cond_negate_by_field(void* cond);   /* v163：按字段名读 Negate */   /* v160：门的条件类名（只登记，不接管） */   /* v157：门 → (pid, 是否在队侧) */
 /* 只读体检：打印某 uid 的角色模板内容（姓/名/陌生时姓名/UName）与实例是否存在。 */
