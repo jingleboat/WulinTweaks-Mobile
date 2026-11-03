@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v176"         /* v176：删除 Hold 守卫，改为"门已通过过(times!=0)则本次不放宽" */
+#define MOD_VER "v177"         /* v177：放宽只覆盖条件节点自身返回值，不再调基类（避免连带放行区域/标记门） */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */

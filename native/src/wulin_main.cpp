@@ -1960,7 +1960,9 @@ static bool hook_check_partner(void* self, int io, void* line) {
         mark_relaxed(self);
         unstranger_relaxed(self);
         g_ev_relax_hits++;
-        return base_check_all(self, io, line);
+        /* v177（用户选 A）：**只覆盖本条件节点的返回值**，不再调基类。
+         * 调基类会把整条条件链一起放行（实测导致挂「大地图区域」的门也被放行 → 剧情播 3 遍）。 */
+        return true;
     }
     return r0;
     return orig_check_partner ? orig_check_partner(self, io, line) : false;
