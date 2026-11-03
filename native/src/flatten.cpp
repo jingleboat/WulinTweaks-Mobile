@@ -233,8 +233,7 @@ static void flat_mark_done(void* g) {
             g_done_warned = 1;
             LOGI("[flat] 已处理图表已用 %d 条，后续不再登记（重复处理会全部跳过）", g_done_used);
         }
-        return;
-    }
+        return;    }
     unsigned h = done_hash(g);
     for (int i = 0; i < 8; ++i) {
         unsigned k = (h + i) & (FLAT_DONE_TBL - 1);
@@ -352,7 +351,80 @@ static int flat_dbg_graph(const char* gn) {
     if (!gn) return 0;
     return strcmp(gn, "R10049-2") == 0 || strcmp(gn, "R10049-2-1") == 0;
 }
+
+/* ================================================================ v193：改线安全白名单
+ *
+ * 改线的本质是「把 region 的对外出口改指到不在队门」，**原目标被跳过**。
+ * 只要原目标写的是存档级状态，跳过它就影响别的图 —— 这是"局部改线影响全局触发"的唯一通道。
+ *
+ * 为什么用白名单而不是黑名单：剧情资产不止 ModEditor.zip，还有
+ * aa/config_assets_all.bundle 里的一大批（例如 R10136 一族 280 个资产）。
+ * 黑名单靠"列出所有写状态的节点名"，遇到没见过的类型就漏；白名单对未知类型默认拒绝，
+ * 天然覆盖全部资产包。
+ *
+ * 允许被跳过的只有「纯流程分支、不写任何状态」的节点：
+ *   · 流程判断（HoldNode 分支）
+ *   · 选项（玩家选择分支）
+ *   · 注释（不执行）
+ *   · StoryScenarioNode（「播放剧情」入口）：跳过 = 这一段不播，
+ *     与"原版 if/else 只播一段"语义一致，不写全局状态。
+ *
+ * 全量统计（PC 侧 tools/audit_safe_skip_whitelist.py，同一份剧情资产）：
+ *   902 个可改线门对 → 717 个（79%）出口只落在这些节点上，可改线；
+ *   185 个命中「时间流逝 / 添加标记 / 改变NPC关系值 / 设置自定义变量 …」→ 不改。 */
+static const char* k_safe_skip[] = {
+    "流程判断",
+    "选项",
+    "注释",
+};
+
+/* 这个节点被"跳过"是否安全 */
+static int flat_node_is_safe_skip(void* nd) {
+    if ((uintptr_t)nd < 0x10000) return 0;
+    char cb[96];
+    const char* cn = cls_name(nd, cb, sizeof(cb));
+    if (cn && strcmp(cn, "StoryScenarioNode") == 0) return 1;      /* 「播放剧情」 */
+    const char* nm = flat_node_name(nd);
+    if (!nm || !nm[0] || nm[0] == '?') return 0;                   /* 读不到名字 → 保守拒绝 */
+    for (size_t i = 0; i < sizeof(k_safe_skip) / sizeof(k_safe_skip[0]); ++i)
+        if (strcmp(nm, k_safe_skip[i]) == 0) return 1;
+    return 0;
+}
+
+/* 这一对的对外出口里，有没有落到"不安全的节点"上（不安全就不改这一对） */
+static int flat_pair_touches_global(FLAT_PAIR* p) {
+    for (int e = 0; e < p->ex_n; ++e) {
+        int ei = g_exit[p->ex_start + e];
+        if (ei < 0 || ei >= g_nedges) continue;
+        int t = g_edge[ei].tgt;
+        if (t < 0 || t >= g_nnodes) continue;
+        if (!flat_node_is_safe_skip(g_nd[t])) return 1;
+    }
+    return 0;
+}
+
 static const char* flat_dbg_name(void* nd) { return flat_node_name(nd); }
+
+/* v193：flat_build 失败的重试计数（与 PC 的 BranchFlatten._attempts 对称）。
+ * 只针对"结构异常"这一类偶发失败，条目数很少。 */
+#define FLAT_ATT_MAX  48
+#define FLAT_ATT_TRY  8
+static void*          g_att_g[FLAT_ATT_MAX];
+static unsigned char  g_att_n[FLAT_ATT_MAX];
+static int            g_att_used = 0;
+
+static int flat_att_inc(void* g) {
+    if ((uintptr_t)g < 0x10000) return FLAT_ATT_TRY;
+    for (int i = 0; i < g_att_used; ++i) {
+        if (g_att_g[i] == g) { if (g_att_n[i] < 255) g_att_n[i]++; return g_att_n[i]; }
+    }
+    if (g_att_used < FLAT_ATT_MAX) {
+        g_att_g[g_att_used] = g;
+        g_att_n[g_att_used] = 1;
+        return g_att_n[g_att_used++];
+    }
+    return FLAT_ATT_TRY;      /* 表满：当作用尽，回到旧行为 */
+}
 static void flat_dump_pair(const char* gn, int k) {
     FLAT_PAIR* p = &g_pair[k];
     int nf = (p->f >= 0 && p->f < g_nnodes) ? p->f : -1;
@@ -433,11 +505,13 @@ static const FLAT_CHAIN_T k_chains[] = {
     { "M5061-3",    k_chain_M5061_3,   2 },
     { "R10039-6",   k_chain_R10039_6,  2 },
 };
+__attribute__((unused))
 static int flat_chain_pids(const char* gn, const int** out) {
     for (size_t i = 0; i < sizeof(k_chains)/sizeof(k_chains[0]); ++i)
         if (strcmp(gn, k_chains[i].graph) == 0) { *out = k_chains[i].pids; return k_chains[i].n; }
     return 0;
 }
+__attribute__((unused))
 static void flat_apply_chain(const char* gn, const int* pids, int n) {
     int applied = 0;
     for (int i = 0; i + 1 < n; ++i) {
@@ -489,10 +563,29 @@ static void relax_ok_add(void* c) {
     for (int i = 0; i < g_relax_ok_n; ++i) if (g_relax_ok[i] == c) return;
     if (g_relax_ok_n < FLAT_RELAX_OK) g_relax_ok[g_relax_ok_n++] = c;
 }
+/* v192：**这道白名单和 PC 端不一致，是把手机版事件卡死的原因，改为与 PC 对齐放行。**
+ *
+ * 原来：条件不在 g_relax_ok 里 → 返回 0 → keep_original_for_uncached 不放宽。
+ * 而 g_relax_ok 只在"门对改线成功"和"整图没有门对"两处填充。于是：
+ *   · 一张图有门对、但那个门对改不了线（region 太大 / 无出口 / 链式接管）
+ *     → 它的条件进不了白名单 → **整张图的队友条件一律不放宽**。
+ *   实测日志（2026-11-04）：
+ *     [flat] 图 R10136-5：节点 86，门对 1，展开 0（跳过 1…），改线 0 条
+ *     [team] 图 R10136-5 该条件不属于门对 → 不放宽（v178）
+ *   · 不在扫描范围内的图（DLC 等）同理。
+ *
+ * PC 端的对应实现（BranchFlatten.RelaxAllowed）有个兼容口子：
+ *     if (!_processed.Contains(gn)) return true;
+ * 而 _processed 只在"节点数异常"和"无门对"时添加 —— 有门对的图永远进不去，
+ * 所以 **PC 那一道限制实际上从未生效**（形同放行）。
+ * 同一个规则，PC 实际放行、手机严格执行 → PC 能触发、手机不能。这就是两端差异。
+ *
+ * 现在手机端与 PC 实际行为对齐：放行。
+ * 防"拐进没有接回主线的死支线"那条本来该由 flatten_relax_forbidden（v171 黑名单）
+ * 负责，但它同样没被正确使用（no_relax_add 从未被调用），留待单独处理。 */
 int flatten_relax_allowed(void* c) {
     if ((uintptr_t)c < 0x10000) return 0;
-    for (int i = 0; i < g_relax_ok_n; ++i) if (g_relax_ok[i] == c) return 1;
-    return 0;
+    return 1;                       /* 与 PC 一致：不做白名单限制 */
 }
 /* 扫图：收节点 + 出边 + 门→条件节点 */
 static int flat_build(void* g) {
@@ -748,11 +841,25 @@ static void flatten_try_inner(void* any_node) {
         return;
     }
     if (!flat_build(g)) {
+        /* v193：不再"一次失败就永久放弃"。
+         * flat_build 失败 = 这一次节点表读不到（图指针失效 / 字段没解析到 → lcnt 返回 0）。
+         * 原来直接 flat_mark_done → 本次进程内这张图再也不处理，而且它的条件
+         * 一条也进不了 g_relax_ok（白名单）→ 整张图不放宽 → 表现为"某些事件有时不触发"。
+         * 现在记次数、给有限次重试，期间不登记 done。 */
+        int a = flat_att_inc(g);
+        if (a < FLAT_ATT_TRY) {
+            if (g_log_graph < FLAT_LOG_GRAPH) {
+                g_log_graph++;
+                LOGI("[flat] 图 %s 结构异常（节点 %d），本次跳过、下次重试（%d/%d）",
+                     unity_name(g, gb, sizeof(gb)), g_nnodes, a, FLAT_ATT_TRY);
+            }
+            return;
+        }
         flat_mark_done(g);
         if (g_log_graph < FLAT_LOG_GRAPH) {
             g_log_graph++;
-            LOGI("[flat] 图 %s 结构异常（节点 %d），跳过",
-                 unity_name(g, gb, sizeof(gb)), g_nnodes);
+            LOGI("[flat] 图 %s 结构异常（节点 %d），已重试 %d 次，放弃展开",
+                 unity_name(g, gb, sizeof(gb)), g_nnodes, a);
         }
         return;
     }
@@ -885,12 +992,30 @@ static void flatten_try_inner(void* any_node) {
         }
     }
 
-    /* v172：名单图的链式接续（按 pid 顺序把内容末端接到下一对在队门） */
+    /* v192（A/B 对照）：**只关掉名单式链式接续，其它逻辑一行不动。**
+     *
+     * 它是 v172~v174 在通用 region 规则之外单独加的 7 张图（M5061-5 / R10005-5 /
+     * R10049-2-1 / R10098-1 / Role5-10 / M5061-3 / R10039-6），走另一条路径：
+     *   · 不校验（无环检测、无可达性守恒）
+     *   · 不回滚（port_set_conn_node 失败就 continue）
+     *   · 只强制 G0（在队门），从不管 G1
+     *   · 把「内容末端的唯一出边」直接改指下一对的在队门，**原目标被丢弃**
+     *
+     * 离线复现（PC 侧 tools/audit_chain_patch.py，同一份剧情资产）被丢弃的原目标里：
+     *   R10005-5   内容末端 → 「时间流逝」        ← 剧情跳时间逻辑被整条砍掉
+     *   R10049-2-1 三条「添加标记」的出口 → 汇合点
+     *   R10039-6   「追加简介」的出口
+     *   Role5-10   死配置（图里找不到那两个 pid 的门对，强制门 0 个）
+     *
+     * 改成 1 即恢复。名单与 flat_apply_chain 都留着，方便逐张重新验证后再放开。 */
+#define FLAT_CHAIN_ENABLED 0
+#if FLAT_CHAIN_ENABLED
     {
         const int* cp = 0;
         int cn = flat_chain_pids(gn, &cp);
         if (cn >= 2 && g_npairs >= 2) flat_apply_chain(gn, cp, cn);
     }
+#endif
 
     /* v167：region 与 exits 都算完之后，按对输出审计明细（只对指定图） */
     if (flat_dbg_graph(gn))
@@ -904,6 +1029,7 @@ static void flatten_try_inner(void* any_node) {
      *   ② 可达性守恒：改线后 Reach(g1) 必须仍然包含改线前的 Reach(g1)（汇合点不能丢）。
      * 任一不过 → 按 journal 逆序还原所有边 + 回退条件/门登记水位。 */
     int expanded = 0, redirected = 0, skipped = 0, overlaps = 0, rolled = 0;
+    int skipped_global = 0;      /* v193：被「全局状态保护」放弃的对数 */
     g_undo_n = 0;
     int wm_cond = g_flat_cond_n, wm_gate = g_flat_gate_n;
     int commit_fail = 0;
@@ -927,6 +1053,11 @@ static void flatten_try_inner(void* any_node) {
          * 这里才是真正落地的位置：命中安全判据的对不改线、不登记强制门。 */
         if (p->skip) { skipped++; continue; }
         if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION || p->ex_n == 0) { skipped++; continue; }
+
+        /* v193：**全局状态保护** —— 见 k_global_state 上面的长注释。
+         * 这一对的对外出口如果落到「时间流逝 / 标记 / 变量 / 关系值 / 离队…」这类节点上，
+         * 改线就会把那一步跳过，连累无关剧情。直接放弃这一对（不改线、不强制门、不进白名单）。 */
+        if (flat_pair_touches_global(p)) { skipped_global++; continue; }
 
         /* v151（用户指定）：不再因为“与另一对门的 region 相交”而跳过，只计数 */
         int clash = 0;
@@ -1024,9 +1155,9 @@ static void flatten_try_inner(void* any_node) {
 
     if (g_log_graph < FLAT_LOG_GRAPH) {
         g_log_graph++;
-        LOGI("[flat] 图 %s：节点 %d，门对 %d，展开 %d（跳过 %d，含区域相交 %d），改线 %d 条，接管条件 %d 个（累计）",
+        LOGI("[flat] 图 %s：节点 %d，门对 %d，展开 %d（跳过 %d，含区域相交 %d、全局状态保护 %d），改线 %d 条，接管条件 %d 个（累计）",
              unity_name(g, gb, sizeof(gb)), g_nnodes, g_npairs, expanded, skipped, overlaps,
-             redirected, g_flat_cond_n);
+             skipped_global, redirected, g_flat_cond_n);
     }
 }
 
