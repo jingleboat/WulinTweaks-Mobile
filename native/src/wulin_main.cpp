@@ -2398,8 +2398,11 @@ static bool hook_enter_area(void* self) {    bool r = orig_enter_area ? orig_ent
  * 也就是说 16 这个数字是为了「绝对安全」随手取的小值，不是按真实剧情深度定的。
  * 但 ContinueArrange 是链式递归推进：一个节点推下一个，链长 = 剧情节点数。
  * 释法寺 Spe-2020 有 315 个节点，实测走到 16 层就被这里砍断 → 剧情停在半路、UI 不出。
- * 8 MB / 0xd0 ≈ 四万层，256 层只占 52 KB，与 PC 端（CA_MAX_DEPTH=256）对齐即可。 */
-#define CA_MAX_DEPTH 256
+ *
+ * v198：256 也不够 —— PC 端实测开场就连播 Role1-1 → Role1-2 → Role1-3 时撞顶被阻断，
+ * 剧情停在那一步。这里同步抬到 4096：
+ *   8 MB / 0xd0 ≈ 四万层，4096 层约占 1 MB，仍留 8 倍余量；真正的死循环远不止 4096 层。 */
+#define CA_MAX_DEPTH 4096
 static void (*orig_continue_arrange)(void* self, void* node, void* port) = nullptr;
 static __thread int g_ca_depth = 0;
 static int g_ca_warn = 0;
