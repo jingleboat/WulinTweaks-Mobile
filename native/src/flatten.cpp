@@ -248,6 +248,7 @@ typedef struct { int src; int tgt; int slot; void* port; } FLAT_EDGE;
 typedef struct { int g0, g1; int pid; int both_story; int reg_n; int ex_start; int ex_n;
                  int first_is_g0;   /* v156：父端口第一条连接是不是「在队」侧（决定引擎先问谁） */
                  int f, s;          /* v156：按连接顺序的 first / second */
+                 int skip;          /* v169：本对判定为不安全，整体跳过（不改线、不强制门） */
 } FLAT_PAIR;
 
 /* v153：改线事务日志。undo 上限 1024（实测单图最多 51 条改线，余量充足）；
@@ -707,6 +708,7 @@ static void flatten_try_inner(void* any_node) {
         p->f = a; p->s = b;
         p->first_is_g0 = (a == g0) ? 1 : 0;
         p->both_story = (s0 && s1);
+        p->skip = 0;
         p->reg_n = 0; p->ex_start = 0; p->ex_n = 0;
     }
 
@@ -720,6 +722,7 @@ static void flatten_try_inner(void* any_node) {
     /* ---------------- ② 每对算独占 region 与对外出口 ---------------- */
     for (int k = 0; k < g_npairs; ++k) {
         FLAT_PAIR* p = &g_pair[k];
+        if (p->skip) continue;          /* v169：不安全的对整体跳过 */
         p->reg_n = flat_region(k);
         p->ex_start = g_nexit;
         p->ex_n = 0;
@@ -729,6 +732,7 @@ static void flatten_try_inner(void* any_node) {
         }
 
         unsigned char* reg = g_reg[k];
+        int back_to_first = 0;
         for (int i = 0; i < g_nnodes && g_nexit < FLAT_MAX_EDGES; ++i) {
             if (reg[i] != 1) continue;
             for (int e = 0; e < g_ec[i]; ++e) {
@@ -738,7 +742,30 @@ static void flatten_try_inner(void* any_node) {
                 if (g_nexit >= FLAT_MAX_EDGES) break;
                 g_exit[g_nexit++] = ei;
                 p->ex_n++;
+                /* v169：出口边若指回 first 本身，说明这条"出口"其实是**入口**
+                 * （R10049-2-1 的 10098 就是这种：唯一 exit 的 old 目标正是门N0，
+                 *  改走之后门N0 变孤岛，她整块 29 节点内容永远不可达）。 */
+                if (g_edge[ei].tgt == p->f) back_to_first = 1;
             }
+        }
+    }
+
+    /* v169：安全检查 —— 任一条出口指回 first，或 region 过大 → 整对跳过（不改线、不强制门） */
+    for (int k = 0; k < g_npairs; ++k) {
+        FLAT_PAIR* p = &g_pair[k];
+        if (p->reg_n == 0) continue;
+        int bad = 0; const char* why = 0;
+        if (p->reg_n > 16) { bad = 1; why = "region 过大"; }
+        if (!bad) {
+            for (int e = 0; e < p->ex_n; ++e) {
+                int ei = g_exit[p->ex_start + e];
+                if (g_edge[ei].tgt == p->f) { bad = 1; why = "出口指回 first（入口被误当出口）"; break; }
+            }
+        }
+        if (bad) {
+            p->skip = 1;
+            if (flat_dbg_graph(gn) || g_log_graph < 8)
+                LOGI("[flat]   pid=%d 跳过展开：%s（region=%d，出口=%d）", p->pid, why, p->reg_n, p->ex_n);
         }
     }
 
