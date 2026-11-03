@@ -2407,10 +2407,13 @@ static bool hook_enter_area(void* self) {    bool r = orig_enter_area ? orig_ent
  * 但 ContinueArrange 是链式递归推进：一个节点推下一个，链长 = 剧情节点数。
  * 释法寺 Spe-2020 有 315 个节点，实测走到 16 层就被这里砍断 → 剧情停在半路、UI 不出。
  *
- * v198：256 也不够 —— PC 端实测开场就连播 Role1-1 → Role1-2 → Role1-3 时撞顶被阻断，
- * 剧情停在那一步。这里同步抬到 4096：
- *   8 MB / 0xd0 ≈ 四万层，4096 层约占 1 MB，仍留 8 倍余量；真正的死循环远不止 4096 层。 */
-#define CA_MAX_DEPTH 4096
+ * ⚠️ **绝对不要再往上抬。** v198 曾按「8 MB / 0xd0 ≈ 四万层」把它提到 4096，
+ * 结果实测**用消耗品直接闪退**，tombstone 里清清楚楚：
+ *     #472~#511  libwulin.so (hook_continue_arrange+324) ↔ libil2cpp.so 交替 500+ 层
+ * 栈溢出。那个换算错得离谱：每层除了 ContinueArrange 自己，还夹着
+ * il2cpp 的 CheckCondition / OnActive 等中间帧，真实占用是 0xd0 的几十倍，
+ * 8 MB 只够 500 层左右。256 是安全值，也是 v137（用户验证正常的那版）的值。 */
+#define CA_MAX_DEPTH 256
 static void (*orig_continue_arrange)(void* self, void* node, void* port) = nullptr;
 static __thread int g_ca_depth = 0;
 static int g_ca_warn = 0;
