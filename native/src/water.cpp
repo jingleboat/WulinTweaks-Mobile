@@ -270,19 +270,41 @@ static int uid_in_force_list(int uid) {
     return 0;
 }
 
-/* 在烤表里找离 (x,y) 最近的水域格（曼哈顿距离） */
-static int pick_water_cell(const WaterMaskEntry* e, int x, int y, int* ox, int* oy) {
-    if (!e || e->count <= 0) return 0;
-    int best = 0x7fffffff, bx = 0, by = 0;
-    for (int i = 0; i < e->count; ++i) {
-        int64_t k = e->keys[i];
-        int cx = (int)(uint32_t)(k & 0xffffffffu);
-        int cy = (int)(uint32_t)(k >> 32);
-        int d = abs(cx - x) + abs(cy - y);
-        if (d < best) { best = d; bx = cx; by = cy; }
-    }
-    *ox = bx; *oy = by;
-    return 1;
+/* ---- v180：504 落点改为「固定矩形内按 uid 哈希取整数」 ----------------------
+ * 用户指定的矩形 x[16,31] × y[23,36]：从烤表实测 **224 格全部是水面**、且单连通，
+ * 所以这里是纯粹的整数取模 —— 不需要「落空重试」，也不需要「退回最近水域格」兜底。
+ * 名单 24 个 uid 在该矩形内哈希后互不碰撞（实测算过：占用 24/24 格、0 冲突），
+ * 因此不会再像 v179 那样全部叠在同一个 (36,34) 上。
+ *
+ * 其余地图（2160 澡堂 / 2169 空表）**一律不做落点覆盖**，保持原版生成坐标，
+ * 只保留「水面可走 / 入水形态」两层伪造 —— v180 用户要求。
+ */
+#define SPAWN_RECT_MAP 504
+#define SPAWN_RECT_X0  16
+#define SPAWN_RECT_X1  31
+#define SPAWN_RECT_Y0  23
+#define SPAWN_RECT_Y1  36
+#define SPAWN_RECT_W   (SPAWN_RECT_X1 - SPAWN_RECT_X0 + 1)
+#define SPAWN_RECT_H   (SPAWN_RECT_Y1 - SPAWN_RECT_Y0 + 1)
+
+/* 只有这张图做落点覆盖；其它图（含 2160）原版生成坐标不动 */
+static int spawn_rect_map(int map) { return map == SPAWN_RECT_MAP; }
+
+/* Thomas Wang 32bit integer hash：同一 (uid, map, salt) 永远得到同一格 */
+static uint32_t spawn_hash(uint32_t a) {
+    a = (a ^ 61u) ^ (a >> 16);
+    a = a + (a << 3);
+    a = a ^ (a >> 4);
+    a = a * 0x27d4eb2du;
+    a = a ^ (a >> 15);
+    return a;
+}
+
+/* 取落点：矩形内的随机整数。salt=0 是生成坐标，其它值用于「游动目标」。 */
+static void pick_spawn_cell(int uid, int map, uint32_t salt, int* ox, int* oy) {
+    uint32_t h = spawn_hash((uint32_t)uid ^ (uint32_t)map ^ salt);
+    *ox = SPAWN_RECT_X0 + (int)(h % (uint32_t)SPAWN_RECT_W);
+    *oy = SPAWN_RECT_Y0 + (int)((h / (uint32_t)SPAWN_RECT_W) % (uint32_t)SPAWN_RECT_H);
 }
 
 #define RVA_GCI_SETPOS 0x2245B58   /* void SetPos(Vector3Int, bool=true) —— 直接调用（钩子跳板构造失败） */
@@ -300,6 +322,7 @@ static int g_mapid_hits = 0;
 static void hook_setmapid(void* self, int map_id, int also) {
     if (orig_setmapid) orig_setmapid(self, map_id, also);
     if (!FORCE_SWIM_IDS[0] || (uintptr_t)self < 0x10000) return;
+    if (!spawn_rect_map(map_id)) return;   /* v180：2160 等保持原版生成坐标 */
 
     int uid = *(int*)((char*)self + OFF_GCI_TPL_UID);
     int all = (strcmp(FORCE_SWIM_IDS, "all") == 0);
@@ -308,15 +331,12 @@ static void hook_setmapid(void* self, int map_id, int also) {
     const WaterMaskEntry* e = mask_for(map_id);
     if (!e || e->count <= 0) return;
 
-    /* 当前坐标：SetPos 之后游戏自己知道，这里只想判断"是否已经在某张表的水格里"，
-       保守做法——无条件挪到离 (0,0) 最近的入口不行，改成：先读 gci 里的位置字段不可靠，
-       所以直接给一个「按 map 取的中心水域格」= 表里排序后的中间那个，位置稳定且一定在水里。 */
-    int64_t k = e->keys[e->count / 2];
-    int wx = (int)(uint32_t)(k & 0xffffffffu);
-    int wy = (int)(uint32_t)(k >> 32);
+    /* v180：不再取「表中间那格」，改为在指定矩形内按 (uid,map) 哈希取整数 */
+    int wx = 0, wy = 0;
+    pick_spawn_cell(uid, map_id, 0, &wx, &wy);
 
     if (g_mapid_hits++ < 12)
-        LOGI("[water] SetMapId 强制定位 uid=%d map=%d -> 水域 (%d,%d)", uid, map_id, wx, wy);
+        LOGI("[water] SetMapId 落点 uid=%d map=%d -> (%d,%d) [矩形随机]", uid, map_id, wx, wy);
 
     if (orig_setpos)
         orig_setpos(self, ((uint64_t)(uint32_t)wx) | ((uint64_t)(uint32_t)wy << 32), 0, 1);
@@ -328,21 +348,23 @@ static void hook_setmapid(void* self, int map_id, int also) {
  */
 static int g_pos_hits = 0;
 
+/* ⚠️ 保留但未安装：SetPos 的跳板构造失败（日志实证），这里只留作记录，别再试一遍。
+ * 真要改坐标走 force_poll 里的 NpcTP。加 unused 是为了让编译告警干净。 */
+__attribute__((unused))
 static void hook_setpos(void* self, uint64_t xy, uint32_t z, int also) {
-    if (FORCE_SWIM_IDS[0] && (uintptr_t)self > 0x10000) {
+    if (FORCE_SWIM_IDS[0] && (uintptr_t)self > 0x10000 && spawn_rect_map(g_cur_map)) {
         int uid = *(int*)((char*)self + OFF_GCI_TPL_UID);
         if (uid_in_force_list(uid)) {
             const WaterMaskEntry* e = mask_for(g_cur_map);
             int x = vec_x(xy), y = vec_y(xy);
-            if (e && !mask_has(e, x, y)) {
+            if (e && e->count > 0 && !mask_has(e, x, y)) {
                 int ox = 0, oy = 0;
-                if (pick_water_cell(e, x, y, &ox, &oy)) {
-                    xy = ((uint64_t)(uint32_t)ox) | ((uint64_t)(uint32_t)oy << 32);
-                    z = 0;
-                    if (g_pos_hits++ < 12)
-                        LOGI("[water] SetPos 强制定位 uid=%d map=%d (%d,%d) -> 水域 (%d,%d)",
-                             uid, g_cur_map, x, y, ox, oy);
-                }
+                pick_spawn_cell(uid, g_cur_map, 0, &ox, &oy);
+                xy = ((uint64_t)(uint32_t)ox) | ((uint64_t)(uint32_t)oy << 32);
+                z = 0;
+                if (g_pos_hits++ < 12)
+                    LOGI("[water] SetPos 落点 uid=%d map=%d (%d,%d) -> (%d,%d) [矩形随机]",
+                         uid, g_cur_map, x, y, ox, oy);
             }
         }
     }
@@ -402,6 +424,7 @@ static void force_poll(void) {
     g_last_poll = now;
 
     int map = g_cur_map;
+    if (!spawn_rect_map(map)) return;   /* v180：2160 等不做轮询强制，坐标保持原版 */
     const WaterMaskEntry* e = mask_for(map);
     if (!e || e->count <= 0) return;
     void* m = gcm();
@@ -435,7 +458,7 @@ static void force_poll(void) {
         if (mask_has(e, x, y)) continue;                  /* 已经在水里 */
 
         int ox = 0, oy = 0;
-        if (!pick_water_cell(e, x, y, &ox, &oy)) continue;
+        pick_spawn_cell(uid, map, 0, &ox, &oy);   /* v180：矩形内哈希取整数（必为水面） */
         uint64_t cell_xy = ((uint64_t)(uint32_t)ox) | ((uint64_t)(uint32_t)oy << 32);
         void* role = role_of_uid(uid);
         if (role) {
@@ -446,15 +469,18 @@ static void force_poll(void) {
             typedef void (*fn_tp)(void*, uint64_t, uint32_t, void*);
             ((fn_tp)(g_base + RVA_ROLE_NPCTP))(role, cell_xy, 0, nullptr);
             if (e->count > 1 && (tick % 2) == 0) {
-                int64_t k2 = e->keys[(tick * 7) % e->count];
-                int tx = (int)(uint32_t)(k2 & 0xffffffffu);
-                int ty = (int)(uint32_t)(k2 >> 32);
+                /* v180：目标也限制在同一矩形内。旧代码用 e->keys[(tick*7)%count] 会跨到
+                 * 另一块水塘（504 有两块），A* 走不过去 → 停在原地播泡澡坐姿而非游泳。 */
+                int tx = 0, ty = 0;
+                pick_spawn_cell(uid, map, ((uint32_t)tick * 0x9E3779B9u) | 1u, &tx, &ty);
+                if (tx == ox && ty == oy)   /* 别把终点设成原点，那样不会动 */
+                    tx = SPAWN_RECT_X0 + (tx - SPAWN_RECT_X0 + 1) % SPAWN_RECT_W;
                 uint64_t tgt = ((uint64_t)(uint32_t)tx) | ((uint64_t)(uint32_t)ty << 32);
                 typedef void (*fn_end)(void*, uint64_t, uint32_t, void*);
                 ((fn_end)(g_base + RVA_ROLE_SETEND))(role, tgt, 0, nullptr);
             }
             if (g_force_hits2++ < 15)
-                LOGI("[water] 传送+游动 uid=%d map=%d (%d,%d) -> 水域 (%d,%d)", uid, map, x, y, ox, oy);
+                LOGI("[water] 传送+游动 uid=%d map=%d (%d,%d) -> (%d,%d) [矩形随机]", uid, map, x, y, ox, oy);
         } else {
             if (g_force_hits2++ < 15)
                 LOGI("[water] 找不到 Role uid=%d（不在场景里？）", uid);
@@ -469,6 +495,10 @@ void water_install() {
         LOGI("[water] 烤表 map=%d 水面格=%d（其它地图不干预）", WATER_MASKS[i].mapid, WATER_MASKS[i].count);
     }
     if (FORCE_SWIM_IDS[0]) LOGI("[water] ForceNPCSwim 名单 = \"%s\"（进入水域图时覆写配置读取）", FORCE_SWIM_IDS);
+    LOGI("[water] v180 落点：仅 map=%d 在 x[%d,%d] y[%d,%d] 内按 (uid,map) 哈希取随机整数"
+         "（%d 格全为水面）；其它图（含 2160）保持原版生成坐标",
+         SPAWN_RECT_MAP, SPAWN_RECT_X0, SPAWN_RECT_X1, SPAWN_RECT_Y0, SPAWN_RECT_Y1,
+         SPAWN_RECT_W * SPAWN_RECT_H);
 
     if (hook_install("MapManager.IsBlock", (void*)(g_base + RVA_MM_ISBLOCK),
                      (void*)hook_mm_isblock, (void**)&orig_mm_block))
