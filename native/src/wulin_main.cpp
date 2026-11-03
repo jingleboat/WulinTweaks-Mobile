@@ -761,19 +761,19 @@ static int keep_original_for_uncached(void* condNode);
  * 防循环能力不变：每个角色在每张图里仍然只放宽一次。 */
 #define RELAX_ONCE_N 256
 static char g_ro_name[RELAX_ONCE_N][64];
-static int  g_ro_pid[RELAX_ONCE_N];
+static void* g_ro_cond[RELAX_ONCE_N];      /* v176：额度按「条件节点」记账（原来按 pid） */
 static int  g_ro_i = 0;
 static int  g_ro_log = 0;
-static int relax_once_pid(const char* gn, int pid) {
+static int relax_once_cond(const char* gn, void* cond) {
     if (!gn || !gn[0]) return 1;
-    if (pid <= 0) pid = -1;
+    if ((uintptr_t)cond < 0x10000) return 1;
     for (int i = 0; i < RELAX_ONCE_N; ++i)
-        if (g_ro_name[i][0] && g_ro_pid[i] == pid && strcmp(g_ro_name[i], gn) == 0) {
-            if (g_ro_log++ < 20) LOGI("[relax] 图 %s pid=%d 已放宽过一次 -> 本次走原版", gn, pid);
+        if (g_ro_name[i][0] && g_ro_cond[i] == cond && strcmp(g_ro_name[i], gn) == 0) {
+            if (g_ro_log++ < 20) LOGI("[relax] 图 %s 条件 %p 已放宽过一次 -> 本次走原版", gn, cond);
             return 0;
         }
     snprintf(g_ro_name[g_ro_i], sizeof(g_ro_name[0]), "%s", gn);
-    g_ro_pid[g_ro_i] = pid;
+    g_ro_cond[g_ro_i] = cond;
     g_ro_i = (g_ro_i + 1) % RELAX_ONCE_N;
     return 1;
 }
@@ -788,7 +788,7 @@ static int relax_once_pid(const char* gn, int pid) {
  *    不适合做 16 字节内联补丁（跳板重定位踩到 PC 相对指令）。该钩子已撤掉，改走既有信号。 */
 static void relax_once_reset(void) {
     memset(g_ro_name, 0, sizeof(g_ro_name));
-    memset(g_ro_pid, 0, sizeof(g_ro_pid));
+    memset(g_ro_cond, 0, sizeof(g_ro_cond));
     g_ro_i = 0;
 }
 
@@ -879,7 +879,12 @@ static int is_bond_graph(void* g, const char* gn) {
     return hit;
 }
 
+/* v176：门已经通过过（times != 0）→ 本次一律不放宽。
+ * 用来替代被删掉的 Hold 守卫：守卫是“事后压制”（orig 已跑、times 已+1 再压回 false），
+ * 这里改成“事前禁止放宽”，既不重复播，也不会污染 times。 */
+static int g_no_relax_eval = 0;
 static int keep_original_for_uncached(void* condNode) {
+    if (g_no_relax_eval) return 1;      /* v176：本门已通过过 → 不放宽 */
     void* g = *(void**)((char*)condNode + OFF_NODE_GRAPH);
     if ((uintptr_t)g < 0x10000) return 0;
 
@@ -945,7 +950,7 @@ static int keep_original_for_uncached(void* condNode) {
          * 计数器，它只该限制"放宽"，不该限制"清名字"。否则同一张图（如 R10049-2 有 19 个
          * partnerID）第一个条件用掉那一次之后，后面所有角色都清不到（凌梦蝶就是这样漏掉的）。 */
         unstranger_apply_uid(pid, 0);
-        return relax_once_pid(gn, pid) ? 0 : 1;
+        return relax_once_cond(gn, condNode) ? 0 : 1;
     }
 
     if (is_bond_graph(g, gn)) {                      /* v95：结缘图跳过放宽 */
@@ -955,7 +960,7 @@ static int keep_original_for_uncached(void* condNode) {
     }
     if (never_joined(pid)) return 1;                 /* 本命角色：从未入队 → 不放宽，同样不清 */
     unstranger_apply_uid(pid, 0);                     /* ★ 只在"本来会放宽"时才清 */
-    return relax_once_pid(gn, pid) ? 0 : 1;                   /* 已入过队 → 只放宽一次 */
+    return relax_once_cond(gn, condNode) ? 0 : 1;                   /* 已入过队 → 只放宽一次 */
 }
 
 /* 每次「需要伙伴 / 有伙伴」条件判定 +1（按线程）。
@@ -2512,44 +2517,11 @@ static bool hold_check_core(void* self) {
     /* v165（用户要求）：判据从「队友条件被求值过」改成「本次确实发生过放宽」。
      * 旧判据的问题是：原版本来就为真（角色真在队）时也会被误判成
      * "放宽引起的重复触发"，于是把合法通过压掉 —— 实测导致鱼薇儿在队也不触发。 */
-    if (g_ev_relax_hits == 0) return r;
-    if ((uintptr_t)self < 0x10000) return r;
-
-    int times = *(int*)((char*)self + OFF_HOLD_TIMES);
-    if (times == 0) return true;          /* 还没成功过：这次正常放行 */
-
-    /* 三条例外（交给原版语义，不做压制）：
-     *   - R{角色id}- 图：条件已由 keep_original_for 精确判定，再压制会让「入队后」也只剩一次；
-     *   - 固定名单（主线/师父线/点名压制的图），同样按原版；
-     *   - 手动名单。 */
-    char gb[128];
-    void* g = *(void**)((char*)self + OFF_NODE_GRAPH);
-    const char* gn = ((uintptr_t)g > 0x10000) ? obj_name(g, gb, sizeof(gb)) : "?";
-    /* v108：去掉「R{角色id}- 整族豁免」——苗彩蝶(10005) 的 R10005-* 就是因此循环触发。 */
-    for (size_t i = 0; i < sizeof(k_fixed_original) / sizeof(k_fixed_original[0]); ++i)
-        if (strcmp(gn, k_fixed_original[i]) == 0) return true;
-    if (story_blacklisted(gn)) return true;
-
-    /* 其余：队友条件被放宽后，这个 Hold 已经通过过还要再过 → 压回 false。 */
-    if (g_hold_once_warn < 60) {          /* v150：8 → 60（诊断用） */
-        g_hold_once_warn++;
-        char nb[128];
-        /* v150 诊断字段：
-         *   门=<HoldNode 指针>            —— 用来和 [flat] 里登记的“接管门”对照
-         *   name=<节点名>                 —— XNode 节点名（一般是「流程判断」）
-         *   times                        —— checkSucessTimes
-         *   hits=before→after            —— 本次 CheckCondition 期间队友条件的判定次数增量
-         *   flatGate=Y/N                 —— 这个门是否被「剧情分支展开」接管过
-         *   step                         —— 交给「跳过之后去了哪」的后续分析（当前只占位） */
-        int rescued = flatten_gate_forced(self);
-        LOGI("[once] 图 %s 门=%p name=\"%s\" times=%d hits=%d→%d flatGate=%s → %s",
-             gn, self, obj_name(self, nb, sizeof(nb)), times,
-             before, g_team_cond_hits,
-             rescued ? "Y" : "N",
-             rescued ? "压制，但随后被展平强制放行救回（times 仍被真实 +1）" : "压制（本次真的判假）");
-    }
-    g_ev_guarded++;                          /* v164：本次判定被守卫压过 */
-    return false;
+    /* v176（用户指定）：**删除 Hold 守卫**。
+     * 原守卫是“事后压制”：orig 已执行、times 已 +1，再把结果压回 false ——
+     * 既冗余（额度已限次），又污染 times。
+     * 其职责改由入口处的 g_no_relax_eval（门已通过过 → 不放宽）承担。 */
+    return r;
 }
 
 /* v87：与 PC 的 Patch_FlattenGate 对齐 —— 被「分支展开」接管的门整门判真。
@@ -2610,7 +2582,9 @@ static bool hook_hold_check(void* self) {
     }
 
     g_ev_relax_hits = 0; g_ev_guarded = 0;
+    g_no_relax_eval = (t0 != 0);        /* v176：这道门以前通过过 → 本次不放宽 */
     bool r = hold_check_core(self);
+    g_no_relax_eval = 0;
     int t1 = *(int*)((char*)self + OFF_HOLD_TIMES);
     const char* src = g_ev_guarded ? "GUARDED"
                     : (r && g_ev_relax_hits ? "RELAXED" : (r ? "VANILLA" : "VANILLA_FAIL"));
