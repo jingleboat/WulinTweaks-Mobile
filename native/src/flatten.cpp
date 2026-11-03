@@ -478,6 +478,36 @@ static void flat_apply_chain(const char* gn, const int* pids, int n) {
         LOGI("[flat] 图 %s 链式接续：改线 %d 条（按名单 %d 个角色顺序）", gn, applied, n);
     g_log_graph++;
 }
+
+/* v175：「只强制、不改线」模式。
+ * 适用图的结构：某角色在队门 → 中间一道无条件门 → 下一角色的门对（天然已成链）。
+ * 这类图不需要改线，只要把每个角色的「在队门」强制放行，流程自己会往下一位走。 */
+static const int k_force_M2155_6[]  = { 10009,10015,10018,10022,10025,10045,10050,10056,10064,10076,10084,10092,10094,20025 };
+static const int k_force_Role5_15_2[] = { 10001,10006,10009,10015,10018,10023,10025,10033,10037,10045,10050,10084,10090,10092,20001 };
+static const FLAT_CHAIN_T k_forces[] = {
+    { "M2155-6",    k_force_M2155_6,   14 },
+    { "Role5-15-2", k_force_Role5_15_2, 15 },
+};
+static int flat_force_pids(const char* gn, const int** out) {
+    for (size_t i = 0; i < sizeof(k_forces)/sizeof(k_forces[0]); ++i)
+        if (strcmp(gn, k_forces[i].graph) == 0) { *out = k_forces[i].pids; return k_forces[i].n; }
+    return 0;
+}
+static void flat_apply_force(const char* gn, const int* pids, int n) {
+    int hit = 0;
+    for (int i = 0; i < n; ++i) {
+        for (int k = 0; k < g_npairs; ++k) {
+            if (g_pair[k].pid != pids[i]) continue;
+            flat_add_gate(g_nd[g_pair[k].f]);
+            flat_add_cond(g_cond[g_pair[k].f]);
+            g_pair[k].skip = 1;
+            hit++;
+            break;
+        }
+    }
+    LOGI("[flat] 图 %s 仅强制放行 %d 道在队门（不改线）", gn, hit);
+    g_log_graph++;
+}
 /* 扫图：收节点 + 出边 + 门→条件节点 */
 static int flat_build(void* g) {
     void* nodes = *(void**)((char*)g + OFF_GRAPH_NODES);
@@ -857,6 +887,13 @@ static void flatten_try_inner(void* any_node) {
             if (flat_dbg_graph(gn) || g_log_graph < 8)
                 LOGI("[flat]   pid=%d 跳过展开：%s（region=%d，出口=%d）", p->pid, why, p->reg_n, p->ex_n);
         }
+    }
+
+    /* v175：仅强制放行的名单图 */
+    {
+        const int* fp = 0;
+        int fn = flat_force_pids(gn, &fp);
+        if (fn > 0 && g_npairs > 0) flat_apply_force(gn, fp, fn);
     }
 
     /* v172：名单图的链式接续（按 pid 顺序把内容末端接到下一对在队门） */

@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v174"         /* v174：链式表扩到 7 张图（新增 Role5-10 / M5061-3 / R10039-6） */
+#define MOD_VER "v175"         /* v175：新增"仅强制放行"模式（M2155-6 / Role5-15-2） */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
