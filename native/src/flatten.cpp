@@ -420,11 +420,18 @@ static const int k_chain_M5061_5[]   = { 10008, 10018, 10086, 10088, 10067, 1005
 static const int k_chain_R10005_5[]  = { 10061, 10098 };
 static const int k_chain_10049_2_1[] = { 10061, 10075, 10052, 10098 };
 static const int k_chain_R10098_1[]  = { 10075, 10005 };
+/* v174：逐张分析后新增（School-2030-2 / R10007-4 跳过；M2155-6 / Role5-15-2 暂缓） */
+static const int k_chain_Role5_10[]  = { 10035, 10036 };
+static const int k_chain_M5061_3[]   = { 10005, 10098 };
+static const int k_chain_R10039_6[]  = { 20022, 10064 };
 static const FLAT_CHAIN_T k_chains[] = {
     { "M5061-5",    k_chain_M5061_5,   6 },
     { "R10005-5",   k_chain_R10005_5,  2 },
     { "R10049-2-1", k_chain_10049_2_1, 4 },
     { "R10098-1",   k_chain_R10098_1,  2 },
+    { "Role5-10",   k_chain_Role5_10,  2 },
+    { "M5061-3",    k_chain_M5061_3,   2 },
+    { "R10039-6",   k_chain_R10039_6,  2 },
 };
 static int flat_chain_pids(const char* gn, const int** out) {
     for (size_t i = 0; i < sizeof(k_chains)/sizeof(k_chains[0]); ++i)
