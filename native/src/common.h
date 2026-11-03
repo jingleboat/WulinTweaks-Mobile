@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v172"         /* v172：R10049-2-1 链式接续补丁（四人依次播，保留添加标记） */
+#define MOD_VER "v173"         /* v173：链式表扩到 4 张图（M5061-5 / R10005-5 / R10049-2-1 / R10098-1） */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */

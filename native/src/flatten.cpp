@@ -415,9 +415,16 @@ int flatten_relax_forbidden(void* c) {
  * 只对名单内的图生效；不接回本对 N1，因此不会成环（离线 41 张图已校验）。
  * 保留「添加标记」等纯副作用节点：改的是它们的出口，而不是场景的出口。 */
 typedef struct { const char* graph; const int* pids; int n; } FLAT_CHAIN_T;
+/* v173：离线校验通过的 4 张图（顺序由场景编号推出，环检测通过） */
+static const int k_chain_M5061_5[]   = { 10008, 10018, 10086, 10088, 10067, 10053 };
+static const int k_chain_R10005_5[]  = { 10061, 10098 };
 static const int k_chain_10049_2_1[] = { 10061, 10075, 10052, 10098 };
+static const int k_chain_R10098_1[]  = { 10075, 10005 };
 static const FLAT_CHAIN_T k_chains[] = {
+    { "M5061-5",    k_chain_M5061_5,   6 },
+    { "R10005-5",   k_chain_R10005_5,  2 },
     { "R10049-2-1", k_chain_10049_2_1, 4 },
+    { "R10098-1",   k_chain_R10098_1,  2 },
 };
 static int flat_chain_pids(const char* gn, const int** out) {
     for (size_t i = 0; i < sizeof(k_chains)/sizeof(k_chains[0]); ++i)
