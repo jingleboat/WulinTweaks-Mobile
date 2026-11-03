@@ -346,6 +346,50 @@ static int flat_reach(int src, int want, unsigned char* seen) {
     return 0;
 }
 
+/* v167：逐对审计日志（只对指定图开启，默认 R10049-2 / R10049-2-1） */
+static int flat_dbg_graph(const char* gn) {
+    if (!gn) return 0;
+    return strcmp(gn, "R10049-2") == 0 || strcmp(gn, "R10049-2-1") == 0;
+}
+static const char* flat_dbg_name(void* nd) { return flat_node_name(nd); }
+static void flat_dump_pair(const char* gn, int k) {
+    FLAT_PAIR* p = &g_pair[k];
+    int nf = (p->f >= 0 && p->f < g_nnodes) ? p->f : -1;
+    int ns = (p->s >= 0 && p->s < g_nnodes) ? p->s : -1;
+    LOGI("[flat-pair] 图=%s 序=%d pid=%d", gn, k, p->pid);
+    LOGI("    first=%p(%s) neg=%d  second=%p(%s) neg=%d",
+         nf >= 0 ? g_nd[nf] : 0, nf >= 0 ? flat_dbg_name(g_nd[nf]) : "-",
+         (p->f == p->g0) ? 0 : 1,
+         ns >= 0 ? g_nd[ns] : 0, ns >= 0 ? flat_dbg_name(g_nd[ns]) : "-",
+         (p->s == p->g0) ? 0 : 1);
+    if (nf >= 0) {
+        LOGI("    first 出边 %d 条:", g_ec[nf]);
+        for (int i = 0; i < g_ec[nf] && i < 6; ++i) {
+            FLAT_EDGE* e = &g_edge[g_e0[nf] + i];
+            LOGI("      [%d] slot=%d → %p(%s)", i, e->slot,
+                 g_nd[e->tgt], flat_dbg_name(g_nd[e->tgt]));
+        }
+    }
+    LOGI("    region=%d 节点:", p->reg_n);
+    if (k < FLAT_MAX_PAIRS) {
+        int shown = 0;
+        for (int i = 0; i < g_nnodes && shown < 10; ++i)
+            if (g_reg[k][i] == 1) {
+                LOGI("      %p(%s)", g_nd[i], flat_dbg_name(g_nd[i]));
+                shown++;
+            }
+        if (p->reg_n > shown) LOGI("      …（其余 %d 个省略）", p->reg_n - shown);
+    }
+    LOGI("    exits=%d:", p->ex_n);
+    for (int e = 0; e < p->ex_n && e < 10; ++e) {
+        int ei = g_exit[p->ex_start + e];
+        FLAT_EDGE* ed = &g_edge[ei];
+        LOGI("      [%d] from=%p(%s) slot=%d old→%p(%s) new→%p",
+             e, g_nd[ed->src], flat_dbg_name(g_nd[ed->src]), ed->slot,
+             g_nd[ed->tgt], flat_dbg_name(g_nd[ed->tgt]), g_nd[p->s]);
+    }
+}
+
 /* 扫图：收节点 + 出边 + 门→条件节点 */
 static int flat_build(void* g) {
     void* nodes = *(void**)((char*)g + OFF_GRAPH_NODES);
@@ -611,7 +655,8 @@ static void flatten_try_inner(void* any_node) {
 
     gate_info_register_all(gn);          /* v160：只登记不接管 */
 
-    /* ---------------- ① 找互补门对 ---------------- */
+    
+/* ---------------- ① 找互补门对 ---------------- */
     g_npairs = 0;
     int pair_skipped = 0;
     for (int i = 0; i < g_nnodes && g_npairs < FLAT_MAX_PAIRS; ++i) {
@@ -678,7 +723,10 @@ static void flatten_try_inner(void* any_node) {
         p->reg_n = flat_region(k);
         p->ex_start = g_nexit;
         p->ex_n = 0;
-        if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION) continue;
+        if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION) {
+            if (flat_dbg_graph(gn)) LOGI("[flat-pair] 图=%s 序=%d pid=%d region=%d（跳过）", gn, k, p->pid, p->reg_n);
+            continue;
+        }
 
         unsigned char* reg = g_reg[k];
         for (int i = 0; i < g_nnodes && g_nexit < FLAT_MAX_EDGES; ++i) {

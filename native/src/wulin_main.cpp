@@ -794,6 +794,7 @@ static void relax_once_reset(void) {
 
 /* 带 TTL 缓存的入口：条件检查是热路径，若每次读图名 + 调 GetCharacter 会卡。
  * 入队状态会变，所以 TTL 3 秒，不能永久缓存。 */
+const char* flat_node_name(void* nd) { static char b[64]; if ((uintptr_t)nd < 0x10000) return "(null)"; return obj_name(nd, b, sizeof(b)); }
 static int keep_original_for(void* condNode) {
     if ((uintptr_t)condNode < 0x10000) return 0;
 

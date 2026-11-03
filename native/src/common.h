@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v166"         /* v166：清陌生名改为"播放期间门通过即清"（不再依赖放宽决策，补回 v164 的漏清） */
+#define MOD_VER "v167"         /* v167：新增 [flat-pair] 逐对审计日志（仅 R10049-2 / R10049-2-1） */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
@@ -51,6 +51,7 @@ int flatten_cond_always_true(void* cond);
 int flatten_gate_forced(void* gate);
 int flatten_gate_pid(void* gate, int* in_team);
 const char* flatten_gate_cls(void* gate);
+const char* flat_node_name(void* nd);   /* v167 */
 int cond_pid_by_field(void* cond);      /* v163：按字段名读 partnerID */
 int cond_negate_by_field(void* cond);   /* v163：按字段名读 Negate */   /* v160：门的条件类名（只登记，不接管） */   /* v157：门 → (pid, 是否在队侧) */
 /* 只读体检：打印某 uid 的角色模板内容（姓/名/陌生时姓名/UName）与实例是否存在。 */
