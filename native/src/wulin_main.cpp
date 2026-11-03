@@ -1982,12 +1982,20 @@ static bool hook_check_partner(void* self, int io, void* line) {
         mark_relaxed(self);
         unstranger_relaxed(self);
         g_ev_relax_hits++;
-        /* v177（用户选 A）：**只覆盖本条件节点的返回值**，不再调基类。
-         * 调基类会把整条条件链一起放行（实测导致挂「大地图区域」的门也被放行 → 剧情播 3 遍）。 */
-        return true;
+        /* v199：**改回 v137 的做法 —— 放宽队友条件后返回基类判定的结果，不是直接 true。**
+         *
+         * v177 曾经改成 `return true`，理由是"调基类会把整条条件链一起放行，导致剧情播 3 遍"。
+         * 但那个改动把**同一道门上的其它条件**也一起跳过了：
+         *   开场剧情的门同时挂着「队友在队」和「经过 3 时辰」，
+         *   v177 之后队友条件一放宽就 return true → 时辰根本没被检查 →
+         *   门在不该通过时通过、走错分支、times 被消耗 → 真正到时辰反而不播。
+         * 这就是用户报的「开场没触发」。
+         *
+         * v137 的正确语义：只丢掉「队友在队」这一条，其余条件照检 —— 由基类完成。
+         * 若再出现"播 3 遍"，那也是基类之外的问题，不该靠跳过其它条件来掩盖。 */
+        return base_check_all(self, io, line);
     }
     return r0;
-    return orig_check_partner ? orig_check_partner(self, io, line) : false;
 }
 
 /* ---- 伙伴邀请/离队：离队容错（v50） --------------------------------------
