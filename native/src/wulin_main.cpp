@@ -55,13 +55,13 @@ volatile int F_TRUEMAP = 0;  /* v127：大地图「真写进存档」—— 默�
 volatile int F_MAP = 0;     /* v125：默认关（只改显示层，会让「判断大地图图标显示」这类剧情门永久卡死） */
 volatile int F_CAB = 0;     /* v125：默认关（同上，马车图标） */
 volatile int F_STORY = 1;   /* v44 起默认开（此前是 0，每次启动要手动点） */
-volatile int F_FLAT = 0;    /* v194：**默认关闭**（v65 起一直是默认开）。
-                             * 它是改剧情**连线**的操作，而改线不是原子的：逐条 RedirectEdge 改到一半时，
-                             * 引擎可能正好在走这张图，读到一半新一半旧的连线 —— 实测表现是
-                             * 「同一段剧情有时正常触发、有时完全不触发」（初始剧情尤其明显）。
-                             * 这个竞态没法靠校验消除，只有不改线才能避免。
-                             * 保护措施（只放行"原目标是纯流程分支"的改线，717/902 门对可展开）已就位，
-                             * 但竞态与放行范围无关。需要时在面板第 8 行手动打开。 */
+volatile int F_FLAT = 1;    /* v194：剧情分支展开，默认开（恢复 v65 的行为）。
+                             * 只走**通用 region 规则**：只放行「原目标是纯流程分支」的改线
+                             * （流程判断 / 选项 / 注释 / 播放剧情），全量 717/902 = 79% 门对可展开；
+                             * 原目标是「时间流逝 / 标记 / 变量 / 人物数据」的一律不改线。
+                             * 名单式**链式接续已整段停用**（FLAT_CHAIN_ENABLED 0）—— 那 7 张图会砍掉
+                             * 时间流逝等收尾节点，是「开了分支展开后无关剧情不触发」的成因，
+                             * 与本开关无关。 */
 volatile int F_WATER = 1;
 
 fn_i2c_get A_domain_get = nullptr;
@@ -888,7 +888,16 @@ static int is_bond_graph(void* g, const char* gn) {
 /* v176：门已经通过过（times != 0）→ 本次一律不放宽。
  * 用来替代被删掉的 Hold 守卫：守卫是“事后压制”（orig 已跑、times 已+1 再压回 false），
  * 这里改成“事前禁止放宽”，既不重复播，也不会污染 times。 */
-static int g_no_relax_eval = 0;
+/* v197：**递归安全**。这两个变量是「本次门判定」的上下文，而 hook_hold_check 是递归的 ——
+ * hold_check_core 里调 orig_hold_check，原版 CheckCondition 会推进剧情、进而判定下一个门，
+ * 又进 hook_hold_check。原来是全局 static int：
+ *     外层 g_no_relax_eval = (t0 != 0);
+ *           → 内层递归重新赋值、再清 0
+ *     外层 hold_check_core 返回后再读 g_no_relax_eval —— 已经是被内层踩过的值
+ * 结果就是「同一段剧情，跑得深就跑飞、跑得浅就正常」，也就是用户报的
+ * 「有时可触发有时不行」。
+ * 改成 __thread + 保存/恢复（见 hook_hold_check），嵌套再多也不互相污染。 */
+static __thread int g_no_relax_eval = 0;
 static int keep_original_for_uncached(void* condNode) {
     if (g_no_relax_eval) return 1;      /* v176：本门已通过过 → 不放宽 */
     void* g = *(void**)((char*)condNode + OFF_NODE_GRAPH);
@@ -1943,8 +1952,10 @@ int cond_negate_by_field(void* cond) {
 }
 
 /* v164：本次判定里「放宽参与了几次」「有没有被守卫压过」——用于 [gate] 的源标记 */
-static int g_ev_relax_hits = 0;
-static int g_ev_guarded = 0;
+/* v197：同样改成 __thread —— 它们是"本次门判定"的观测计数，递归时也会互相覆盖。
+ * 只影响 [gate] 日志里的来源标记（RELAXED/GUARDED），不影响判定结果，但一起改干净。 */
+static __thread int g_ev_relax_hits = 0;
+static __thread int g_ev_guarded = 0;
 
 static bool hook_check_joined(void* self, int io, void* line) {
     g_team_cond_hits++;
@@ -2594,13 +2605,26 @@ static bool hook_hold_check(void* self) {
         return true;
     }
 
+    /* v197：**保存 / 恢复**，不是直接清 0。
+     * hook_hold_check 是递归的（orig_hold_check 会推进剧情、再判定下一个门），
+     * 直接清 0 会把外层的状态冲掉；恢复成进入前的值才能嵌套安全。 */
+    int saved_no_relax = g_no_relax_eval;
+    int saved_relax_hits = g_ev_relax_hits;
+    int saved_guarded = g_ev_guarded;
+
     g_ev_relax_hits = 0; g_ev_guarded = 0;
     g_no_relax_eval = (t0 != 0);        /* v176：这道门以前通过过 → 本次不放宽 */
     bool r = hold_check_core(self);
-    g_no_relax_eval = 0;
+    int my_relax_hits = g_ev_relax_hits;
+    int my_guarded = g_ev_guarded;
+
+    g_no_relax_eval = saved_no_relax;              /* ← 恢复，不是清零 */
+    g_ev_relax_hits = saved_relax_hits;
+    g_ev_guarded = saved_guarded;
+
     int t1 = *(int*)((char*)self + OFF_HOLD_TIMES);
-    const char* src = g_ev_guarded ? "GUARDED"
-                    : (r && g_ev_relax_hits ? "RELAXED" : (r ? "VANILLA" : "VANILLA_FAIL"));
+    const char* src = my_guarded ? "GUARDED"
+                    : (r && my_relax_hits ? "RELAXED" : (r ? "VANILLA" : "VANILLA_FAIL"));
     gate_trace(self, 0, r ? 1 : 0, src, t0, t1);
     /* v166（用户要求）：**清陌生名应该由"剧情真的在播"驱动**，而不是搭在放宽决策上。
      * 规则：播放期间，任何与角色相关的门通过 → 清该角色的 '@' 陌生名。
