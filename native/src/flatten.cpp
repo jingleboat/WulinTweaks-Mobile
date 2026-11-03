@@ -410,6 +410,60 @@ int flatten_relax_forbidden(void* c) {
     for (int i = 0; i < g_norelax_n; ++i) if (g_norelax[i] == c) return 1;
     return 0;
 }
+
+/* v172：链式接续补丁表（按 pid 顺序接「内容末端 → 下一对在队门」）。
+ * 只对名单内的图生效；不接回本对 N1，因此不会成环（离线 41 张图已校验）。
+ * 保留「添加标记」等纯副作用节点：改的是它们的出口，而不是场景的出口。 */
+typedef struct { const char* graph; const int* pids; int n; } FLAT_CHAIN_T;
+static const int k_chain_10049_2_1[] = { 10061, 10075, 10052, 10098 };
+static const FLAT_CHAIN_T k_chains[] = {
+    { "R10049-2-1", k_chain_10049_2_1, 4 },
+};
+static int flat_chain_pids(const char* gn, const int** out) {
+    for (size_t i = 0; i < sizeof(k_chains)/sizeof(k_chains[0]); ++i)
+        if (strcmp(gn, k_chains[i].graph) == 0) { *out = k_chains[i].pids; return k_chains[i].n; }
+    return 0;
+}
+static void flat_apply_chain(const char* gn, const int* pids, int n) {
+    int applied = 0;
+    for (int i = 0; i + 1 < n; ++i) {
+        int fi = -1, ni = -1;
+        for (int k = 0; k < g_npairs; ++k) {
+            if (g_pair[k].pid == pids[i])   fi = k;
+            if (g_pair[k].pid == pids[i+1]) ni = k;
+        }
+        if (fi < 0 || ni < 0) continue;
+        FLAT_PAIR* p = &g_pair[fi];
+        FLAT_PAIR* q = &g_pair[ni];
+        int f = p->f;
+        if (f < 0 || g_ec[f] < 1) continue;
+        int scene = g_edge[g_e0[f]].tgt;
+        if (scene < 0 || scene >= g_nnodes || g_ec[scene] < 1) continue;
+        int src = scene;
+        int tgt = g_edge[g_e0[scene]].tgt;
+        /* 若场景出口是「添加标记」这类单出口副作用节点，则改它的出口，保留它执行 */
+        if (tgt >= 0 && tgt < g_nnodes && g_ec[tgt] == 1) {
+            const char* n2 = flat_dbg_name(g_nd[tgt]);
+            if (n2 && (strcmp(n2, "添加标记") == 0 || strcmp(n2, "追加简介") == 0)) {
+                src = tgt;
+            }
+        }
+        if (src < 0 || g_ec[src] < 1) continue;
+        FLAT_EDGE* ed = &g_edge[g_e0[src]];
+        void* newt = g_nd[q->f];
+        if (port_set_conn_node(ed->port, ed->slot, newt)) {
+            ed->tgt = q->f;
+            applied++;
+        }
+        /* 强制放行两端在队门 */
+        flat_add_gate(g_nd[p->f]);  flat_add_cond(g_cond[p->f]);
+        flat_add_gate(g_nd[q->f]);  flat_add_cond(g_cond[q->f]);
+        p->skip = 1; q->skip = 1;
+    }
+    if (applied || g_log_graph < 8)
+        LOGI("[flat] 图 %s 链式接续：改线 %d 条（按名单 %d 个角色顺序）", gn, applied, n);
+    g_log_graph++;
+}
 /* 扫图：收节点 + 出边 + 门→条件节点 */
 static int flat_build(void* g) {
     void* nodes = *(void**)((char*)g + OFF_GRAPH_NODES);
@@ -789,6 +843,13 @@ static void flatten_try_inner(void* any_node) {
             if (flat_dbg_graph(gn) || g_log_graph < 8)
                 LOGI("[flat]   pid=%d 跳过展开：%s（region=%d，出口=%d）", p->pid, why, p->reg_n, p->ex_n);
         }
+    }
+
+    /* v172：名单图的链式接续（按 pid 顺序把内容末端接到下一对在队门） */
+    {
+        const int* cp = 0;
+        int cn = flat_chain_pids(gn, &cp);
+        if (cn >= 2 && g_npairs >= 2) flat_apply_chain(gn, cp, cn);
     }
 
     /* v167：region 与 exits 都算完之后，按对输出审计明细（只对指定图） */
