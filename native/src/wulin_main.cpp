@@ -1917,6 +1917,10 @@ int cond_negate_by_field(void* cond) {
     return (int)*(unsigned char*)((char*)cond + no);
 }
 
+/* v164：本次判定里「放宽参与了几次」「有没有被守卫压过」——用于 [gate] 的源标记 */
+static int g_ev_relax_hits = 0;
+static int g_ev_guarded = 0;
+
 static bool hook_check_joined(void* self, int io, void* line) {
     g_team_cond_hits++;
     flatten_try(self);
@@ -1935,11 +1939,16 @@ static bool hook_check_partner(void* self, int io, void* line) {
         if (base_check_all) return base_check_all(self, io, line);
         return true;
     }
-    if (F_STORY && base_check_all && !keep_original_for(self)) {
+    /* v165：同 joined —— 先原版，失败才放宽 */
+    bool r0 = orig_check_partner ? orig_check_partner(self, io, line) : false;
+    if (r0 || !F_STORY || !base_check_all) return r0;
+    if (!keep_original_for(self)) {
         mark_relaxed(self);
-        unstranger_relaxed(self);           /* v138 */
+        unstranger_relaxed(self);
+        g_ev_relax_hits++;
         return base_check_all(self, io, line);
     }
+    return r0;
     return orig_check_partner ? orig_check_partner(self, io, line) : false;
 }
 
@@ -2479,10 +2488,6 @@ static int story_blacklisted_pair(const char* g, int pid) {
     return 0;
 }
 
-/* v164：本次判定里「放宽参与了几次」「有没有被守卫压过」——用于 [gate] 的源标记 */
-static int g_ev_relax_hits = 0;
-static int g_ev_guarded = 0;
-
 static bool hold_check_core(void* self) {
     rn_maybe_sync();   /* v79：检测「剧情播放中」状态变化，过渡时统一改名/还原 */
     /* v65：HoldNode 就是「流程判断」，这是最靠近执行点的地方 —— 在判定前把展开补丁套上，
@@ -2492,9 +2497,13 @@ static bool hold_check_core(void* self) {
      *   - 没碰（计数没变）→ 这个 Hold 与放宽无关，一行都不碰；
      *   - 碰过 + times!=0 + 这次仍然通过 → 是放宽把"一次性"变成了"可重复"→ 压回 false。 */
     int before = g_team_cond_hits;
+    g_ev_relax_hits = 0;                      /* v165：本次判定里是否真的放宽过 */
     bool r = orig_hold_check ? orig_hold_check(self) : false;
     if (!F_STORY || !r) return r;
-    if (g_team_cond_hits == before) return r;      /* 本次判定没碰队友条件：不干预 */
+    /* v165（用户要求）：判据从「队友条件被求值过」改成「本次确实发生过放宽」。
+     * 旧判据的问题是：原版本来就为真（角色真在队）时也会被误判成
+     * "放宽引起的重复触发"，于是把合法通过压掉 —— 实测导致鱼薇儿在队也不触发。 */
+    if (g_ev_relax_hits == 0) return r;
     if ((uintptr_t)self < 0x10000) return r;
 
     int times = *(int*)((char*)self + OFF_HOLD_TIMES);
@@ -2583,6 +2592,10 @@ static bool hook_hold_check(void* self) {
      * 我们“先调再覆盖”等于白白消耗原生次数（这正是用户指出的隐患）。
      * 展平的“两侧各播一次”由改线保证，不需要原生次数参与。 */
     if (flatten_gate_forced(self)) {
+        /* v165：展平门不再调用原版 → 条件层的 clear 也不会跑，这里补回来 */
+        int pit = -1;
+        int pid2 = flatten_gate_pid(self, &pit);
+        if (pid2 > 0) unstranger_apply_uid(pid2, 0);
         gate_trace(self, 1, 1, "FLATTENED", t0, t0);
         return true;
     }
@@ -2593,6 +2606,14 @@ static bool hook_hold_check(void* self) {
     const char* src = g_ev_guarded ? "GUARDED"
                     : (r && g_ev_relax_hits ? "RELAXED" : (r ? "VANILLA" : "VANILLA_FAIL"));
     gate_trace(self, 0, r ? 1 : 0, src, t0, t1);
+    /* v166（用户要求）：**清陌生名应该由"剧情真的在播"驱动**，而不是搭在放宽决策上。
+     * 规则：播放期间，任何与角色相关的门通过 → 清该角色的 '@' 陌生名。
+     * 这样无论这次通过是 原版 / 放宽 / 展平，都会清（v164 跳过原版导致漏清的问题彻底解决）。 */
+    if (r && playing_now()) {
+        int pit = -1;
+        int pidc = flatten_gate_pid(self, &pit);
+        if (pidc > 0) unstranger_apply_uid(pidc, 0);
+    }
     return r;
 }
 

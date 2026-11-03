@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v164"         /* v164：S1 展平门不再调用原版(不计 times)；S1.5 [gate] 增加 源=VANILLA/RELAXED/FLATTENED/GUARDED 与 times 前后 */
+#define MOD_VER "v166"         /* v166：清陌生名改为"播放期间门通过即清"（不再依赖放宽决策，补回 v164 的漏清） */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
