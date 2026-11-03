@@ -352,40 +352,38 @@ static int flat_dbg_graph(const char* gn) {
     return strcmp(gn, "R10049-2") == 0 || strcmp(gn, "R10049-2-1") == 0;
 }
 
-/* ================================================================ v193：改线安全白名单
+/* ================================================================ v197：改线安全白名单
  *
  * 改线的本质是「把 region 的对外出口改指到不在队门」，**原目标被跳过**。
- * 只要原目标写的是存档级状态，跳过它就影响别的图 —— 这是"局部改线影响全局触发"的唯一通道。
  *
- * 为什么用白名单而不是黑名单：剧情资产不止 ModEditor.zip，还有
- * aa/config_assets_all.bundle 里的一大批（例如 R10136 一族 280 个资产）。
- * 黑名单靠"列出所有写状态的节点名"，遇到没见过的类型就漏；白名单对未知类型默认拒绝，
- * 天然覆盖全部资产包。
+ * ⚠️ v194 曾把「播放剧情」（StoryScenarioNode）也放进来，理由是"跳过它只是这一段不播"。
+ * 实测证伪：开场图 R10021-4-1 的 5 条改线里 4 条目标都是「播放剧情」子场景、1 条「添加标记」，
+ * 跳过之后开场后续整段不播 —— 表现就是"游戏开场不触发"。剧情节点是**实打实的内容**，
+ * 不是可丢的分支壳子。
  *
- * 允许被跳过的只有「纯流程分支、不写任何状态」的节点：
- *   · 流程判断（HoldNode 分支）
- *   · 选项（玩家选择分支）
- *   · 注释（不执行）
- *   · StoryScenarioNode（「播放剧情」入口）：跳过 = 这一段不播，
- *     与"原版 if/else 只播一段"语义一致，不写全局状态。
+ * 现在只留这三类（不含剧情内容、不写任何状态）：
+ *   流程判断（HoldNode 分支） / 选项（玩家选择） / 注释（不执行）
  *
- * 全量统计（PC 侧 tools/audit_safe_skip_whitelist.py，同一份剧情资产）：
- *   902 个可改线门对 → 717 个（79%）出口只落在这些节点上，可改线；
- *   185 个命中「时间流逝 / 添加标记 / 改变NPC关系值 / 设置自定义变量 …」→ 不改。 */
+ * 代价：可改线门对从 717/902 降到 422/902（47%）。宁可少展，也不能让剧情不播。
+ * 用白名单而非黑名单：资产不止 ModEditor.zip（R10136 一族 280 个在 config_assets_all.bundle），
+ * 黑名单遇到没见过的类型就漏。 */
 static const char* k_safe_skip[] = {
     "流程判断",
     "选项",
     "注释",
 };
 
-/* 这个节点被"跳过"是否安全 */
+/* 这个节点被"跳过"是否安全（纯流程分支 / 注释） */
 static int flat_node_is_safe_skip(void* nd) {
     if ((uintptr_t)nd < 0x10000) return 0;
     char cb[96];
     const char* cn = cls_name(nd, cb, sizeof(cb));
-    if (cn && strcmp(cn, "StoryScenarioNode") == 0) return 1;      /* 「播放剧情」 */
+    if (!cn || !cn[0] || cn[0] == '?') return 0;          /* 类名读不到 → 保守拒绝 */
+    if (strcmp(cn, "HoldNode") == 0) return 1;            /* 流程判断 */
+    if (strcmp(cn, "CommentNode") == 0) return 1;         /* 注释 */
+
     const char* nm = flat_node_name(nd);
-    if (!nm || !nm[0] || nm[0] == '?') return 0;                   /* 读不到名字 → 保守拒绝 */
+    if (!nm || !nm[0] || nm[0] == '?') return 0;
     for (size_t i = 0; i < sizeof(k_safe_skip) / sizeof(k_safe_skip[0]); ++i)
         if (strcmp(nm, k_safe_skip[i]) == 0) return 1;
     return 0;
