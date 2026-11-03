@@ -444,8 +444,8 @@ static void gate_info_register_all(const char* gn) {
     for (int i = 0; i < g_nnodes; ++i) {
         void* cond = g_cond[i];
         if ((uintptr_t)cond < 0x10000) continue;
-        int pid = *(int*)((char*)cond + OFF_HP_PARTNER_ID);
-        int neg = (int)*(unsigned char*)((char*)cond + OFF_HP_NEGATE);
+        int pid = cond_pid_by_field(cond);     /* v163：按字段名解析，避免不同子类偏移不同 */
+        int neg = cond_negate_by_field(cond);
         char cb[40];
         gate_info_add_cls(g_nd[i], pid, neg ? 0 : 1, cls_name(cond, cb, sizeof(cb)));
     }

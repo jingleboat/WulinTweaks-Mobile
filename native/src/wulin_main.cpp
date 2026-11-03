@@ -1873,6 +1873,50 @@ static void unstranger_apply_uid(int pid, int force) {
         LOGI("[name] 放宽在队条件 uid=%d 清空陌生名 \"%s\"", pid, gb);
 }
 
+
+/* v163：按**字段名**解析条件的 partnerID / Negate 偏移并缓存。
+ * 不同条件子类布局不同（例如 TalkToNpcCondition 的 partnerID 不在 0x58），
+ * 用固定偏移会读到垃圾值（日志里出现过 pid=495075136）。 */
+typedef struct { void* klass; int pid_off; int neg_off; } COND_FIELD_CACHE;
+static COND_FIELD_CACHE g_cfc[64];
+static int g_cfc_n = 0;
+
+static void cond_field_offsets(void* cond, int* pid_off, int* neg_off) {
+    *pid_off = -1; *neg_off = -1;
+    if ((uintptr_t)cond < 0x10000 || !A_obj_get_class) return;
+    void* k = A_obj_get_class(cond);
+    if ((uintptr_t)k < 0x10000) return;
+    for (int i = 0; i < g_cfc_n; ++i)
+        if (g_cfc[i].klass == k) { *pid_off = g_cfc[i].pid_off; *neg_off = g_cfc[i].neg_off; return; }
+
+    static void* (*fld_from_name)(void*, const char*) = nullptr;
+    static size_t (*fld_offset)(void*) = nullptr;
+    if (!fld_from_name && g_i2cpp) {
+        fld_from_name = (void* (*)(void*, const char*))dlsym(g_i2cpp, "il2cpp_class_get_field_from_name");
+        fld_offset   = (size_t (*)(void*))dlsym(g_i2cpp, "il2cpp_field_get_offset");
+    }
+    int po = -1, no = -1;
+    if (fld_from_name && fld_offset) {
+        void* f1 = fld_from_name(k, "partnerID");
+        if ((uintptr_t)f1 > 0x10000) po = (int)fld_offset(f1);
+        void* f2 = fld_from_name(k, "Negate");
+        if ((uintptr_t)f2 > 0x10000) no = (int)fld_offset(f2);
+    }
+    if (g_cfc_n < 64) { g_cfc[g_cfc_n].klass = k; g_cfc[g_cfc_n].pid_off = po; g_cfc[g_cfc_n].neg_off = no; g_cfc_n++; }
+    *pid_off = po; *neg_off = no;
+}
+
+int cond_pid_by_field(void* cond) {
+    int po, no; cond_field_offsets(cond, &po, &no);
+    if (po < 0 || po > 0x400) return 0;
+    return *(int*)((char*)cond + po);
+}
+int cond_negate_by_field(void* cond) {
+    int po, no; cond_field_offsets(cond, &po, &no);
+    if (no < 0 || no > 0x400) return 0;
+    return (int)*(unsigned char*)((char*)cond + no);
+}
+
 static bool hook_check_joined(void* self, int io, void* line) {
     g_team_cond_hits++;
     flatten_try(self);
@@ -2435,6 +2479,10 @@ static int story_blacklisted_pair(const char* g, int pid) {
     return 0;
 }
 
+/* v164：本次判定里「放宽参与了几次」「有没有被守卫压过」——用于 [gate] 的源标记 */
+static int g_ev_relax_hits = 0;
+static int g_ev_guarded = 0;
+
 static bool hold_check_core(void* self) {
     rn_maybe_sync();   /* v79：检测「剧情播放中」状态变化，过渡时统一改名/还原 */
     /* v65：HoldNode 就是「流程判断」，这是最靠近执行点的地方 —— 在判定前把展开补丁套上，
@@ -2482,6 +2530,7 @@ static bool hold_check_core(void* self) {
              rescued ? "Y" : "N",
              rescued ? "压制，但随后被展平强制放行救回（times 仍被真实 +1）" : "压制（本次真的判假）");
     }
+    g_ev_guarded++;                          /* v164：本次判定被守卫压过 */
     return false;
 }
 
@@ -2500,7 +2549,7 @@ typedef struct { void* gate; int last; } GATE_TRACE;
 static GATE_TRACE g_gtrace[128];
 static int g_gtrace_n = 0, g_gtrace_log = 0;
 
-static void gate_trace(void* self, int forced, int result) {
+static void gate_trace(void* self, int forced, int result, const char* src, int t_before, int t_after) {
     if ((uintptr_t)self < 0x10000 || g_gtrace_log >= 400) return;
     int last = -1, slot = -1;
     for (int i = 0; i < g_gtrace_n; ++i)
@@ -2518,18 +2567,32 @@ static void gate_trace(void* self, int forced, int result) {
     const char* gn = ((uintptr_t)g > 0x10000) ? obj_name(g, gb, sizeof(gb)) : "?";
     int in_team = -1;
     int pid = flatten_gate_pid(self, &in_team);
-    int times = *(int*)((char*)self + OFF_HOLD_TIMES);
-    LOGI("[gate] 图=%s 门=%p pid=%d 类=%s 侧=%s times=%d forced=%s → %s", gn, self, pid,
-         flatten_gate_cls(self),
+    LOGI("[gate] 图=%s 门=%p pid=%d 类=%s 侧=%s times=%d→%d forced=%s 源=%s → %s",
+         gn, self, pid, flatten_gate_cls(self),
          pid <= 0 ? "?" : (in_team ? "在队" : "不在队"),
-         times, forced ? "Y" : "N", result ? "通过" : "不通过");
+         t_before, t_after, forced ? "Y" : "N", src ? src : "?",
+         result ? "通过" : "不通过");
 }
 
 static bool hook_hold_check(void* self) {
+    if ((uintptr_t)self < 0x10000) return false;
+    int t0 = *(int*)((char*)self + OFF_HOLD_TIMES);
+
+    /* v164（S1）：已被展平接管的门 —— **不调用原版**，直接放行。
+     * 为什么：原版 CheckCondition 内部会把 checkSucessTimes +1，
+     * 我们“先调再覆盖”等于白白消耗原生次数（这正是用户指出的隐患）。
+     * 展平的“两侧各播一次”由改线保证，不需要原生次数参与。 */
+    if (flatten_gate_forced(self)) {
+        gate_trace(self, 1, 1, "FLATTENED", t0, t0);
+        return true;
+    }
+
+    g_ev_relax_hits = 0; g_ev_guarded = 0;
     bool r = hold_check_core(self);
-    int forced = flatten_gate_forced(self);
-    if (!r && forced) r = true;
-    gate_trace(self, forced, r ? 1 : 0);
+    int t1 = *(int*)((char*)self + OFF_HOLD_TIMES);
+    const char* src = g_ev_guarded ? "GUARDED"
+                    : (r && g_ev_relax_hits ? "RELAXED" : (r ? "VANILLA" : "VANILLA_FAIL"));
+    gate_trace(self, 0, r ? 1 : 0, src, t0, t1);
     return r;
 }
 
