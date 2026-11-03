@@ -887,6 +887,14 @@ static int keep_original_for_uncached(void* condNode) {
     const char* gn = obj_name(g, gb, sizeof(gb));
     if (!gn || !gn[0] || gn[0] == '?') return 0;
 
+    /* v171：门对没被展平接管（region=0 / 安全跳过）→ 一律按原版，不做放宽。
+     * 否则宽松会把流程拐进该角色的支线，而那条支线没有改线接回主线。 */
+    if (flatten_relax_forbidden(condNode)) {
+        if (g_scene_log++ < 20)
+            LOGI("[team] 图 %s 该条件所属门对未被展平接管 → 不放宽（原版）", gn);
+        return 1;
+    }
+
     for (size_t i = 0; i < sizeof(k_fixed_original) / sizeof(k_fixed_original[0]); ++i)
         if (strcmp(gn, k_fixed_original[i]) == 0) return 1;
 

@@ -391,6 +391,25 @@ static void flat_dump_pair(const char* gn, int k) {
     }
 }
 
+
+/* v171：展平没接管（region=0 或因安全判据跳过）的门对，其条件**禁止放宽**。
+ * 原因（有实测证据）：R10049-2-1 里 10061 那对 region=0、展平不改线，
+ * 但放宽仍把它的"在队"条件判真 → 流程走进 _4_2 那条**以「添加标记」结束的死支线**
+ * → 后续 10098（鱼薇儿，当时在队）的门永远轮不到。
+ * 展平接管的对会改线接回主线，所以只有"没被接管"的对需要这条禁令。 */
+#define FLAT_NO_RELAX 2048
+static void* g_norelax[FLAT_NO_RELAX];
+static int   g_norelax_n = 0;
+static void no_relax_add(void* c) {
+    if ((uintptr_t)c < 0x10000) return;
+    for (int i = 0; i < g_norelax_n; ++i) if (g_norelax[i] == c) return;
+    if (g_norelax_n < FLAT_NO_RELAX) g_norelax[g_norelax_n++] = c;
+}
+int flatten_relax_forbidden(void* c) {
+    if ((uintptr_t)c < 0x10000) return 0;
+    for (int i = 0; i < g_norelax_n; ++i) if (g_norelax[i] == c) return 1;
+    return 0;
+}
 /* 扫图：收节点 + 出边 + 门→条件节点 */
 static int flat_build(void* g) {
     void* nodes = *(void**)((char*)g + OFF_GRAPH_NODES);
@@ -728,6 +747,8 @@ static void flatten_try_inner(void* any_node) {
         p->ex_n = 0;
         if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION) {
             if (flat_dbg_graph(gn)) LOGI("[flat-pair] 图=%s 序=%d pid=%d region=%d（跳过）", gn, k, p->pid, p->reg_n);
+            /* v171：这对没被展平接管 → 禁止放宽，否则会把流程拐进该角色的死支线 */
+            no_relax_add(g_cond[p->f]); no_relax_add(g_cond[p->s]);
             continue;
         }
 
@@ -764,6 +785,7 @@ static void flatten_try_inner(void* any_node) {
         }
         if (bad) {
             p->skip = 1;
+            no_relax_add(g_cond[p->f]); no_relax_add(g_cond[p->s]);
             if (flat_dbg_graph(gn) || g_log_graph < 8)
                 LOGI("[flat]   pid=%d 跳过展开：%s（region=%d，出口=%d）", p->pid, why, p->reg_n, p->ex_n);
         }
@@ -800,6 +822,9 @@ static void flatten_try_inner(void* any_node) {
 
     for (int k = 0; k < g_npairs; ++k) {
         FLAT_PAIR* p = &g_pair[k];
+        /* v170：v169 的 skip 标志插在别的循环里（只挡住校验、没挡住提交）。
+         * 这里才是真正落地的位置：命中安全判据的对不改线、不登记强制门。 */
+        if (p->skip) { skipped++; continue; }
         if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION || p->ex_n == 0) { skipped++; continue; }
 
         /* v151（用户指定）：不再因为“与另一对门的 region 相交”而跳过，只计数 */
