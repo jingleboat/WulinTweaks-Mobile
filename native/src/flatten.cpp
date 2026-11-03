@@ -742,6 +742,11 @@ static void flatten_try_inner(void* any_node) {
         }
     }
 
+    /* v167：region 与 exits 都算完之后，按对输出审计明细（只对指定图） */
+    if (flat_dbg_graph(gn))
+        for (int k = 0; k < g_npairs; ++k)
+            if (g_pair[k].reg_n > 0) flat_dump_pair(gn, k);
+
     /* ---------------- ③ 逐对落地（事务化：改线 → 校验 → 提交或全部回滚） ----------------
      * v153：把“边算边改”改成“先全改、再校验、不合格整体回滚”。
      * 校验两条（缺一不可，都会造成「剧情卡死」）：

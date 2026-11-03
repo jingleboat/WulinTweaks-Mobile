@@ -13,7 +13,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v167"         /* v167：新增 [flat-pair] 逐对审计日志（仅 R10049-2 / R10049-2-1） */
+#define MOD_VER "v168"         /* v168：补上 [flat-pair] 明细输出（v167 只定义了函数没调用） */
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
