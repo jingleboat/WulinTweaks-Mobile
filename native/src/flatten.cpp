@@ -44,7 +44,6 @@
  *   HavePartnerCondition     partnerID 0x58(int)  Negate 0x5C(bool)
  *   il2cpp 数组元素起点 0x20（List._items 指向数组对象）
  */
-#include <cstdio>
 #include "common.h"
 
 #include <string.h>
@@ -64,11 +63,11 @@ extern volatile int F_STORY;     /* 剧情条件放宽（姓名窗口也受它�
 #define FLAT_MAX_NODES   2050        /* 单图节点上限（最大的图约 1300） */
 #define FLAT_MAX_EDGES   8200
 #define FLAT_MAX_PAIRS   48
-#define FLAT_MAX_CONDS   4096    /* v158：128 → 4096（实测打满后所有门 forced=N，展平失效） */
-#define FLAT_MAX_GATES   8192        /* v158：512 → 8192（同上） */
+#define FLAT_MAX_CONDS   128
+#define FLAT_MAX_GATES   512         /* v87：被接管的门（HoldNode）指针表，与 PC 的 HashSet 对齐 */
 #define FLAT_MAX_REGION  512         /* region 节点上限 */
 #define FLAT_DONE_MAX    96          /* 处理过的图指针（环形） */
-#define FLAT_LOG_GRAPH   200   /* v149：40 → 200（本次诊断发现 40 条上限把 R10049-2 的结果吞掉了） */
+#define FLAT_LOG_GRAPH   40
 
 /* ---------------------------------------------------------------- 列表访问 */
 /* ⚠️ il2cpp 数组（T[]）的元素不是从数组对象头开始，而是 +0x20：
@@ -156,13 +155,11 @@ static int port_set_conn_node(void* port, int idx, void* target) {
 static void* g_flat_cond[FLAT_MAX_CONDS];
 static int g_flat_cond_n = 0;
 
-static int g_cond_full_warned = 0, g_gate_full_warned = 0;
 static void flat_add_cond(void* cond) {
     if ((uintptr_t)cond < 0x10000) return;
     for (int i = 0; i < g_flat_cond_n; ++i)
         if (g_flat_cond[i] == cond) return;
     if (g_flat_cond_n < FLAT_MAX_CONDS) g_flat_cond[g_flat_cond_n++] = cond;
-    else if (!g_cond_full_warned) { g_cond_full_warned = 1; LOGE("[flat] 条件表已满（%d），后续条件不再登记 —— 展平会失效", FLAT_MAX_CONDS); }
 }
 
 /* v87：被接管的**门**（HoldNode）本身 —— 与 PC 的 BranchFlatten._gateForced 对齐。
@@ -179,7 +176,6 @@ static void flat_add_gate(void* gate) {
     for (int i = 0; i < g_flat_gate_n; ++i)
         if (g_flat_gate[i] == gate) return;
     if (g_flat_gate_n < FLAT_MAX_GATES) g_flat_gate[g_flat_gate_n++] = gate;
-    else if (!g_gate_full_warned) { g_gate_full_warned = 1; LOGE("[flat] 门表已满（%d），后续门不再登记 —— 展平会失效", FLAT_MAX_GATES); }
 }
 
 /* 这道门是否已被「分支展开」接管（= 无条件判真）。由 hook_hold_check 调用。 */
@@ -202,68 +198,28 @@ int flatten_cond_always_true(void* cond) {
 /* ================================================================ 图处理状态 */
 /* 处理过的图指针（环形）。通用规则下「任何图都要扫一次」，所以比原来大得多，
  * 否则指针一被挤出环形就会被反复重扫（每次都是几千次 il2cpp 调用）。 */
-/* v153：处理过的图改为**不可淘汰**的开放寻址表。
- * 原来 96 条环形表会被挤掉 → 同一张图被二次展开（实测「门对 15，展开 13」紧接着
- * 「门对 15，展开 0（跳过 15）」）。表满时 fail-open：只报警不再登记 —— 重复处理
- * 会因为算不出可展开的 region/exits 而全部跳过，无害。 */
-#define FLAT_DONE_TBL 2048
-static void* g_done_tbl[FLAT_DONE_TBL];        /* 16 KB */
-static int   g_done_used = 0, g_done_warned = 0;
-static int   g_log_graph = 0;
-static int   g_log_pair = 0;
+static void* g_done[FLAT_DONE_MAX];
+static int g_done_n = 0;
+static int g_done_rr = 0;
+static int g_log_graph = 0;
+static int g_log_pair = 0;
 
-static unsigned done_hash(void* p) {
-    uintptr_t x = (uintptr_t)p; x ^= x >> 13; x *= 0x9E3779B1u; x ^= x >> 15;
-    return (unsigned)x & (FLAT_DONE_TBL - 1);
-}
 static int flat_done(void* g) {
-    if ((uintptr_t)g < 0x10000) return 0;
-    unsigned h = done_hash(g);
-    for (int i = 0; i < 8; ++i) {
-        unsigned k = (h + i) & (FLAT_DONE_TBL - 1);
-        if (!g_done_tbl[k]) return 0;
-        if (g_done_tbl[k] == g) return 1;
-    }
+    for (int i = 0; i < g_done_n; ++i)
+        if (g_done[i] == g) return 1;
     return 0;
 }
+
 static void flat_mark_done(void* g) {
     if ((uintptr_t)g < 0x10000) return;
-    if (g_done_used >= FLAT_DONE_TBL * 3 / 4) {
-        if (!g_done_warned) {
-            g_done_warned = 1;
-            LOGI("[flat] 已处理图表已用 %d 条，后续不再登记（重复处理会全部跳过）", g_done_used);
-        }
-        return;    }
-    unsigned h = done_hash(g);
-    for (int i = 0; i < 8; ++i) {
-        unsigned k = (h + i) & (FLAT_DONE_TBL - 1);
-        if (!g_done_tbl[k]) { g_done_tbl[k] = g; g_done_used++; return; }
-        if (g_done_tbl[k] == g) return;
-    }
+    g_done[g_done_rr] = g;
+    g_done_rr = (g_done_rr + 1) % FLAT_DONE_MAX;
+    if (g_done_n < FLAT_DONE_MAX) g_done_n++;
 }
 
 /* ================================================================ 单图工作区 */
 typedef struct { int src; int tgt; int slot; void* port; } FLAT_EDGE;
-typedef struct { int g0, g1; int pid; int both_story; int reg_n; int ex_start; int ex_n;
-                 int first_is_g0;   /* v156：父端口第一条连接是不是「在队」侧（决定引擎先问谁） */
-                 int f, s;          /* v156：按连接顺序的 first / second */
-                 int skip;          /* v169：本对判定为不安全，整体跳过（不改线、不强制门） */
-} FLAT_PAIR;
-
-/* v153：改线事务日志。undo 上限 1024（实测单图最多 51 条改线，余量充足）；
- * 超过上限 → 整图放弃展开，绝不留半改状态。 */
-#define FLAT_MAX_UNDO 1024
-typedef struct { int ei; int old_tgt; int g1; } FLAT_UNDO;
-static FLAT_UNDO      g_undo[FLAT_MAX_UNDO];     /* 12 KB */
-static int            g_undo_n = 0;
-static unsigned char  g_reach_before[FLAT_MAX_NODES];   /* 兼容保留（不再用于判定） */
-static unsigned char  g_tmp_reach[FLAT_MAX_NODES];      /* 临时位图 */
-/* v154：可达性守恒必须**按对**比较 —— v153 错在把“所有对 g1 可达集的并集”当作每对的门槛，
- * 于是一对 g1 只要到不了别的对的内容就误判失败（实测 20+ 张图被误回滚，R10049-2 全灭）。
- * 这里给每对存一份改线前的 Reach(g1) 位集：48 对 × 257 字节 ≈ 12 KB。 */
-#define FLAT_BITS ((FLAT_MAX_NODES + 7) / 8)
-static unsigned char  g_before_bits[FLAT_MAX_PAIRS][FLAT_BITS];
-static int            g_log_rollback = 0;
+typedef struct { int g0, g1; int pid; int both_story; int reg_n; int ex_start; int ex_n; } FLAT_PAIR;
 
 static void*          g_nd[FLAT_MAX_NODES];      /* 节点指针 */
 static int            g_e0[FLAT_MAX_NODES];      /* 该节点第一条出边下标 */
@@ -304,287 +260,6 @@ static int hash_get(void* p) {
     return -1;
 }
 
-/* ---- v153：两个迭代式图算法（绝不用递归，避免 2000+ 节点爆栈） ---- */
-
-/* 从下标 start 出发能到达的所有节点 → 写进 out（长度 g_nnodes） */
-static void flat_mark_reach(int start, unsigned char* out) {
-    static int stk[FLAT_MAX_NODES];
-    memset(out, 0, (size_t)g_nnodes);
-    if (start < 0 || start >= g_nnodes) return;
-    int sp = 0;
-    out[start] = 1;
-    stk[sp++] = start;
-    while (sp > 0) {
-        int c = stk[--sp];
-        for (int e = 0; e < g_ec[c]; ++e) {
-            int t = g_edge[g_e0[c] + e].tgt;
-            if (t < 0 || t >= g_nnodes || out[t]) continue;
-            out[t] = 1;
-            if (sp < FLAT_MAX_NODES) stk[sp++] = t;
-        }
-    }
-}
-
-/* src 能否到达 want（按当前 g_edge 镜像，含已改的边） */
-static int flat_reach(int src, int want, unsigned char* seen) {
-    static int stk[FLAT_MAX_NODES];
-    if (src < 0 || src >= g_nnodes || want < 0 || want >= g_nnodes) return 0;
-    memset(seen, 0, (size_t)g_nnodes);
-    int sp = 0;
-    seen[src] = 1;
-    stk[sp++] = src;
-    while (sp > 0) {
-        int c = stk[--sp];
-        if (c == want) return 1;
-        for (int e = 0; e < g_ec[c]; ++e) {
-            int t = g_edge[g_e0[c] + e].tgt;
-            if (t < 0 || t >= g_nnodes || seen[t]) continue;
-            seen[t] = 1;
-            if (sp < FLAT_MAX_NODES) stk[sp++] = t;
-        }
-    }
-    return 0;
-}
-
-/* v167：逐对审计日志（只对指定图开启，默认 R10049-2 / R10049-2-1） */
-static int flat_dbg_graph(const char* gn) {
-    if (!gn) return 0;
-    return strcmp(gn, "R10049-2") == 0 || strcmp(gn, "R10049-2-1") == 0;
-}
-
-/* ================================================================ v197：改线安全白名单
- *
- * 改线的本质是「把 region 的对外出口改指到不在队门」，**原目标被跳过**。
- *
- * ⚠️ v194 曾把「播放剧情」（StoryScenarioNode）也放进来，理由是"跳过它只是这一段不播"。
- * 实测证伪：开场图 R10021-4-1 的 5 条改线里 4 条目标都是「播放剧情」子场景、1 条「添加标记」，
- * 跳过之后开场后续整段不播 —— 表现就是"游戏开场不触发"。剧情节点是**实打实的内容**，
- * 不是可丢的分支壳子。
- *
- * 现在只留这三类（不含剧情内容、不写任何状态）：
- *   流程判断（HoldNode 分支） / 选项（玩家选择） / 注释（不执行）
- *
- * 代价：可改线门对从 717/902 降到 422/902（47%）。宁可少展，也不能让剧情不播。
- * 用白名单而非黑名单：资产不止 ModEditor.zip（R10136 一族 280 个在 config_assets_all.bundle），
- * 黑名单遇到没见过的类型就漏。 */
-static const char* k_safe_skip[] = {
-    "流程判断",
-    "选项",
-    "注释",
-};
-
-/* 这个节点被"跳过"是否安全（纯流程分支 / 注释） */
-static int flat_node_is_safe_skip(void* nd) {
-    if ((uintptr_t)nd < 0x10000) return 0;
-    char cb[96];
-    const char* cn = cls_name(nd, cb, sizeof(cb));
-    if (!cn || !cn[0] || cn[0] == '?') return 0;          /* 类名读不到 → 保守拒绝 */
-    if (strcmp(cn, "HoldNode") == 0) return 1;            /* 流程判断 */
-    if (strcmp(cn, "CommentNode") == 0) return 1;         /* 注释 */
-
-    const char* nm = flat_node_name(nd);
-    if (!nm || !nm[0] || nm[0] == '?') return 0;
-    for (size_t i = 0; i < sizeof(k_safe_skip) / sizeof(k_safe_skip[0]); ++i)
-        if (strcmp(nm, k_safe_skip[i]) == 0) return 1;
-    return 0;
-}
-
-/* 这一对的对外出口里，有没有落到"不安全的节点"上（不安全就不改这一对） */
-static int flat_pair_touches_global(FLAT_PAIR* p) {
-    for (int e = 0; e < p->ex_n; ++e) {
-        int ei = g_exit[p->ex_start + e];
-        if (ei < 0 || ei >= g_nedges) continue;
-        int t = g_edge[ei].tgt;
-        if (t < 0 || t >= g_nnodes) continue;
-        if (!flat_node_is_safe_skip(g_nd[t])) return 1;
-    }
-    return 0;
-}
-
-static const char* flat_dbg_name(void* nd) { return flat_node_name(nd); }
-
-/* v193：flat_build 失败的重试计数（与 PC 的 BranchFlatten._attempts 对称）。
- * 只针对"结构异常"这一类偶发失败，条目数很少。 */
-#define FLAT_ATT_MAX  48
-#define FLAT_ATT_TRY  8
-static void*          g_att_g[FLAT_ATT_MAX];
-static unsigned char  g_att_n[FLAT_ATT_MAX];
-static int            g_att_used = 0;
-
-static int flat_att_inc(void* g) {
-    if ((uintptr_t)g < 0x10000) return FLAT_ATT_TRY;
-    for (int i = 0; i < g_att_used; ++i) {
-        if (g_att_g[i] == g) { if (g_att_n[i] < 255) g_att_n[i]++; return g_att_n[i]; }
-    }
-    if (g_att_used < FLAT_ATT_MAX) {
-        g_att_g[g_att_used] = g;
-        g_att_n[g_att_used] = 1;
-        return g_att_n[g_att_used++];
-    }
-    return FLAT_ATT_TRY;      /* 表满：当作用尽，回到旧行为 */
-}
-static void flat_dump_pair(const char* gn, int k) {
-    FLAT_PAIR* p = &g_pair[k];
-    int nf = (p->f >= 0 && p->f < g_nnodes) ? p->f : -1;
-    int ns = (p->s >= 0 && p->s < g_nnodes) ? p->s : -1;
-    LOGI("[flat-pair] 图=%s 序=%d pid=%d", gn, k, p->pid);
-    LOGI("    first=%p(%s) neg=%d  second=%p(%s) neg=%d",
-         nf >= 0 ? g_nd[nf] : 0, nf >= 0 ? flat_dbg_name(g_nd[nf]) : "-",
-         (p->f == p->g0) ? 0 : 1,
-         ns >= 0 ? g_nd[ns] : 0, ns >= 0 ? flat_dbg_name(g_nd[ns]) : "-",
-         (p->s == p->g0) ? 0 : 1);
-    if (nf >= 0) {
-        LOGI("    first 出边 %d 条:", g_ec[nf]);
-        for (int i = 0; i < g_ec[nf] && i < 6; ++i) {
-            FLAT_EDGE* e = &g_edge[g_e0[nf] + i];
-            LOGI("      [%d] slot=%d → %p(%s)", i, e->slot,
-                 g_nd[e->tgt], flat_dbg_name(g_nd[e->tgt]));
-        }
-    }
-    LOGI("    region=%d 节点:", p->reg_n);
-    if (k < FLAT_MAX_PAIRS) {
-        int shown = 0;
-        for (int i = 0; i < g_nnodes && shown < 10; ++i)
-            if (g_reg[k][i] == 1) {
-                LOGI("      %p(%s)", g_nd[i], flat_dbg_name(g_nd[i]));
-                shown++;
-            }
-        if (p->reg_n > shown) LOGI("      …（其余 %d 个省略）", p->reg_n - shown);
-    }
-    LOGI("    exits=%d:", p->ex_n);
-    for (int e = 0; e < p->ex_n && e < 10; ++e) {
-        int ei = g_exit[p->ex_start + e];
-        FLAT_EDGE* ed = &g_edge[ei];
-        LOGI("      [%d] from=%p(%s) slot=%d old→%p(%s) new→%p",
-             e, g_nd[ed->src], flat_dbg_name(g_nd[ed->src]), ed->slot,
-             g_nd[ed->tgt], flat_dbg_name(g_nd[ed->tgt]), g_nd[p->s]);
-    }
-}
-
-
-/* v171：展平没接管（region=0 或因安全判据跳过）的门对，其条件**禁止放宽**。
- * 原因（有实测证据）：R10049-2-1 里 10061 那对 region=0、展平不改线，
- * 但放宽仍把它的"在队"条件判真 → 流程走进 _4_2 那条**以「添加标记」结束的死支线**
- * → 后续 10098（鱼薇儿，当时在队）的门永远轮不到。
- * 展平接管的对会改线接回主线，所以只有"没被接管"的对需要这条禁令。 */
-#define FLAT_NO_RELAX 2048
-static void* g_norelax[FLAT_NO_RELAX];
-static int   g_norelax_n = 0;
-static void no_relax_add(void* c) {
-    if ((uintptr_t)c < 0x10000) return;
-    for (int i = 0; i < g_norelax_n; ++i) if (g_norelax[i] == c) return;
-    if (g_norelax_n < FLAT_NO_RELAX) g_norelax[g_norelax_n++] = c;
-}
-int flatten_relax_forbidden(void* c) {
-    if ((uintptr_t)c < 0x10000) return 0;
-    for (int i = 0; i < g_norelax_n; ++i) if (g_norelax[i] == c) return 1;
-    return 0;
-}
-
-/* v172：链式接续补丁表（按 pid 顺序接「内容末端 → 下一对在队门」）。
- * 只对名单内的图生效；不接回本对 N1，因此不会成环（离线 41 张图已校验）。
- * 保留「添加标记」等纯副作用节点：改的是它们的出口，而不是场景的出口。 */
-typedef struct { const char* graph; const int* pids; int n; } FLAT_CHAIN_T;
-/* v173：离线校验通过的 4 张图（顺序由场景编号推出，环检测通过） */
-static const int k_chain_M5061_5[]   = { 10008, 10018, 10086, 10088, 10067, 10053 };
-static const int k_chain_R10005_5[]  = { 10061, 10098 };
-static const int k_chain_10049_2_1[] = { 10061, 10075, 10052, 10098 };
-static const int k_chain_R10098_1[]  = { 10075, 10005 };
-/* v174：逐张分析后新增（School-2030-2 / R10007-4 跳过；M2155-6 / Role5-15-2 暂缓） */
-static const int k_chain_Role5_10[]  = { 10035, 10036 };
-static const int k_chain_M5061_3[]   = { 10005, 10098 };
-static const int k_chain_R10039_6[]  = { 20022, 10064 };
-static const FLAT_CHAIN_T k_chains[] = {
-    { "M5061-5",    k_chain_M5061_5,   6 },
-    { "R10005-5",   k_chain_R10005_5,  2 },
-    { "R10049-2-1", k_chain_10049_2_1, 4 },
-    { "R10098-1",   k_chain_R10098_1,  2 },
-    { "Role5-10",   k_chain_Role5_10,  2 },
-    { "M5061-3",    k_chain_M5061_3,   2 },
-    { "R10039-6",   k_chain_R10039_6,  2 },
-};
-__attribute__((unused))
-static int flat_chain_pids(const char* gn, const int** out) {
-    for (size_t i = 0; i < sizeof(k_chains)/sizeof(k_chains[0]); ++i)
-        if (strcmp(gn, k_chains[i].graph) == 0) { *out = k_chains[i].pids; return k_chains[i].n; }
-    return 0;
-}
-__attribute__((unused))
-static void flat_apply_chain(const char* gn, const int* pids, int n) {
-    int applied = 0;
-    for (int i = 0; i + 1 < n; ++i) {
-        int fi = -1, ni = -1;
-        for (int k = 0; k < g_npairs; ++k) {
-            if (g_pair[k].pid == pids[i])   fi = k;
-            if (g_pair[k].pid == pids[i+1]) ni = k;
-        }
-        if (fi < 0 || ni < 0) continue;
-        FLAT_PAIR* p = &g_pair[fi];
-        FLAT_PAIR* q = &g_pair[ni];
-        int f = p->f;
-        if (f < 0 || g_ec[f] < 1) continue;
-        int scene = g_edge[g_e0[f]].tgt;
-        if (scene < 0 || scene >= g_nnodes || g_ec[scene] < 1) continue;
-        int src = scene;
-        int tgt = g_edge[g_e0[scene]].tgt;
-        /* 若场景出口是「添加标记」这类单出口副作用节点，则改它的出口，保留它执行 */
-        if (tgt >= 0 && tgt < g_nnodes && g_ec[tgt] == 1) {
-            const char* n2 = flat_dbg_name(g_nd[tgt]);
-            if (n2 && (strcmp(n2, "添加标记") == 0 || strcmp(n2, "追加简介") == 0)) {
-                src = tgt;
-            }
-        }
-        if (src < 0 || g_ec[src] < 1) continue;
-        FLAT_EDGE* ed = &g_edge[g_e0[src]];
-        void* newt = g_nd[q->f];
-        if (port_set_conn_node(ed->port, ed->slot, newt)) {
-            ed->tgt = q->f;
-            applied++;
-        }
-        /* 强制放行两端在队门 */
-        flat_add_gate(g_nd[p->f]);  flat_add_cond(g_cond[p->f]);
-        flat_add_gate(g_nd[q->f]);  flat_add_cond(g_cond[q->f]);
-        p->skip = 1; q->skip = 1;
-    }
-    if (applied || g_log_graph < 8)
-        LOGI("[flat] 图 %s 链式接续：改线 %d 条（按名单 %d 个角色顺序）", gn, applied, n);
-    g_log_graph++;
-}
-
-
-/* v178/v179：只有「属于某个门对」的条件才允许放宽（与展平的 region 无关）。 */
-#define FLAT_RELAX_OK 2048
-static void* g_relax_ok[FLAT_RELAX_OK];
-static int   g_relax_ok_n = 0;
-static void relax_ok_add(void* c) {
-    if ((uintptr_t)c < 0x10000) return;
-    for (int i = 0; i < g_relax_ok_n; ++i) if (g_relax_ok[i] == c) return;
-    if (g_relax_ok_n < FLAT_RELAX_OK) g_relax_ok[g_relax_ok_n++] = c;
-}
-/* v192：**这道白名单和 PC 端不一致，是把手机版事件卡死的原因，改为与 PC 对齐放行。**
- *
- * 原来：条件不在 g_relax_ok 里 → 返回 0 → keep_original_for_uncached 不放宽。
- * 而 g_relax_ok 只在"门对改线成功"和"整图没有门对"两处填充。于是：
- *   · 一张图有门对、但那个门对改不了线（region 太大 / 无出口 / 链式接管）
- *     → 它的条件进不了白名单 → **整张图的队友条件一律不放宽**。
- *   实测日志（2026-11-04）：
- *     [flat] 图 R10136-5：节点 86，门对 1，展开 0（跳过 1…），改线 0 条
- *     [team] 图 R10136-5 该条件不属于门对 → 不放宽（v178）
- *   · 不在扫描范围内的图（DLC 等）同理。
- *
- * PC 端的对应实现（BranchFlatten.RelaxAllowed）有个兼容口子：
- *     if (!_processed.Contains(gn)) return true;
- * 而 _processed 只在"节点数异常"和"无门对"时添加 —— 有门对的图永远进不去，
- * 所以 **PC 那一道限制实际上从未生效**（形同放行）。
- * 同一个规则，PC 实际放行、手机严格执行 → PC 能触发、手机不能。这就是两端差异。
- *
- * 现在手机端与 PC 实际行为对齐：放行。
- * 防"拐进没有接回主线的死支线"那条本来该由 flatten_relax_forbidden（v171 黑名单）
- * 负责，但它同样没被正确使用（no_relax_add 从未被调用），留待单独处理。 */
-int flatten_relax_allowed(void* c) {
-    if ((uintptr_t)c < 0x10000) return 0;
-    return 1;                       /* 与 PC 一致：不做白名单限制 */
-}
 /* 扫图：收节点 + 出边 + 门→条件节点 */
 static int flat_build(void* g) {
     void* nodes = *(void**)((char*)g + OFF_GRAPH_NODES);
@@ -642,76 +317,6 @@ static int is_story_idx(int i) {
     return (uintptr_t)sk > 0x10000;
 }
 
-/* v157：允许参与展平的条件类（"和角色在队/在场相关"的那几类）。
- * 需要NPC情缘**未加入**：R10049-2 里它的下游是 R10049-2_6_6（定海棠出演），
- * 绛紫烟本人出演的 _6_7 由「需要伙伴」控制，按用户规则不加。 */
-static int is_story_cond(const char* cn) {
-    if (!cn || !cn[0]) return 0;
-    /* v158（用户指定）：放宽与展平**都只对「需要伙伴」生效**。 */
-    return strcmp(cn, "HavePartnerCondition") == 0;
-}
-
-/* v157：门 → (pid, 侧别)，供 [gate] 轨迹日志打印 */
-#define FLAT_GATE_INFO 4096   /* v161：256 → 4096（一晚上几十张图 × 每图几十道门，256 早就满了，导致 pid/类名全空） */
-typedef struct { void* gate; int pid; int in_team; char cls[40]; } FLAT_GATE_INFO_T;
-static FLAT_GATE_INFO_T g_ginfo[FLAT_GATE_INFO];
-static int g_ginfo_n = 0;
-static void gate_info_add_cls(void* gate, int pid, int in_team, const char* cls) {
-    if ((uintptr_t)gate < 0x10000) return;
-    for (int i = 0; i < g_ginfo_n; ++i)
-        if (g_ginfo[i].gate == gate) {
-            /* 已存在：允许用更完整的信息补全（先登记的是 pid=0/无类名） */
-            if (pid > 0) g_ginfo[i].pid = pid;
-            g_ginfo[i].in_team = in_team;
-            if (cls && cls[0] && !g_ginfo[i].cls[0])
-                snprintf(g_ginfo[i].cls, sizeof(g_ginfo[0].cls), "%s", cls);
-            return;
-        }
-    if (g_ginfo_n >= FLAT_GATE_INFO) return;
-    g_ginfo[g_ginfo_n].gate = gate;
-    g_ginfo[g_ginfo_n].pid = pid;
-    g_ginfo[g_ginfo_n].in_team = in_team;
-    snprintf(g_ginfo[g_ginfo_n].cls, sizeof(g_ginfo[0].cls), "%s", cls ? cls : "");
-    g_ginfo_n++;
-}
-static void gate_info_add(void* gate, int pid, int in_team) { gate_info_add_cls(gate, pid, in_team, ""); }
-
-/* v160：把「本图所有带条件的门」都登记一遍（含未接管的）——
- * 只用于日志，不加入强制放行表。这样 [gate] 里就不会全是 pid=0 侧=?。 */
-static void gate_info_register_all(const char* gn) {
-    (void)gn;
-    for (int i = 0; i < g_nnodes; ++i) {
-        void* cond = g_cond[i];
-        if ((uintptr_t)cond < 0x10000) continue;
-        int pid = cond_pid_by_field(cond);     /* v163：按字段名解析，避免不同子类偏移不同 */
-        int neg = cond_negate_by_field(cond);
-        char cb[40];
-        gate_info_add_cls(g_nd[i], pid, neg ? 0 : 1, cls_name(cond, cb, sizeof(cb)));
-    }
-}
-const char* flatten_gate_cls(void* gate) {
-    for (int i = 0; i < g_ginfo_n; ++i)
-        if (g_ginfo[i].gate == gate) return g_ginfo[i].cls;
-    return "";
-}
-int flatten_gate_pid(void* gate, int* in_team) {
-    for (int i = 0; i < g_ginfo_n; ++i)
-        if (g_ginfo[i].gate == gate) { if (in_team) *in_team = g_ginfo[i].in_team; return g_ginfo[i].pid; }
-    return 0;
-}
-
-/* v155：这一侧是否**含有**播放剧情节点（不再要求「单节点直连」）。
- * 用于区分 A/B 类，并决定 X 类是否放开：以前「两侧出口都不是单节点剧情」一律放弃，
- * 于是「门→设置标记→播放剧情」这种形状（X 类）永远拿不到在队内容。 */
-static unsigned char g_story_reach[FLAT_MAX_NODES];
-static int side_has_story(int gateIdx) {
-    if (gateIdx < 0 || gateIdx >= g_nnodes) return 0;
-    flat_mark_reach(gateIdx, g_story_reach);
-    for (int i = 0; i < g_nnodes; ++i)
-        if (g_story_reach[i] && is_story_idx(i)) return 1;
-    return 0;
-}
-
 /* 这一侧是不是「单个播放剧情节点」——用来区分 A 类 / B 类 */
 static int story_exit(int gateIdx) {
     if (gateIdx < 0 || gateIdx >= g_nnodes) return 0;
@@ -729,7 +334,7 @@ static int flat_region(int k) {
     memset(out, 0, (size_t)g_nnodes);
 
     int head = 0;
-    if (p->s >= 0 && p->s < g_nnodes) { out[p->s] = 2; st[head++] = p->s; }
+    if (p->g1 >= 0 && p->g1 < g_nnodes) { out[p->g1] = 2; st[head++] = p->g1; }
     while (head > 0) {
         int cur = st[--head];
         for (int e = 0; e < g_ec[cur]; ++e) {
@@ -741,7 +346,7 @@ static int flat_region(int k) {
     }
 
     head = 0;
-    if (p->f >= 0 && p->f < g_nnodes && !out[p->f]) { out[p->f] = 3; st[head++] = p->f; }
+    if (p->g0 >= 0 && p->g0 < g_nnodes && !out[p->g0]) { out[p->g0] = 3; st[head++] = p->g0; }
     while (head > 0) {
         int cur = st[--head];
         for (int e = 0; e < g_ec[cur]; ++e) {
@@ -752,8 +357,8 @@ static int flat_region(int k) {
         }
     }
 
-    if (p->f >= 0 && p->f < g_nnodes) out[p->f] = 0;
-    if (p->s >= 0 && p->s < g_nnodes) out[p->s] = 0;
+    if (p->g0 >= 0 && p->g0 < g_nnodes) out[p->g0] = 0;
+    if (p->g1 >= 0 && p->g1 < g_nnodes) out[p->g1] = 0;
 
     int n = 0;
     for (int i = 0; i < g_nnodes; ++i) if (out[i] == 1) n++;
@@ -785,11 +390,7 @@ static int flatten_skip(const char* gn) {
     for (size_t i = 0; i < sizeof(k_flatten_skip) / sizeof(k_flatten_skip[0]); ++i) {
         const char* p = k_flatten_skip[i];
         const char* colon = strchr(p, ':');
-        /* v155：带 ':' 的是**门对级**名单，只由 flatten_skip_pair 处理。
-         * 以前这里把它截成 ':' 前的图名当整图匹配 → `Fame-10:10049` 会把整张
-         * 1294 节点的 Fame-10 全跳过（PC 只跳一对），两端行为不一致。 */
-        if (colon) continue;
-        size_t n = strlen(p);
+        size_t n = colon ? (size_t)(colon - p) : strlen(p);
         if (n == 0) continue;
         if (p[n - 1] == '*') {
             if (n > 1 && strncmp(gn, p, n - 1) == 0) return 1;
@@ -820,7 +421,7 @@ static int flatten_skip_pair(const char* gn, int pid) {
     return 0;
 }
 
-static void flatten_try_inner(void* any_node) {
+void flatten_try(void* any_node) {
     if (!F_FLAT) return;
     if ((uintptr_t)any_node < 0x10000) return;
 
@@ -839,33 +440,16 @@ static void flatten_try_inner(void* any_node) {
         return;
     }
     if (!flat_build(g)) {
-        /* v193：不再"一次失败就永久放弃"。
-         * flat_build 失败 = 这一次节点表读不到（图指针失效 / 字段没解析到 → lcnt 返回 0）。
-         * 原来直接 flat_mark_done → 本次进程内这张图再也不处理，而且它的条件
-         * 一条也进不了 g_relax_ok（白名单）→ 整张图不放宽 → 表现为"某些事件有时不触发"。
-         * 现在记次数、给有限次重试，期间不登记 done。 */
-        int a = flat_att_inc(g);
-        if (a < FLAT_ATT_TRY) {
-            if (g_log_graph < FLAT_LOG_GRAPH) {
-                g_log_graph++;
-                LOGI("[flat] 图 %s 结构异常（节点 %d），本次跳过、下次重试（%d/%d）",
-                     unity_name(g, gb, sizeof(gb)), g_nnodes, a, FLAT_ATT_TRY);
-            }
-            return;
-        }
         flat_mark_done(g);
         if (g_log_graph < FLAT_LOG_GRAPH) {
             g_log_graph++;
-            LOGI("[flat] 图 %s 结构异常（节点 %d），已重试 %d 次，放弃展开",
-                 unity_name(g, gb, sizeof(gb)), g_nnodes, a);
+            LOGI("[flat] 图 %s 结构异常（节点 %d），跳过",
+                 unity_name(g, gb, sizeof(gb)), g_nnodes);
         }
         return;
     }
 
-    gate_info_register_all(gn);          /* v160：只登记不接管 */
-
-    
-/* ---------------- ① 找互补门对 ---------------- */
+    /* ---------------- ① 找互补门对 ---------------- */
     g_npairs = 0;
     int pair_skipped = 0;
     for (int i = 0; i < g_nnodes && g_npairs < FLAT_MAX_PAIRS; ++i) {
@@ -877,15 +461,6 @@ static void flatten_try_inner(void* any_node) {
         void* ca = g_cond[a];
         void* cb = g_cond[b];
         if ((uintptr_t)ca < 0x10000 || (uintptr_t)cb < 0x10000) continue;
-
-        /* v155：**白名单**——只认「当前在队」这一类条件（HavePartnerCondition）。
-         * 以前只看 partnerID+Negate，于是「石万三存活 / 石万三死亡」(NpcDeadCondition)、
-         * 关系值、位置等同样带 partnerID 的条件也被当成在队门对，展平后两侧都强制放行
-         * → 存活与死亡剧情同时播，语义矛盾（实测 R10049-2 的 10063）。
-         * SlgHavePartnerCondition 属 DLC 小游戏，不参与。 */
-        char cn1[64], cn2[64];
-        if (!is_story_cond(cls_name(ca, cn1, sizeof(cn1)))) continue;
-        if (!is_story_cond(cls_name(cb, cn2, sizeof(cn2)))) continue;
 
         int pa = *(int*)((char*)ca + OFF_HP_PARTNER_ID);
         int pb = *(int*)((char*)cb + OFF_HP_PARTNER_ID);
@@ -901,8 +476,8 @@ static void flatten_try_inner(void* any_node) {
         int g0 = na ? b : a;                           /* Negate=0 = 在队侧 */
         int g1 = na ? a : b;
 
-        int s0 = side_has_story(g0), s1 = side_has_story(g1);
-        if (!s0 && !s1) continue;      /* v155：两侧 region 都没有剧情 → 仍不动 */
+        int s0 = story_exit(g0), s1 = story_exit(g1);
+        if (!s0 && !s1) continue;                      /* X 类不动 */
 
         int dup = 0;
         for (int k = 0; k < g_npairs; ++k)
@@ -911,12 +486,7 @@ static void flatten_try_inner(void* any_node) {
 
         FLAT_PAIR* p = &g_pair[g_npairs++];
         p->g0 = g0; p->g1 = g1; p->pid = pa;
-        /* v159：v156 只加了字段和日志，**赋值丢了** → region 起点恒为 0，全部判空（展开 0）。
-         * a、b 就是父端口的连接顺序：a 先被引擎问。 */
-        p->f = a; p->s = b;
-        p->first_is_g0 = (a == g0) ? 1 : 0;
         p->both_story = (s0 && s1);
-        p->skip = 0;
         p->reg_n = 0; p->ex_start = 0; p->ex_n = 0;
     }
 
@@ -925,139 +495,38 @@ static void flatten_try_inner(void* any_node) {
         LOGI("[flat] 图 %s 按门对名单跳过 %d 对（partnerID 命中，其余照常展开）",
              gn, pair_skipped);
     }
-    if (g_npairs == 0) {
-        /* v178：图里没有门对时，允许放宽“门直接挂着的那个队友条件” */
-        for (int i = 0; i < g_nnodes; ++i) {
-            void* c = g_cond[i];
-            if ((uintptr_t)c < 0x10000) continue;
-            char cb[40];
-            if (is_story_cond(cls_name(c, cb, sizeof(cb)))) relax_ok_add(c);
-        }
-        flat_mark_done(g); return;
-    }
+    if (g_npairs == 0) { flat_mark_done(g); return; }
 
     /* ---------------- ② 每对算独占 region 与对外出口 ---------------- */
     for (int k = 0; k < g_npairs; ++k) {
         FLAT_PAIR* p = &g_pair[k];
-        if (p->skip) continue;          /* v169：不安全的对整体跳过 */
         p->reg_n = flat_region(k);
         p->ex_start = g_nexit;
         p->ex_n = 0;
-        if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION) {
-            if (flat_dbg_graph(gn)) LOGI("[flat-pair] 图=%s 序=%d pid=%d region=%d（跳过改线）", gn, k, p->pid, p->reg_n);
-            /* v179（用户指定）：**解耦** —— region=0 只是“展平不改线”，
-             * 不再因此禁止放宽。放宽有自己的判据（R 图规则/入过队/名单/额度），
-             * 而“分支有没有出路”由链式接续表负责。 */
-            continue;
-        }
+        if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION) continue;
 
         unsigned char* reg = g_reg[k];
-        int back_to_first = 0;
         for (int i = 0; i < g_nnodes && g_nexit < FLAT_MAX_EDGES; ++i) {
             if (reg[i] != 1) continue;
             for (int e = 0; e < g_ec[i]; ++e) {
                 int ei = g_e0[i] + e;
                 if (reg[g_edge[ei].tgt] == 1) continue;      /* 内部边 */
-                if (g_edge[ei].tgt == p->s) continue;        /* 已经接过去了 */
+                if (g_edge[ei].tgt == p->g1) continue;       /* 已经接过去了 */
                 if (g_nexit >= FLAT_MAX_EDGES) break;
                 g_exit[g_nexit++] = ei;
                 p->ex_n++;
-                /* v169：出口边若指回 first 本身，说明这条"出口"其实是**入口**
-                 * （R10049-2-1 的 10098 就是这种：唯一 exit 的 old 目标正是门N0，
-                 *  改走之后门N0 变孤岛，她整块 29 节点内容永远不可达）。 */
-                if (g_edge[ei].tgt == p->f) back_to_first = 1;
             }
         }
     }
 
-    /* v169：安全检查 —— 任一条出口指回 first，或 region 过大 → 整对跳过（不改线、不强制门） */
+    /* ---------------- ③ 逐对落地（先判冲突，再动手） ---------------- */
+    int expanded = 0, redirected = 0, skipped = 0;
     for (int k = 0; k < g_npairs; ++k) {
         FLAT_PAIR* p = &g_pair[k];
-        if (p->reg_n == 0) continue;
-        int bad = 0; const char* why = 0;
-        if (p->reg_n > 16) { bad = 1; why = "region 过大"; }
-        if (!bad) {
-            for (int e = 0; e < p->ex_n; ++e) {
-                int ei = g_exit[p->ex_start + e];
-                if (g_edge[ei].tgt == p->f) { bad = 1; why = "出口指回 first（入口被误当出口）"; break; }
-            }
-        }
-        if (bad) {
-            p->skip = 1;
-            no_relax_add(g_cond[p->f]); no_relax_add(g_cond[p->s]);
-            if (flat_dbg_graph(gn) || g_log_graph < 8)
-                LOGI("[flat]   pid=%d 跳过展开：%s（region=%d，出口=%d）", p->pid, why, p->reg_n, p->ex_n);
-        }
-    }
-
-    /* v192（A/B 对照）：**只关掉名单式链式接续，其它逻辑一行不动。**
-     *
-     * 它是 v172~v174 在通用 region 规则之外单独加的 7 张图（M5061-5 / R10005-5 /
-     * R10049-2-1 / R10098-1 / Role5-10 / M5061-3 / R10039-6），走另一条路径：
-     *   · 不校验（无环检测、无可达性守恒）
-     *   · 不回滚（port_set_conn_node 失败就 continue）
-     *   · 只强制 G0（在队门），从不管 G1
-     *   · 把「内容末端的唯一出边」直接改指下一对的在队门，**原目标被丢弃**
-     *
-     * 离线复现（PC 侧 tools/audit_chain_patch.py，同一份剧情资产）被丢弃的原目标里：
-     *   R10005-5   内容末端 → 「时间流逝」        ← 剧情跳时间逻辑被整条砍掉
-     *   R10049-2-1 三条「添加标记」的出口 → 汇合点
-     *   R10039-6   「追加简介」的出口
-     *   Role5-10   死配置（图里找不到那两个 pid 的门对，强制门 0 个）
-     *
-     * 改成 1 即恢复。名单与 flat_apply_chain 都留着，方便逐张重新验证后再放开。 */
-#define FLAT_CHAIN_ENABLED 0
-#if FLAT_CHAIN_ENABLED
-    {
-        const int* cp = 0;
-        int cn = flat_chain_pids(gn, &cp);
-        if (cn >= 2 && g_npairs >= 2) flat_apply_chain(gn, cp, cn);
-    }
-#endif
-
-    /* v167：region 与 exits 都算完之后，按对输出审计明细（只对指定图） */
-    if (flat_dbg_graph(gn))
-        for (int k = 0; k < g_npairs; ++k)
-            if (g_pair[k].reg_n > 0) flat_dump_pair(gn, k);
-
-    /* ---------------- ③ 逐对落地（事务化：改线 → 校验 → 提交或全部回滚） ----------------
-     * v153：把“边算边改”改成“先全改、再校验、不合格整体回滚”。
-     * 校验两条（缺一不可，都会造成「剧情卡死」）：
-     *   ① 无新增环：新环必然经过某条被改的边 (u→g1)，所以只要检查 g1 能否回到 u；
-     *   ② 可达性守恒：改线后 Reach(g1) 必须仍然包含改线前的 Reach(g1)（汇合点不能丢）。
-     * 任一不过 → 按 journal 逆序还原所有边 + 回退条件/门登记水位。 */
-    int expanded = 0, redirected = 0, skipped = 0, overlaps = 0, rolled = 0;
-    int skipped_global = 0;      /* v193：被「全局状态保护」放弃的对数 */
-    g_undo_n = 0;
-    int wm_cond = g_flat_cond_n, wm_gate = g_flat_gate_n;
-    int commit_fail = 0;
-
-    /* 记录改线前 Reach(g1) 的并集（用于第 ② 条），按对分别记太占内存，这里只记并集 */
-    memset(g_reach_before, 0, (size_t)g_nnodes);
-
-    /* 预扫：按对记录“改线前 Reach(g1)”，必须在任何改线之前算 */
-    memset(g_before_bits, 0, sizeof(g_before_bits));
-    for (int k = 0; k < g_npairs; ++k) {
-        FLAT_PAIR* p = &g_pair[k];
-        if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION || p->ex_n == 0) continue;
-        flat_mark_reach(p->s, g_tmp_reach);
-        for (int i = 0; i < g_nnodes; ++i)
-            if (g_tmp_reach[i]) g_before_bits[k][i >> 3] |= (unsigned char)(1u << (i & 7));
-    }
-
-    for (int k = 0; k < g_npairs; ++k) {
-        FLAT_PAIR* p = &g_pair[k];
-        /* v170：v169 的 skip 标志插在别的循环里（只挡住校验、没挡住提交）。
-         * 这里才是真正落地的位置：命中安全判据的对不改线、不登记强制门。 */
-        if (p->skip) { skipped++; continue; }
         if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION || p->ex_n == 0) { skipped++; continue; }
 
-        /* v193：**全局状态保护** —— 见 k_global_state 上面的长注释。
-         * 这一对的对外出口如果落到「时间流逝 / 标记 / 变量 / 关系值 / 离队…」这类节点上，
-         * 改线就会把那一步跳过，连累无关剧情。直接放弃这一对（不改线、不强制门、不进白名单）。 */
-        if (flat_pair_touches_global(p)) { skipped_global++; continue; }
-
-        /* v151（用户指定）：不再因为“与另一对门的 region 相交”而跳过，只计数 */
+        /* 冲突：与另一对的 region 相交 → 这一对不动（另一对会在它自己那轮判）。
+         * v87 与 PC 对齐：region 超上限的对**也参与**冲突判定（PC 只跳过 reg_n==0 的）。 */
         int clash = 0;
         for (int q = 0; q < g_npairs && !clash; ++q) {
             if (q == k) continue;
@@ -1068,104 +537,40 @@ static void flatten_try_inner(void* any_node) {
             for (int i = 0; i < g_nnodes; ++i)
                 if (ra[i] == 1 && rb[i] == 1) { clash = 1; break; }
         }
-        if (clash) overlaps++;
+        if (clash) { skipped++; continue; }
 
         int ok = 0, bad = 0;
         for (int e = 0; e < p->ex_n; ++e) {
-            int ei = g_exit[p->ex_start + e];
-            FLAT_EDGE* ed = &g_edge[ei];
-            if (g_undo_n >= FLAT_MAX_UNDO) { commit_fail = 1; break; }
-            if (!port_set_conn_node(ed->port, ed->slot, g_nd[p->s])) { commit_fail = 1; break; }
-            g_undo[g_undo_n].ei = ei;
-            g_undo[g_undo_n].old_tgt = ed->tgt;
-            g_undo[g_undo_n].g1 = p->s;
-            g_undo_n++;
-            ed->tgt = p->s;          /* 镜像到内存表，后面的 DFS 才看得到新边 */
-            ok++;
+            FLAT_EDGE* ed = &g_edge[g_exit[p->ex_start + e]];
+            if (port_set_conn_node(ed->port, ed->slot, g_nd[p->g1])) ok++;
+            else bad++;
         }
         redirected += ok;
-        if (commit_fail) { rolled = 1; break; }
 
-        flat_add_cond(g_cond[p->f]);
-        flat_add_cond(g_cond[p->s]);
-        flat_add_gate(g_nd[p->f]);
-        flat_add_gate(g_nd[p->s]);
-        relax_ok_add(g_cond[p->f]);
-        relax_ok_add(g_cond[p->s]);
-        /* v161：强制表登记的是 f/s，日志查询的也是 f/s —— 这里必须按 f/s 登记，
-         * 否则 forced=Y 的门查不到 pid（v160 的 pid=0 就是这么来的）。
-         * 侧别仍按 Negate 语义标注（Negate=0 = 在队侧）。 */
-        gate_info_add(g_nd[p->f], p->pid, (p->f == p->g0) ? 1 : 0);
-        gate_info_add(g_nd[p->s], p->pid, (p->s == p->g0) ? 1 : 0);
+        flat_add_cond(g_cond[p->g0]);
+        flat_add_cond(g_cond[p->g1]);
+        /* v87：门指针也记一份 —— hook_hold_check 用它整门判真（对齐 PC） */
+        flat_add_gate(g_nd[p->g0]);
+        flat_add_gate(g_nd[p->g1]);
+
+        /* 只登记姓名窗口（改名的时机由播放状态驱动，见 story_play_begin/end） */
+        if (F_STORY) relax_name_open(p->pid, g);
 
         expanded++;
-        if (g_log_pair < 300) {
+        if (g_log_pair < 60) {
             g_log_pair++;
-            LOGI("[flat]   pid=%d (%s) 先问=%s 内容 %d 节点，改线 %d 条%s",
-                 p->pid, p->both_story ? "B 类" : "A 类",
-                 p->first_is_g0 ? "在队" : "不在队", p->reg_n, ok, bad ? " ⚠部分失败" : "");
+            LOGI("[flat]   pid=%d (%s) 内容 %d 节点，改线 %d 条%s",
+                 p->pid, p->both_story ? "B 类" : "A 类", p->reg_n, ok,
+                 bad ? " ⚠部分失败" : "");
         }
     }
-
-    /* ---- 校验 ---- */
-    if (!rolled) {
-        for (int i = 0; i < g_undo_n; ++i) {
-            int s = g_edge[g_undo[i].ei].src;
-            if (flat_reach(g_undo[i].g1, s, g_tmp_reach)) { rolled = 1; break; }
-        }
-    }
-    if (!rolled) {
-        /* 按对比较：第 k 对改线前的 Reach(g1) 必须仍是改线后的子集 */
-        for (int k = 0; k < g_npairs && !rolled; ++k) {
-            FLAT_PAIR* p = &g_pair[k];
-            if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION || p->ex_n == 0) continue;
-            flat_mark_reach(p->s, g_tmp_reach);
-            for (int i = 0; i < g_nnodes; ++i) {
-                if (!(g_before_bits[k][i >> 3] & (1u << (i & 7)))) continue;
-                if (!g_tmp_reach[i]) { rolled = 1; break; }
-            }
-        }
-    }
-
-    if (rolled) {
-        /* 全部回滚：边 → 旧目标；条件/门登记 → 水位 */
-        for (int i = g_undo_n - 1; i >= 0; --i) {
-            FLAT_EDGE* ed = &g_edge[g_undo[i].ei];
-            port_set_conn_node(ed->port, ed->slot, g_nd[g_undo[i].old_tgt]);
-            ed->tgt = g_undo[i].old_tgt;
-        }
-        g_flat_cond_n = wm_cond;
-        g_flat_gate_n = wm_gate;
-        if (g_log_rollback++ < 200)
-            LOGI("[flat] 图 %s 回滚：改线 %d 条后校验不通过（环或可达性），已全部还原",
-                 unity_name(g, gb, sizeof(gb)), g_undo_n);
-        expanded = 0; redirected = 0;
-    } else if (F_STORY) {
-        for (int k = 0; k < g_npairs; ++k) {
-            FLAT_PAIR* p = &g_pair[k];
-            if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION || p->ex_n == 0) continue;
-            relax_name_open(p->pid, g);
-        }
-    }
-    g_undo_n = 0;
 
     flat_mark_done(g);
 
     if (g_log_graph < FLAT_LOG_GRAPH) {
         g_log_graph++;
-        LOGI("[flat] 图 %s：节点 %d，门对 %d，展开 %d（跳过 %d，含区域相交 %d、全局状态保护 %d），改线 %d 条，接管条件 %d 个（累计）",
-             unity_name(g, gb, sizeof(gb)), g_nnodes, g_npairs, expanded, skipped, overlaps,
-             skipped_global, redirected, g_flat_cond_n);
+        LOGI("[flat] 图 %s：节点 %d，门对 %d，展开 %d（跳过 %d），改线 %d 条，接管条件 %d 个（累计）",
+             unity_name(g, gb, sizeof(gb)), g_nnodes, g_npairs, expanded, skipped,
+             redirected, g_flat_cond_n);
     }
-}
-
-/* v153：重入保护。条件判定会跑在加载线程（tombstone 里是 Loading.Preload），
- * 而整个展平用的是一组静态暂存 —— 并发进入会互相踩。抢不到就直接放弃本次。 */
-static volatile int g_flat_busy = 0;
-
-void flatten_try(void* any_node) {
-    if (!F_FLAT) return;
-    if (__atomic_exchange_n(&g_flat_busy, 1, __ATOMIC_ACQ_REL)) return;
-    flatten_try_inner(any_node);
-    __atomic_store_n(&g_flat_busy, 0, __ATOMIC_RELEASE);
 }

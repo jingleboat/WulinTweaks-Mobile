@@ -55,13 +55,7 @@ volatile int F_TRUEMAP = 0;  /* v127：大地图「真写进存档」—— 默�
 volatile int F_MAP = 0;     /* v125：默认关（只改显示层，会让「判断大地图图标显示」这类剧情门永久卡死） */
 volatile int F_CAB = 0;     /* v125：默认关（同上，马车图标） */
 volatile int F_STORY = 1;   /* v44 起默认开（此前是 0，每次启动要手动点） */
-volatile int F_FLAT = 1;    /* v194：剧情分支展开，默认开（恢复 v65 的行为）。
-                             * 只走**通用 region 规则**：只放行「原目标是纯流程分支」的改线
-                             * （流程判断 / 选项 / 注释 / 播放剧情），全量 717/902 = 79% 门对可展开；
-                             * 原目标是「时间流逝 / 标记 / 变量 / 人物数据」的一律不改线。
-                             * 名单式**链式接续已整段停用**（FLAT_CHAIN_ENABLED 0）—— 那 7 张图会砍掉
-                             * 时间流逝等收尾节点，是「开了分支展开后无关剧情不触发」的成因，
-                             * 与本开关无关。 */
+volatile int F_FLAT = 1;    /* v65 剧情分支展开，默认开 */
 volatile int F_WATER = 1;
 
 fn_i2c_get A_domain_get = nullptr;
@@ -761,25 +755,19 @@ static int never_joined(int uid) {
  * 读不到图名时保守返回 0（放宽），避免误挡。 */
 static int keep_original_for_uncached(void* condNode);
 
-/* v160：放宽粒度从「每图一次」改成「每 (图, partnerID) 一次」。
- * 原因：R10049-2 里有 12 对「需要伙伴」，旧的每图一次让第一个角色吃掉额度，
- * 其余 11 个角色全部走原版 —— 明显不是本意（放宽的对象本来就是"某个角色的在队条件"）。
- * 防循环能力不变：每个角色在每张图里仍然只放宽一次。 */
-#define RELAX_ONCE_N 256
+/* v109：同一张剧情图只放宽一次（不再用固定名单） */
+#define RELAX_ONCE_N 128
 static char g_ro_name[RELAX_ONCE_N][64];
-static void* g_ro_cond[RELAX_ONCE_N];      /* v176：额度按「条件节点」记账（原来按 pid） */
 static int  g_ro_i = 0;
 static int  g_ro_log = 0;
-static int relax_once_cond(const char* gn, void* cond) {
+static int relax_once(const char* gn) {
     if (!gn || !gn[0]) return 1;
-    if ((uintptr_t)cond < 0x10000) return 1;
     for (int i = 0; i < RELAX_ONCE_N; ++i)
-        if (g_ro_name[i][0] && g_ro_cond[i] == cond && strcmp(g_ro_name[i], gn) == 0) {
-            if (g_ro_log++ < 20) LOGI("[relax] 图 %s 条件 %p 已放宽过一次 -> 本次走原版", gn, cond);
+        if (g_ro_name[i][0] && strcmp(g_ro_name[i], gn) == 0) {
+            if (g_ro_log++ < 12) LOGI("[relax] 图 %s 已放宽过一次 -> 本次走原版", gn);
             return 0;
         }
     snprintf(g_ro_name[g_ro_i], sizeof(g_ro_name[0]), "%s", gn);
-    g_ro_cond[g_ro_i] = cond;
     g_ro_i = (g_ro_i + 1) % RELAX_ONCE_N;
     return 1;
 }
@@ -794,13 +782,11 @@ static int relax_once_cond(const char* gn, void* cond) {
  *    不适合做 16 字节内联补丁（跳板重定位踩到 PC 相对指令）。该钩子已撤掉，改走既有信号。 */
 static void relax_once_reset(void) {
     memset(g_ro_name, 0, sizeof(g_ro_name));
-    memset(g_ro_cond, 0, sizeof(g_ro_cond));
     g_ro_i = 0;
 }
 
 /* 带 TTL 缓存的入口：条件检查是热路径，若每次读图名 + 调 GetCharacter 会卡。
  * 入队状态会变，所以 TTL 3 秒，不能永久缓存。 */
-const char* flat_node_name(void* nd) { static char b[64]; if ((uintptr_t)nd < 0x10000) return "(null)"; return obj_name(nd, b, sizeof(b)); }
 static int keep_original_for(void* condNode) {
     if ((uintptr_t)condNode < 0x10000) return 0;
 
@@ -885,40 +871,13 @@ static int is_bond_graph(void* g, const char* gn) {
     return hit;
 }
 
-/* v176：门已经通过过（times != 0）→ 本次一律不放宽。
- * 用来替代被删掉的 Hold 守卫：守卫是“事后压制”（orig 已跑、times 已+1 再压回 false），
- * 这里改成“事前禁止放宽”，既不重复播，也不会污染 times。 */
-/* v197：**递归安全**。这两个变量是「本次门判定」的上下文，而 hook_hold_check 是递归的 ——
- * hold_check_core 里调 orig_hold_check，原版 CheckCondition 会推进剧情、进而判定下一个门，
- * 又进 hook_hold_check。原来是全局 static int：
- *     外层 g_no_relax_eval = (t0 != 0);
- *           → 内层递归重新赋值、再清 0
- *     外层 hold_check_core 返回后再读 g_no_relax_eval —— 已经是被内层踩过的值
- * 结果就是「同一段剧情，跑得深就跑飞、跑得浅就正常」，也就是用户报的
- * 「有时可触发有时不行」。
- * 改成 __thread + 保存/恢复（见 hook_hold_check），嵌套再多也不互相污染。 */
-static __thread int g_no_relax_eval = 0;
 static int keep_original_for_uncached(void* condNode) {
-    if (g_no_relax_eval) return 1;      /* v176：本门已通过过 → 不放宽 */
     void* g = *(void**)((char*)condNode + OFF_NODE_GRAPH);
     if ((uintptr_t)g < 0x10000) return 0;
 
     char gb[128];
     const char* gn = obj_name(g, gb, sizeof(gb));
     if (!gn || !gn[0] || gn[0] == '?') return 0;
-
-    /* v171：门对没被展平接管（region=0 / 安全跳过）→ 一律按原版，不做放宽。
-     * 否则宽松会把流程拐进该角色的支线，而那条支线没有改线接回主线。 */
-    if (!flatten_relax_allowed(condNode)) {
-        if (g_scene_log++ < 20)
-            LOGI("[team] 图 %s 该条件不属于门对 → 不放宽（v178）", gn);
-        return 1;
-    }
-    if (flatten_relax_forbidden(condNode)) {
-        if (g_scene_log++ < 20)
-            LOGI("[team] 图 %s 该条件所属门对未被展平接管 → 不放宽（原版）", gn);
-        return 1;
-    }
 
     for (size_t i = 0; i < sizeof(k_fixed_original) / sizeof(k_fixed_original[0]); ++i)
         if (strcmp(gn, k_fixed_original[i]) == 0) return 1;
@@ -961,7 +920,7 @@ static int keep_original_for_uncached(void* condNode) {
     if (selfId <= 0) {                               /* 非角色剧情图：放宽 */
         int p0 = *(int*)((char*)condNode + OFF_PARTNER_ID);
         if (p0 > 0) unstranger_apply_uid(p0, 0);     /* ★ 顺带清掉涉及角色的陌生名 */
-        return 0;                                   /* 非角色剧情图：直接放宽（不计额度） */
+        return 0;
     }
 
     int pid = *(int*)((char*)condNode + OFF_PARTNER_ID);
@@ -970,7 +929,7 @@ static int keep_original_for_uncached(void* condNode) {
          * 计数器，它只该限制"放宽"，不该限制"清名字"。否则同一张图（如 R10049-2 有 19 个
          * partnerID）第一个条件用掉那一次之后，后面所有角色都清不到（凌梦蝶就是这样漏掉的）。 */
         unstranger_apply_uid(pid, 0);
-        return relax_once_cond(gn, condNode) ? 0 : 1;
+        return relax_once(gn) ? 0 : 1;
     }
 
     if (is_bond_graph(g, gn)) {                      /* v95：结缘图跳过放宽 */
@@ -980,7 +939,7 @@ static int keep_original_for_uncached(void* condNode) {
     }
     if (never_joined(pid)) return 1;                 /* 本命角色：从未入队 → 不放宽，同样不清 */
     unstranger_apply_uid(pid, 0);                     /* ★ 只在"本来会放宽"时才清 */
-    return relax_once_cond(gn, condNode) ? 0 : 1;                   /* 已入过队 → 只放宽一次 */
+    return relax_once(gn) ? 0 : 1;                   /* 已入过队 → 只放宽一次 */
 }
 
 /* 每次「需要伙伴 / 有伙伴」条件判定 +1（按线程）。
@@ -1907,62 +1866,22 @@ static void unstranger_apply_uid(int pid, int force) {
         LOGI("[name] 放宽在队条件 uid=%d 清空陌生名 \"%s\"", pid, gb);
 }
 
-
-/* v163：按**字段名**解析条件的 partnerID / Negate 偏移并缓存。
- * 不同条件子类布局不同（例如 TalkToNpcCondition 的 partnerID 不在 0x58），
- * 用固定偏移会读到垃圾值（日志里出现过 pid=495075136）。 */
-typedef struct { void* klass; int pid_off; int neg_off; } COND_FIELD_CACHE;
-static COND_FIELD_CACHE g_cfc[64];
-static int g_cfc_n = 0;
-
-static void cond_field_offsets(void* cond, int* pid_off, int* neg_off) {
-    *pid_off = -1; *neg_off = -1;
-    if ((uintptr_t)cond < 0x10000 || !A_obj_get_class) return;
-    void* k = A_obj_get_class(cond);
-    if ((uintptr_t)k < 0x10000) return;
-    for (int i = 0; i < g_cfc_n; ++i)
-        if (g_cfc[i].klass == k) { *pid_off = g_cfc[i].pid_off; *neg_off = g_cfc[i].neg_off; return; }
-
-    static void* (*fld_from_name)(void*, const char*) = nullptr;
-    static size_t (*fld_offset)(void*) = nullptr;
-    if (!fld_from_name && g_i2cpp) {
-        fld_from_name = (void* (*)(void*, const char*))dlsym(g_i2cpp, "il2cpp_class_get_field_from_name");
-        fld_offset   = (size_t (*)(void*))dlsym(g_i2cpp, "il2cpp_field_get_offset");
-    }
-    int po = -1, no = -1;
-    if (fld_from_name && fld_offset) {
-        void* f1 = fld_from_name(k, "partnerID");
-        if ((uintptr_t)f1 > 0x10000) po = (int)fld_offset(f1);
-        void* f2 = fld_from_name(k, "Negate");
-        if ((uintptr_t)f2 > 0x10000) no = (int)fld_offset(f2);
-    }
-    if (g_cfc_n < 64) { g_cfc[g_cfc_n].klass = k; g_cfc[g_cfc_n].pid_off = po; g_cfc[g_cfc_n].neg_off = no; g_cfc_n++; }
-    *pid_off = po; *neg_off = no;
-}
-
-int cond_pid_by_field(void* cond) {
-    int po, no; cond_field_offsets(cond, &po, &no);
-    if (po < 0 || po > 0x400) return 0;
-    return *(int*)((char*)cond + po);
-}
-int cond_negate_by_field(void* cond) {
-    int po, no; cond_field_offsets(cond, &po, &no);
-    if (no < 0 || no > 0x400) return 0;
-    return (int)*(unsigned char*)((char*)cond + no);
-}
-
-/* v164：本次判定里「放宽参与了几次」「有没有被守卫压过」——用于 [gate] 的源标记 */
-/* v197：同样改成 __thread —— 它们是"本次门判定"的观测计数，递归时也会互相覆盖。
- * 只影响 [gate] 日志里的来源标记（RELAXED/GUARDED），不影响判定结果，但一起改干净。 */
-static __thread int g_ev_relax_hits = 0;
-static __thread int g_ev_guarded = 0;
-
 static bool hook_check_joined(void* self, int io, void* line) {
     g_team_cond_hits++;
-    flatten_try(self);
-    /* v155（用户指定）：IsJoinedTeamCondition 的语义是「曾经加入过队伍」，不是「当前在队」。
-     * 它**不作为被放宽的条件**（放宽它 = 允许“从未加入”也触发本命事件）；
-     * 但仍按原版判定 —— 本命事件的这道门槛必须完整保留。 */
+    flatten_try(self);                      /* v65：顺手把「分支展开」补丁套到这张图上（只做一次） */
+    /* v70：被「分支展开」接管的条件恒真。用基类实现 = 丢掉这一个条件，
+     * 但 partnerID/Negate 原值仍在，下面 mark_relaxed 才能继续为「姓名替换」开窗口。 */
+    if (flatten_cond_always_true(self)) {
+        mark_relaxed(self);
+        unstranger_relaxed(self);           /* v138：这条在队条件被跳过 → 清该角色的陌生名 */
+        if (base_check_all) return base_check_all(self, io, line);
+        return true;
+    }
+    if (F_STORY && base_check_all && !keep_original_for(self)) {
+        mark_relaxed(self);                 /* v61：记下"这次放宽放过了谁"，用于显示真名 */
+        unstranger_relaxed(self);           /* v138：同上 */
+        return base_check_all(self, io, line);
+    }
     return orig_check_joined ? orig_check_joined(self, io, line) : false;
 }
 
@@ -1975,27 +1894,12 @@ static bool hook_check_partner(void* self, int io, void* line) {
         if (base_check_all) return base_check_all(self, io, line);
         return true;
     }
-    /* v165：同 joined —— 先原版，失败才放宽 */
-    bool r0 = orig_check_partner ? orig_check_partner(self, io, line) : false;
-    if (r0 || !F_STORY || !base_check_all) return r0;
-    if (!keep_original_for(self)) {
+    if (F_STORY && base_check_all && !keep_original_for(self)) {
         mark_relaxed(self);
-        unstranger_relaxed(self);
-        g_ev_relax_hits++;
-        /* v199：**改回 v137 的做法 —— 放宽队友条件后返回基类判定的结果，不是直接 true。**
-         *
-         * v177 曾经改成 `return true`，理由是"调基类会把整条条件链一起放行，导致剧情播 3 遍"。
-         * 但那个改动把**同一道门上的其它条件**也一起跳过了：
-         *   开场剧情的门同时挂着「队友在队」和「经过 3 时辰」，
-         *   v177 之后队友条件一放宽就 return true → 时辰根本没被检查 →
-         *   门在不该通过时通过、走错分支、times 被消耗 → 真正到时辰反而不播。
-         * 这就是用户报的「开场没触发」。
-         *
-         * v137 的正确语义：只丢掉「队友在队」这一条，其余条件照检 —— 由基类完成。
-         * 若再出现"播 3 遍"，那也是基类之外的问题，不该靠跳过其它条件来掩盖。 */
+        unstranger_relaxed(self);           /* v138 */
         return base_check_all(self, io, line);
     }
-    return r0;
+    return orig_check_partner ? orig_check_partner(self, io, line) : false;
 }
 
 /* ---- 伙伴邀请/离队：离队容错（v50） --------------------------------------
@@ -2406,13 +2310,7 @@ static bool hook_enter_area(void* self) {    bool r = orig_enter_area ? orig_ent
  * 也就是说 16 这个数字是为了「绝对安全」随手取的小值，不是按真实剧情深度定的。
  * 但 ContinueArrange 是链式递归推进：一个节点推下一个，链长 = 剧情节点数。
  * 释法寺 Spe-2020 有 315 个节点，实测走到 16 层就被这里砍断 → 剧情停在半路、UI 不出。
- *
- * ⚠️ **绝对不要再往上抬。** v198 曾按「8 MB / 0xd0 ≈ 四万层」把它提到 4096，
- * 结果实测**用消耗品直接闪退**，tombstone 里清清楚楚：
- *     #472~#511  libwulin.so (hook_continue_arrange+324) ↔ libil2cpp.so 交替 500+ 层
- * 栈溢出。那个换算错得离谱：每层除了 ContinueArrange 自己，还夹着
- * il2cpp 的 CheckCondition / OnActive 等中间帧，真实占用是 0xd0 的几十倍，
- * 8 MB 只够 500 层左右。256 是安全值，也是 v137（用户验证正常的那版）的值。 */
+ * 8 MB / 0xd0 ≈ 四万层，256 层只占 52 KB，与 PC 端（CA_MAX_DEPTH=256）对齐即可。 */
 #define CA_MAX_DEPTH 256
 static void (*orig_continue_arrange)(void* self, void* node, void* port) = nullptr;
 static __thread int g_ca_depth = 0;
@@ -2549,17 +2447,34 @@ static bool hold_check_core(void* self) {
      *   - 没碰（计数没变）→ 这个 Hold 与放宽无关，一行都不碰；
      *   - 碰过 + times!=0 + 这次仍然通过 → 是放宽把"一次性"变成了"可重复"→ 压回 false。 */
     int before = g_team_cond_hits;
-    g_ev_relax_hits = 0;                      /* v165：本次判定里是否真的放宽过 */
     bool r = orig_hold_check ? orig_hold_check(self) : false;
     if (!F_STORY || !r) return r;
-    /* v165（用户要求）：判据从「队友条件被求值过」改成「本次确实发生过放宽」。
-     * 旧判据的问题是：原版本来就为真（角色真在队）时也会被误判成
-     * "放宽引起的重复触发"，于是把合法通过压掉 —— 实测导致鱼薇儿在队也不触发。 */
-    /* v176（用户指定）：**删除 Hold 守卫**。
-     * 原守卫是“事后压制”：orig 已执行、times 已 +1，再把结果压回 false ——
-     * 既冗余（额度已限次），又污染 times。
-     * 其职责改由入口处的 g_no_relax_eval（门已通过过 → 不放宽）承担。 */
-    return r;
+    if (g_team_cond_hits == before) return r;      /* 本次判定没碰队友条件：不干预 */
+    if ((uintptr_t)self < 0x10000) return r;
+
+    int times = *(int*)((char*)self + OFF_HOLD_TIMES);
+    if (times == 0) return true;          /* 还没成功过：这次正常放行 */
+
+    /* 三条例外（交给原版语义，不做压制）：
+     *   - R{角色id}- 图：条件已由 keep_original_for 精确判定，再压制会让「入队后」也只剩一次；
+     *   - 固定名单（主线/师父线/点名压制的图），同样按原版；
+     *   - 手动名单。 */
+    char gb[128];
+    void* g = *(void**)((char*)self + OFF_NODE_GRAPH);
+    const char* gn = ((uintptr_t)g > 0x10000) ? obj_name(g, gb, sizeof(gb)) : "?";
+    /* v108：去掉「R{角色id}- 整族豁免」——苗彩蝶(10005) 的 R10005-* 就是因此循环触发。 */
+    for (size_t i = 0; i < sizeof(k_fixed_original) / sizeof(k_fixed_original[0]); ++i)
+        if (strcmp(gn, k_fixed_original[i]) == 0) return true;
+    if (story_blacklisted(gn)) return true;
+
+    /* 其余：队友条件被放宽后，这个 Hold 已经通过过还要再过 → 压回 false。 */
+    if (g_hold_once_warn < 8) {
+        g_hold_once_warn++;
+        char nb[128];
+        LOGI("[once] 剧情图 %s 的 Hold \"%s\" times=%d 已通过过，压制本次（放宽引起的重复触发）",
+             gn, obj_name(self, nb, sizeof(nb)), times);
+    }
+    return false;
 }
 
 /* v87：与 PC 的 Patch_FlattenGate 对齐 —— 被「分支展开」接管的门整门判真。
@@ -2572,82 +2487,9 @@ static bool hold_check_core(void* self) {
  * 优先级：**高于**上面「Hold 只放行一次」的压制。PC 端两个 Postfix 的生效顺序也是
  * Patch_FlattenGate 盖住 HoldOnceGuard（注册顺序决定），这里用「先核心、后强制」显式对齐。
  * 另外 flatten_gate_forced 故意不看 F_FLAT —— 线已改指，门必须继续放行，否则卡死。 */
-/* v155：门的执行轨迹（纯观测）。只在「状态变化」时打一行，避免热路径刷屏。 */
-typedef struct { void* gate; int last; } GATE_TRACE;
-static GATE_TRACE g_gtrace[128];
-static int g_gtrace_n = 0, g_gtrace_log = 0;
-
-static void gate_trace(void* self, int forced, int result, const char* src, int t_before, int t_after) {
-    if ((uintptr_t)self < 0x10000 || g_gtrace_log >= 400) return;
-    int last = -1, slot = -1;
-    for (int i = 0; i < g_gtrace_n; ++i)
-        if (g_gtrace[i].gate == self) { last = g_gtrace[i].last; slot = i; break; }
-    if (last == result) return;                 /* 状态没变，不重复打 */
-    if (slot < 0) {
-        if (g_gtrace_n >= 128) return;
-        slot = g_gtrace_n++;
-        g_gtrace[slot].gate = self;
-    }
-    g_gtrace[slot].last = result;
-    g_gtrace_log++;
-    char gb[96]; gb[0] = 0;
-    void* g = *(void**)((char*)self + OFF_NODE_GRAPH);
-    const char* gn = ((uintptr_t)g > 0x10000) ? obj_name(g, gb, sizeof(gb)) : "?";
-    int in_team = -1;
-    int pid = flatten_gate_pid(self, &in_team);
-    LOGI("[gate] 图=%s 门=%p pid=%d 类=%s 侧=%s times=%d→%d forced=%s 源=%s → %s",
-         gn, self, pid, flatten_gate_cls(self),
-         pid <= 0 ? "?" : (in_team ? "在队" : "不在队"),
-         t_before, t_after, forced ? "Y" : "N", src ? src : "?",
-         result ? "通过" : "不通过");
-}
-
 static bool hook_hold_check(void* self) {
-    if ((uintptr_t)self < 0x10000) return false;
-    int t0 = *(int*)((char*)self + OFF_HOLD_TIMES);
-
-    /* v164（S1）：已被展平接管的门 —— **不调用原版**，直接放行。
-     * 为什么：原版 CheckCondition 内部会把 checkSucessTimes +1，
-     * 我们“先调再覆盖”等于白白消耗原生次数（这正是用户指出的隐患）。
-     * 展平的“两侧各播一次”由改线保证，不需要原生次数参与。 */
-    if (flatten_gate_forced(self)) {
-        /* v165：展平门不再调用原版 → 条件层的 clear 也不会跑，这里补回来 */
-        int pit = -1;
-        int pid2 = flatten_gate_pid(self, &pit);
-        if (pid2 > 0) unstranger_apply_uid(pid2, 0);
-        gate_trace(self, 1, 1, "FLATTENED", t0, t0);
-        return true;
-    }
-
-    /* v197：**保存 / 恢复**，不是直接清 0。
-     * hook_hold_check 是递归的（orig_hold_check 会推进剧情、再判定下一个门），
-     * 直接清 0 会把外层的状态冲掉；恢复成进入前的值才能嵌套安全。 */
-    int saved_no_relax = g_no_relax_eval;
-    int saved_relax_hits = g_ev_relax_hits;
-    int saved_guarded = g_ev_guarded;
-
-    g_ev_relax_hits = 0; g_ev_guarded = 0;
-    g_no_relax_eval = (t0 != 0);        /* v176：这道门以前通过过 → 本次不放宽 */
     bool r = hold_check_core(self);
-    int my_relax_hits = g_ev_relax_hits;
-    int my_guarded = g_ev_guarded;
-
-    g_no_relax_eval = saved_no_relax;              /* ← 恢复，不是清零 */
-    g_ev_relax_hits = saved_relax_hits;
-    g_ev_guarded = saved_guarded;
-
-    int t1 = *(int*)((char*)self + OFF_HOLD_TIMES);
-    const char* src = my_guarded ? "GUARDED"
-                    : (r && my_relax_hits ? "RELAXED" : (r ? "VANILLA" : "VANILLA_FAIL"));
-    gate_trace(self, 0, r ? 1 : 0, src, t0, t1);
-    /* v166（用户要求）：**清陌生名应该由"剧情真的在播"驱动**，而不是搭在放宽决策上。
-     * 规则：播放期间，任何与角色相关的门通过 → 清该角色的 '@' 陌生名。
-     * 这样无论这次通过是 原版 / 放宽 / 展平，都会清（v164 跳过原版导致漏清的问题彻底解决）。 */
-    if (r && playing_now()) {
-        int pit = -1;
-        int pidc = flatten_gate_pid(self, &pit);
-        if (pidc > 0) unstranger_apply_uid(pidc, 0);
-    }
+    if (!r && flatten_gate_forced(self)) return true;
     return r;
 }
 
@@ -2777,98 +2619,6 @@ static void hook_steal_init(void* self) {
 }
 
 /* ================================================================ 安装 */
-
-/* ---- v151：独立剧情 / 头部独立剧情节点的播放日志 -------------------------
- * 背景：`StoryScenarioNode.OnActive`（我们已有日志）只覆盖普通「播放剧情」节点；
- * R10049-2 里还有 `StoryOpenAloneNodePort ×2` / `StoryHeadAloneNodePort ×2` 这类
- * 独立剧情节点，它们**不走同一个方法** → PC 上看到 10061 的剧情，但我们日志里一条
- * `R10049-2-1_*` 都没有，无法验证到底是哪条路径播的。
- * 这里按类名在运行期解析出它们的 OnActive 并挂一条纯日志钩子（找不到就跳过，不影响功能）。 */
-static void* (*orig_alone_onactive)(void* self) = nullptr;
-static void* (*orig_head_onactive)(void* self)  = nullptr;
-static int g_playlog_n = 0;
-static int g_diag_alone = 0, g_diag_story = 0;   /* v151：类名诊断计数 */
-
-static void log_play_kind(const char* kind, void* self) {
-    if ((uintptr_t)self < 0x10000 || g_playlog_n >= 300) return;
-    char kb[192]; kb[0] = 0;
-    void* sk = *(void**)((char*)self + OFF_SCENARIO_KEY);
-    str_to_buf(sk, kb, sizeof(kb));
-    if (!kb[0]) return;
-    char gb2[96]; gb2[0] = 0;
-    void* g = *(void**)((char*)self + OFF_NODE_GRAPH);
-    const char* gn = ((uintptr_t)g > 0x10000) ? obj_name(g, gb2, sizeof(gb2)) : "?";
-    g_playlog_n++;
-    LOGI("[play] %s key=%s（图 %s）", kind, kb, gn);
-}
-static void* hook_alone_onactive(void* self) {
-    log_play_kind("OpenAlone", self);
-    return orig_alone_onactive ? orig_alone_onactive(self) : nullptr;
-}
-static void* hook_head_onactive(void* self) {
-    log_play_kind("HeadAlone", self);
-    return orig_head_onactive ? orig_head_onactive(self) : nullptr;
-}
-
-static void* method_ptr_of_class(void* klass, const char* name, int argc) {
-    if ((uintptr_t)klass < 0x10000) return nullptr;
-    static void* (*getm)(void*, const char*, int) = nullptr;
-    if (!getm && g_i2cpp) getm = (void* (*)(void*, const char*, int))dlsym(g_i2cpp, "il2cpp_class_get_method_from_name");
-    if (!getm) return nullptr;
-    void* mi = getm(klass, name, argc);
-    if ((uintptr_t)mi < 0x10000) return nullptr;
-    void* fp = *(void**)mi;
-    return ((uintptr_t)fp > 0x10000) ? fp : nullptr;
-}
-
-static void install_play_log_hooks(void) {
-    /* v151：不猜类名。遍历所有程序集里的类，名字含 "Alone" 且有无参 OnActive 的，全部挂日志钩子。
-     * 先跑一遍实机确认过 `WuLin.StateMachine.StoryOpenAloneNode` 这个名字找不到，
-     * 所以改成按特征扫描；顺手把命中的类名打出来，便于以后精确定位。 */
-    typedef void* (*fn_img_cls_count)(void*);
-    typedef void* (*fn_img_get_cls)(void*, size_t);
-    static fn_img_cls_count A_img_cls_count = nullptr;
-    static fn_img_get_cls   A_img_get_cls   = nullptr;
-    if (!A_img_cls_count && g_i2cpp) A_img_cls_count = (fn_img_cls_count)dlsym(g_i2cpp, "il2cpp_image_get_class_count");
-    if (!A_img_get_cls && g_i2cpp)   A_img_get_cls   = (fn_img_get_cls)dlsym(g_i2cpp, "il2cpp_image_get_class");
-    if (!A_img_cls_count || !A_img_get_cls || !A_class_get_name) {
-        LOGI("[play] 缺少类枚举 API，跳过播放日志钩子");
-        return;
-    }
-
-    int hooked = 0, found = 0;
-    for (size_t im = 0; im < g_nimg; ++im) {
-        if (!g_imgs[im]) continue;
-        size_t n = (size_t)(uintptr_t)A_img_cls_count(g_imgs[im]);
-        if (n == 0 || n > 20000) continue;
-        for (size_t ci = 0; ci < n; ++ci) {
-            void* k = A_img_get_cls(g_imgs[im], ci);
-            if ((uintptr_t)k < 0x10000) continue;
-            const char* nm = A_class_get_name(k);
-            if (!nm) continue;
-            /* v151：实机扫出来的真实类名 —— 「独立剧情」并不是 StoryXxxAloneNode，
-             * 而是 StoryOpenNode（独立剧情）与 StoryStartPlayNode（开始播放）；
-             * Slg* 变体与它们共用同一个方法地址，挂一次即覆盖。 */
-            int slot = -1;
-            if (strcmp(nm, "StoryOpenNode") == 0) slot = 0;
-            else if (strcmp(nm, "StoryStartPlayNode") == 0) slot = 1;
-            if (slot < 0) continue;
-
-            void* fp = method_ptr_of_class(k, "OnActive", 0);
-            if (!fp) continue;
-            found++;
-            if (slot == 0 && !orig_alone_onactive) {
-                if (hook_install("名字.独立剧情", fp, (void*)hook_alone_onactive, (void**)&orig_alone_onactive))
-                    LOGI("[play] %s.OnActive 已挂 @ %p（播放日志）", nm, fp);
-            } else if (slot == 1 && !orig_head_onactive) {
-                if (hook_install("名字.开始播放", fp, (void*)hook_head_onactive, (void**)&orig_head_onactive))
-                    LOGI("[play] %s.OnActive 已挂 @ %p（播放日志）", nm, fp);
-            }
-        }
-    }
-    if (!found) LOGI("[play] 没有找到 StoryOpenNode / StoryStartPlayNode（播放日志未挂）");
-}
-
 static void install_tweaks() {
     g_i2cpp = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
     if (g_i2cpp) {
@@ -3027,8 +2777,6 @@ static void install_tweaks() {
                      (void*)hook_scn_onresult, (void**)&orig_scn_onresult)) {
         LOGI("名字: StoryCloseNode.OnResult 已挂 @ 0x%X", RVA_SCN_ONRESULT);
     }
-    /* v151：独立剧情节点的播放日志（纯观测） */
-    /* v152：play 日志钩子已撤（v151 内联补丁导致读档闪退），保留函数不调用 */
 
     /* v73：气泡入口直接改名 —— 这是唯一确认能把「熟悉后姓名」显示出来的位置 */
     if (hook_install("名字.气泡Init", (void*)(g_base + RVA_BUBBLE_INIT),
