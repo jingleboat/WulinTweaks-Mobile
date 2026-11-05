@@ -821,6 +821,12 @@ static int keep_original_for(void* condNode) {
 
     if ((uintptr_t)condNode < 0x10000) return 0;
 
+    /* v271：**属于「未展开的链」的门对条件 → 不放宽**（用户规则：整链不展开时不放宽）。
+     *
+     * 只针对门对；孤立门不进 ban 表，继续走下面的原规则。
+     * 放在 TTL 缓存之前：禁放宽是图结构决定的，不需要缓存。 */
+    if (flatten_is_banned_cond(condNode)) return 1;
+
     uint64_t now = rule_now_ms();
     for (int i = 0; i < RULE_CACHE_N; ++i) {
         if (g_rule_cache[i].node == condNode) {

@@ -365,7 +365,7 @@ static void flat_mark_done(void* g, const char* reason) {
 int g_markdone_log = 0;
 /* ================================================================ 单图工作区 */
 typedef struct { int src; int tgt; int slot; void* port; } FLAT_EDGE;
-typedef struct { int g0, g1; int pid; int both_story; int reg_n; int ex_start; int ex_n; } FLAT_PAIR;
+typedef struct { int g0, g1; int pid; int both_story; int reg_n; int ex_start; int ex_n; int parent; } FLAT_PAIR;
 
 static void*          g_nd[FLAT_MAX_NODES];      /* 节点指针 */
 static int            g_e0[FLAT_MAX_NODES];      /* 该节点第一条出边下标 */
@@ -373,6 +373,46 @@ static int            g_ec[FLAT_MAX_NODES];      /* 该节点出边条数 */
 static void*          g_cond[FLAT_MAX_NODES];    /* 门的条件节点（非门为 0） */
 static FLAT_EDGE      g_edge[FLAT_MAX_EDGES];
 static FLAT_PAIR      g_pair[FLAT_MAX_PAIRS];
+
+/* v271：**整链决策** 用的两张表。
+ *
+ * 背景（文档第二十八章）：同一父节点 / 同一条梯子链上的门对必须一起决定展开或不展开。
+ *   · 全部展开 → 并联改串联，确定
+ *   · 全部不展开 → 保持原版互斥，确定
+ *   · 部分展开 → 一边串联一边并联，引擎「无法确定走哪个分支」（官方文档第 251 段）
+ *              → 实测 R10049-0：5 段剧情几毫秒内连续触发，玩家看不见
+ *
+ * 链的定义（用户明确要求「宽松」判据）：
+ *   pair i 的 G1 门出边 → pair j 的**父节点**、或 j 的 G0/G1 门 → i 与 j 同链。
+ *   离线对比：宽松比严格只少 5 对（489 vs 494），组数 438 vs 548（链更完整）。
+ */
+static int g_will_expand[FLAT_MAX_PAIRS];   /* 该对最终会不会展开 */
+
+/* v271：**未展开的链 → 禁止放宽**。
+ *
+ * 用户规则：「整组不展开时不放宽」（只针对门对，孤立门不改规则）。
+ *
+ * 为什么：展开失败时如果仍然放宽，G0（在队）和 G1（不在队）会同时为真 →
+ * 违反官方设计范式（文档第 251 段「并联的多个流程判断必须互斥」）→ 引擎行为未定义。
+ * 不放宽则回到原版互斥 → 引擎能唯一确定 → 按「是否在队」各走一边。
+ */
+static void* g_pair_ban[FLAT_MAX_CONDS];
+static int   g_pair_ban_n = 0;
+
+static void flat_add_ban(void* cond) {
+    if ((uintptr_t)cond < 0x10000) return;
+    for (int i = 0; i < g_pair_ban_n; ++i)
+        if (g_pair_ban[i] == cond) return;
+    if (g_pair_ban_n < FLAT_MAX_CONDS) g_pair_ban[g_pair_ban_n++] = cond;
+}
+
+/* 供 keep_original_for 调用：这个条件是否属于「未展开的链」→ 禁止放宽 */
+int flatten_is_banned_cond(void* cond) {
+    if ((uintptr_t)cond < 0x10000) return 0;
+    for (int i = 0; i < g_pair_ban_n; ++i)
+        if (g_pair_ban[i] == cond) return 1;
+    return 0;
+}
 static int            g_exit[FLAT_MAX_EDGES];    /* 各 pair 的出口边下标（按 pair 顺序排） */
 static unsigned char  g_reg[FLAT_MAX_PAIRS][FLAT_MAX_NODES];  /* 每对的 region 位图 */
 static int            g_nnodes, g_nedges, g_npairs, g_nexit;
@@ -482,6 +522,82 @@ static int flat_build(void* g) {
 
 
 
+
+/* v270：目标节点除 exclude 之外还有没有别的入边（按**节点指针**判断）。
+ *
+ * 用途：G1→G0 改线时只改「目标还有别的入边」的那些边（策略 C）。
+ *
+ * 为什么必须这样：v244~v269 把 G1 的**所有**出边都改指 G0，于是 G1 独占的下级子树
+ * 全部不可达。离线实测：42 对受影响，**丢 3046 个节点**，例如
+ *   DBZX-6  pid=10083  49+52 节点（20 段剧情、删除标记×10、强制NPC死亡×6）
+ *   M2190-3 pid=10064  43+43 节点（17 段剧情、获得/扣除背包物品×3）
+ *   M10140-3 pid=10086 12+18 节点（12 段剧情、预设战斗×2）
+ *   DNJH-6  pid=10008   6+12 节点（6 段剧情、改变NPC势力）
+ *
+ * 判据来源：G1 出边若指向**并联兄弟**（如 R10049-2-1 的 10061 G1 → 10075 的门，
+ * 那个门还有父节点指着）→ 改指安全；若指向**自己独占的下级**（只有 G1 指着）→ 改指就切断。
+ * 三种策略离线对比：全部改指 42 对丢 3046；只改门对成员 42 对丢 3046；只改仍有别的入边 **0 对丢 0**。
+ */
+static int flat_has_other_in_ptr(void* tgt_nd, void* exclude_nd) {
+    if ((uintptr_t)tgt_nd < 0x10000) return 0;
+    for (int i = 0; i < g_nnodes; ++i) {
+        if (g_nd[i] == exclude_nd) continue;
+        for (int e = 0; e < g_ec[i]; ++e)
+            if (g_nd[g_edge[g_e0[i] + e].tgt] == tgt_nd) return 1;
+    }
+    return 0;
+}
+
+/* v271：**整链决策** —— 同一链上的门对要么全展开，要么全不展开。
+ *
+ * 链的定义（宽松）：pair i 的 G1 门出边指向 pair j 的父节点 / G0 / G1 → i 与 j 同链。
+ *
+ * 输入：g_will_expand[] 已经填了「逐对判定通过」的结果。
+ * 输出：g_will_expand[] 被改成「整链通过」的结果 —— 链内任一不通过则整链清零。
+ */
+static void flat_chain_decide(void) {
+    if (g_npairs <= 0) return;
+    int par[FLAT_MAX_PAIRS];
+    for (int i = 0; i < g_npairs; ++i) par[i] = i;
+
+    /* 迭代式 union-find（无路径压缩也够用：最多 48 对） */
+    for (int i = 0; i < g_npairs; ++i) {
+        int g1 = g_pair[i].g1;
+        if (g1 < 0 || g1 >= g_nnodes) continue;
+        for (int e = 0; e < g_ec[g1]; ++e) {
+            int t = g_edge[g_e0[g1] + e].tgt;
+            for (int j = 0; j < g_npairs; ++j) {
+                if (j == i) continue;
+                if (t == g_pair[j].parent || t == g_pair[j].g0 || t == g_pair[j].g1) {
+                    int a = i, b = j;
+                    while (par[a] != a) a = par[a];
+                    while (par[b] != b) b = par[b];
+                    if (a != b) par[a] = b;
+                }
+            }
+        }
+    }
+
+    /* 每个链组：组内全 pass 才保留，否则整组清零 */
+    for (int i = 0; i < g_npairs; ++i) {
+        int ri = i;
+        while (par[ri] != ri) ri = par[ri];
+        int all_ok = 1;
+        for (int j = 0; j < g_npairs; ++j) {
+            int rj = j;
+            while (par[rj] != rj) rj = par[rj];
+            if (rj != ri) continue;
+            if (!g_will_expand[j]) { all_ok = 0; break; }
+        }
+        if (!all_ok) {
+            for (int j = 0; j < g_npairs; ++j) {
+                int rj = j;
+                while (par[rj] != rj) rj = par[rj];
+                if (rj == ri) g_will_expand[j] = 0;
+            }
+        }
+    }
+}
 
 static int is_story_idx(int i) {
     if (i < 0 || i >= g_nnodes) return 0;
@@ -685,6 +801,7 @@ void flatten_try(void* any_node) {
         if ((uintptr_t)g_cond[i] > 0x10000) g_ncond++;
     }
     g_npairs = 0;
+    g_pair_ban_n = 0;
     int pair_skipped = 0;
     for (int i = 0; i < g_nnodes && g_npairs < FLAT_MAX_PAIRS; ++i) {
         if (g_ec[i] != 2) continue;                    /* 只认「一个端口两条连接」 */
@@ -745,6 +862,7 @@ void flatten_try(void* any_node) {
         p->g0 = g0; p->g1 = g1; p->pid = pa;
         p->both_story = (s0 && s1);
         p->reg_n = 0; p->ex_start = 0; p->ex_n = 0;
+        p->parent = i;                                 /* v271：门对自己所在的父节点 */
     }
 
     if (pair_skipped && g_log_graph < FLAT_LOG_GRAPH) {
@@ -861,10 +979,60 @@ void flatten_try(void* any_node) {
         }
     }
 
-    /* ---------------- ③ 逐对落地（先判冲突，再动手） ---------------- */
+    /* ---------------- ③a 整链决策（只判定，不改线） ----------------
+     *
+     * v271：先把「每对能不能展开」算出来（clash / 孤岛都在这里判），
+     * 再按链分组做整链决策，最后才进入 ③b 真正改线。
+     *
+     * 为什么要拆两步：链内任一不通过就必须整链不展开（否则一边串联一边并联 →
+     * 引擎「无法确定走哪个分支」，官方文档第 251 段；实测 R10049-0 五段同时触发）。
+     * 而逐对处理时不知道「后面的对会不会被拦」，所以必须先全算一遍。
+     *
+     * 离线验证：原始图一次性判定 vs 逐对改线逐对判定，209 张图**完全一致**（0 差异），
+     * 所以这里用原始图算是安全的。 */
+    for (int k = 0; k < g_npairs; ++k) {
+        FLAT_PAIR* p = &g_pair[k];
+        g_will_expand[k] = 0;
+        if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION || p->ex_n == 0) continue;
+        /* clash */
+        int clash2 = 0;
+        for (int q = 0; q < g_npairs && !clash2; ++q) {
+            if (q == k || g_pair[q].reg_n == 0) continue;
+            const unsigned char* ra = g_reg[k];
+            const unsigned char* rb = g_reg[q];
+            for (int i = 0; i < g_nnodes; ++i)
+                if (ra[i] == 1 && rb[i] == 1) { clash2 = 1; break; }
+        }
+        if (clash2) continue;
+        /* 孤岛 */
+        int orphan2 = 0;
+        for (int e = 0; e < p->ex_n && !orphan2; ++e) {
+            FLAT_EDGE* ed = &g_edge[g_exit[p->ex_start + e]];
+            int other = 0;
+            for (int i = 0; i < g_nnodes && !other; ++i) {
+                if (i == ed->src) continue;
+                for (int e2 = 0; e2 < g_ec[i]; ++e2)
+                    if (g_edge[g_e0[i] + e2].tgt == ed->tgt) { other = 1; break; }
+            }
+            if (!other) orphan2 = 1;
+        }
+        if (orphan2) continue;
+        g_will_expand[k] = 1;
+    }
+    flat_chain_decide();   /* 整链决策：链内任一不通过 → 整链清零 */
+
+    /* 未展开的对 → 它们的条件进「禁止放宽」表 */
+    for (int k = 0; k < g_npairs; ++k) {
+        if (g_will_expand[k]) continue;
+        flat_add_ban(g_cond[g_pair[k].g0]);
+        flat_add_ban(g_cond[g_pair[k].g1]);
+    }
+
+    /* ---------------- ③b 逐对落地（只处理整链通过的） ---------------- */
     int expanded = 0, redirected = 0, skipped = 0;
     for (int k = 0; k < g_npairs; ++k) {
         FLAT_PAIR* p = &g_pair[k];
+        if (!g_will_expand[k]) { skipped++; continue; }
         if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION || p->ex_n == 0) { skipped++; continue; }
 
         /* 冲突：与另一对的 region 相交 → 这一对不动（另一对会在它自己那轮判）。
@@ -891,6 +1059,36 @@ void flatten_try(void* any_node) {
                 }
         }
         if (clash) { skipped++; continue; }
+
+        /* v270：**孤岛判据** —— 出口边的目标如果「除这条边外没有别的入边」，
+         * 改线会让它（以及它下游整棵子树）永久不可达。
+         *
+         * 离线实测：19 对 / 26 个目标节点受影响，典型
+         *   R10025-6-1（6 个）、Role5-15-2+3qianzhitiaojian（7 个）、
+         *   DBZX-6 / M10070-4-1 / R10021-4-8 / R10081-2。
+         *
+         * 判据按**节点索引**（g_edge[].tgt 是索引）。 */
+        int orphan = 0;
+        for (int e = 0; e < p->ex_n && !orphan; ++e) {
+            FLAT_EDGE* ed = &g_edge[g_exit[p->ex_start + e]];
+            int tgt = ed->tgt;
+            int src = ed->src;
+            int other = 0;
+            for (int i = 0; i < g_nnodes && !other; ++i) {
+                if (i == src) continue;
+                for (int e2 = 0; e2 < g_ec[i]; ++e2)
+                    if (g_edge[g_e0[i] + e2].tgt == tgt) { other = 1; break; }
+            }
+            if (!other) orphan = 1;
+        }
+        if (orphan) {
+            skipped++;
+            if (g_log_pair < 300) {
+                g_log_pair++;
+                LOGI("[flat-orphan] pid=%d 的出口目标除这条边外无其它入边 → 不展开（避免丢下游）", p->pid);
+            }
+            continue;
+        }
 
 
         /* v238：**链式接续** —— 剧情出口改指「下一对的在队门（G0）」，而不是自己的 G1 门。
@@ -958,9 +1156,19 @@ void flatten_try(void* any_node) {
                 int cnt1 = port_conn_count(op1);
                 if (cnt1 > 0 && cnt1 <= 32) {
                     for (int k2 = 0; k2 < cnt1; ++k2) {
+                        /* v270（策略 C）：只改「目标还有别的入边」的边。
+                         * 目标只有 G1 指着 = 它独占的下级 → 改指就切断整棵子树。 */
+                        void* tgt = port_conn_node(op1, k2);
+                        if (!flat_has_other_in_ptr(tgt, g_nd[p->g1])) {
+                            if (g_log_pair < 300) {
+                                g_log_pair++;
+                                LOGI("[flat-g1] pid=%d 的 G1 有一条出边目标只有它指向 → 保持原样（避免切断下级）",
+                                     p->pid);
+                            }
+                            continue;
+                        }
                         if (port_set_conn_node(op1, k2, g_nd[p->g0])) redirected++;
                     }
-
                 }
             }
         }

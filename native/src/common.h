@@ -62,7 +62,6 @@ int flatten_cond_always_true(void* cond);
 int flatten_gate_forced(void* gate);
 /* v260：这个条件是否属于「某个门对」（不管该对是否展开）。
  * keep_original_for 用它区分「没展开的门对」（不放宽）与「孤立门」（按原规则放宽）。 */
-int flatten_is_pair_cond(void* cond);
 int flatten_gate_pid(void* gate, int* in_team);
 const char* flatten_gate_cls(void* gate);
 const char* flat_node_name(void* nd);
@@ -361,3 +360,6 @@ const char* str_to_buf(void* il2str, char* buf, int cap);
 typedef struct { float x, y; } V2;
 typedef struct { float x, y, z; } V3;
 typedef struct { float x, y, w, h; } Rect4;
+
+/* v271：该条件是否属于「未展开的链」→ 禁止放宽（只针对门对） */
+int flatten_is_banned_cond(void* cond);
