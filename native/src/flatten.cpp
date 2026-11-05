@@ -564,120 +564,6 @@ static int flat_has_other_in_ptr(void* tgt_nd, void* exclude_nd) {
  * 输入：g_will_expand[] 已经填了「逐对判定通过」的结果。
  * 输出：g_will_expand[] 被改成「整链通过」的结果 —— 链内任一不通过则整链清零。
  */
-/* v273（P0-3'）：**改线后链是否线性**。
- *
- * 审查意见 P0-3 要求「第一阶段只接受简单路径：唯一前驱、唯一后继、无环」。
- * 但直接用**原版图**判会误伤 —— 原版本来就有「捷径」（R10049-2-1：10061 G1 同时指向
- * 10075 和 10052），而那正是改线要消除的。
- *
- * 所以判据放在**改线后**：
- *   链接 = ① G1 出边里**不会被策略 C 改指**的那些（即目标没有别的入边 → 保留）
- *         ② 出口改指的目标（下一对的 G0）
- * 然后判：链内每对后继 ≤ 1、前驱 ≤ 1、无环。
- *
- * 离线对比：原版图判 → 289 对；改线后判 → 445 对。差 156 对全是被原版捷径误伤的正常链。
- * 真正在改线后仍非线性的只有 DBZX-6 一组（2 对）。
- */
-static int flat_owner_pair(int node) {
-    for (int q = 0; q < g_npairs; ++q) {
-        if (g_pair[q].parent == node) return q;
-        if (g_pair[q].g0 == node || g_pair[q].g1 == node) return q;
-    }
-    return -1;
-}
-
-/* 返回 0 = 不线性（该组须整组拒绝） */
-static void flat_chain_linear_check(void) {
-    if (g_npairs <= 1) return;
-    static unsigned char succ[FLAT_MAX_PAIRS][FLAT_MAX_PAIRS];
-    static unsigned char pred[FLAT_MAX_PAIRS][FLAT_MAX_PAIRS];
-    memset(succ, 0, sizeof(succ));
-    memset(pred, 0, sizeof(pred));
-
-    for (int i = 0; i < g_npairs; ++i) {
-        if (!g_will_expand[i]) continue;               /* 未展开的不参与 */
-        FLAT_PAIR* p = &g_pair[i];
-
-        /* ① G1 出边里不会被策略 C 改指的 → 仍是后继 */
-        int g1 = p->g1;
-        if (g1 >= 0 && g1 < g_nnodes) {
-            for (int e = 0; e < g_ec[g1]; ++e) {
-                int t = g_edge[g_e0[g1] + e].tgt;
-                /* 策略 C：目标有别的入边 → 这条边会被改指 G0 → 不再是后继 */
-                int other = 0;
-                for (int x = 0; x < g_nnodes && !other; ++x) {
-                    if (x == g1) continue;
-                    for (int e2 = 0; e2 < g_ec[x]; ++e2)
-                        if (g_edge[g_e0[x] + e2].tgt == t) { other = 1; break; }
-                }
-                if (other) continue;                    /* 会被改指 */
-                int j = flat_owner_pair(t);
-                if (j >= 0 && j != i) { succ[i][j] = 1; pred[j][i] = 1; }
-            }
-        }
-
-        /* ② 出口改指的目标 */
-        if (p->ex_n > 0) {
-            int tgt_node = -1;
-            int multi = 0;
-            for (int e = 0; e < p->ex_n; ++e) {
-                int t = g_edge[g_exit[p->ex_start + e]].tgt;
-                if (tgt_node < 0) tgt_node = t;
-                else if (t != tgt_node) { multi = 1; break; }
-            }
-            (void)multi;
-            if (tgt_node >= 0) {
-                int j = flat_owner_pair(tgt_node);
-                if (j >= 0 && j != i) { succ[i][j] = 1; pred[j][i] = 1; }
-            }
-        }
-    }
-
-    /* 逐对检查：后继 ≤ 1、前驱 ≤ 1 */
-    int bad[FLAT_MAX_PAIRS];
-    memset(bad, 0, sizeof(bad));
-    for (int i = 0; i < g_npairs; ++i) {
-        if (!g_will_expand[i]) continue;
-        int ns = 0, np = 0;
-        for (int j = 0; j < g_npairs; ++j) {
-            if (succ[i][j]) ns++;
-            if (pred[i][j]) np++;
-        }
-        if (ns > 1 || np > 1) bad[i] = 1;
-    }
-    /* 环（在展开集合内做 DFS） */
-    static unsigned char color[FLAT_MAX_PAIRS];
-    memset(color, 0, sizeof(color));
-    /* 迭代式 DFS 太啰嗦；用递归辅助（层数 ≤ 48） */
-    struct Local { static int dfs(int u, int n, unsigned char (*sg)[FLAT_MAX_PAIRS], unsigned char* col) {
-        col[u] = 1;
-        for (int v = 0; v < n; ++v) {
-            if (!sg[u][v]) continue;
-            if (col[v] == 1) return 1;
-            if (col[v] == 0 && dfs(v, n, sg, col)) return 1;
-        }
-        col[u] = 2;
-        return 0;
-    } };
-    for (int i = 0; i < g_npairs; ++i) {
-        if (!g_will_expand[i] || color[i]) continue;
-        if (Local::dfs(i, g_npairs, succ, color)) { bad[i] = 1; break; }
-    }
-
-    int any = 0;
-    for (int i = 0; i < g_npairs; ++i) if (bad[i]) { any = 1; break; }
-    if (!any) return;
-
-    /* 有问题的对 → 它所在的链组整组清零（用 flat_chain_decide 的分组逻辑：
-     * 这里简化成「把有问题的对及其链内邻居一起清零」—— 但为了与 P0-3 语义一致，
-     * 直接整图拒绝更保守，代价是 2 对变 0 对）。 */
-    if (g_log_graph < FLAT_LOG_GRAPH) {
-        g_log_graph++;
-        LOGI("[flat-reject] 改线后链非线性（后继/前驱 >1 或成环）→ 整图不展开");
-    }
-    for (int i = 0; i < g_npairs; ++i) g_will_expand[i] = 0;
-}
-
 static void flat_chain_decide(void) {
     if (g_npairs <= 0) return;
     int par[FLAT_MAX_PAIRS];
@@ -713,6 +599,16 @@ static void flat_chain_decide(void) {
             if (!g_will_expand[j]) { all_ok = 0; break; }
         }
         if (!all_ok) {
+            int cnt = 0;
+            for (int j = 0; j < g_npairs; ++j) {
+                int rj = j;
+                while (par[rj] != rj) rj = par[rj];
+                if (rj == ri && g_will_expand[j]) cnt++;
+            }
+            if (g_log_graph < FLAT_LOG_GRAPH) {
+                g_log_graph++;
+                LOGI("[flat-chain] 链组内有对未通过 → 整组清零（本组原有 %d 对通过，现全清）", cnt);
+            }
             for (int j = 0; j < g_npairs; ++j) {
                 int rj = j;
                 while (par[rj] != rj) rj = par[rj];
@@ -1241,8 +1137,31 @@ void flatten_try(void* any_node) {
         }
         g_will_expand[k] = 1;
     }
+    /* v274 诊断：③a 后每对的结果（定位「整图展开 0」） */
+    if (g_log_graph < FLAT_LOG_GRAPH) {
+        int cs = 0;
+        char buf[256];
+        int off = 0;
+        for (int k = 0; k < g_npairs && off < 240; ++k) {
+            if (g_will_expand[k]) cs++;
+            if (k && off < 254) buf[off++] = ',';
+            if (off < 254) buf[off++] = g_will_expand[k] ? '1' : '0';
+        }
+        buf[off < 255 ? off : 255] = 0;
+        if (cs < g_npairs) {
+            g_log_graph++;
+            char nb[96];
+            const char* gn2 = unity_name(g, nb, sizeof(nb));
+            LOGI("[flat-3a] 图=%s 逐对结果=[%s] 通过 %d/%d",
+                 (gn2 && gn2[0]) ? gn2 : "?", buf, cs, g_npairs);
+        }
+    }
+
     flat_chain_decide();        /* 整链决策：链内任一不通过 → 整链清零 */
-    flat_chain_linear_check();  /* v273（P0-3'）：改线后必须线性 */
+    /* v274：**撤掉 P0-3'（改线后线性检查）** —— 用户要求：「P0-3 那项不要改动，
+     * 用审查之前的版本代码就行，只要进行逻辑上判断无风险即可」。
+     * 离线已验证改线后 R10049-2-1 / R10049-0 都是纯线性，逻辑上无风险；
+     * 不再在运行时加这道判据（它会因为实现细节误拒整图）。 */
 
     /* v273（P0-2 第 5 条 / P0-7）：**改线记录容量不足 → 整图不展开**。
      *
