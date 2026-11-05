@@ -5,10 +5,23 @@ $cc   = "$ndk\aarch64-linux-android23-clang.cmd"
 $objc = "$ndk\llvm-objcopy.exe"
 $src  = 'C:\Users\User\Documents\deepseek-harness\default-workspace\wulin-apk\native'
 
+# v261：注入版本号（构建时间 + git 短 hash），日志第一行就能对上 APK 文件名。
+# 之前 common.h 里硬编码 "v179" 从没改过，排查时多次误判「装了新版」实际还是旧版。
+$gitHash = 'nogit'
+try {
+    $g = (& git -C $src rev-parse --short HEAD 2>$null)
+    if ($LASTEXITCODE -eq 0 -and $g) { $gitHash = "$g".Trim() }
+} catch { }
+$stamp = Get-Date -Format 'MMdd-HHmm'
+$ver   = "v261-$stamp-$gitHash"
+
+$defineVer = "-DMOD_VER_RAW=$ver"
+
 Push-Location $src
 try {
     Write-Host '--- libwulin.so'
     & $cc -shared -fPIC -O2 -Wall -Wextra -o libwulin.so `
+        $defineVer `
         src\wulin_main.cpp src\trade.cpp src\ui.cpp src\hook.cpp src\probe.cpp src\water.cpp src\flatten.cpp src\join.cpp -llog -lm `
         '-Wl,-soname,libwulin.so' '-Wl,--build-id=none'
     if ($LASTEXITCODE) { throw 'clang (libwulin) failed' }

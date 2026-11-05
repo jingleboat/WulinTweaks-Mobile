@@ -222,7 +222,11 @@ static void resolve_save() {
 static uint64_t rule_now_ms(void);          /* 定义在剧情缓存那一节 */
 static void char_mgr_reset(void);           /* 定义在「从未入队」那一节：换档后清角色管理器缓存 */
 static void relax_once_reset(void);         /* v145：清「每图只放宽一次」（定义在放宽规则那一节） */
-static void unstranger_apply_uid(int pid, int force);   /* v148：清该 uid 实例的 '@' 陌生名 */
+
+static void unstranger_apply_uid(int pid, int force);   /* 清陌生名（定义在下面） */
+void flat_reset(void);                      /* v239：清「分支展开」的进程级状态（定义在 flatten.cpp） */
+extern int g_miss_log;
+extern int g_hold_dbg;
 
 static int save_sets_ready(void) {
     return ((uintptr_t)g_set_enable > 0x10000) || ((uintptr_t)g_set_vis > 0x10000);
@@ -755,19 +759,31 @@ static int never_joined(int uid) {
  * 读不到图名时保守返回 0（放宽），避免误挡。 */
 static int keep_original_for_uncached(void* condNode);
 
-/* v109：同一张剧情图只放宽一次（不再用固定名单） */
+/* v109：同一张剧情图只放宽一次（不再用固定名单）
+ *
+ * v214：粒度从「整张图」改成「**图 + 条件节点**」。
+ *
+ * 为什么必须改：按图记账时，一张图里只有**第一个**命中的条件能放宽，后面的全走原版。
+ * 而像 R10049-2（游览衙门三口铡刀）这种"谁在队谁解说"的串行链有 16 对门，
+ * 每条链要依次经过多个角色的门 —— 额度只够第一个，后面的门判假，链就断在那里。
+ * 实测表现：洛千雪（真在队）能一路串到大梁城知府那段，而李乐雅、花四娘（不在队、
+ * 靠放宽才播）只播自己那一段，后续接不上。
+ *
+ * 改成按条件节点记账后，每个角色的条件各自独立，不再互相抢额度。 */
 #define RELAX_ONCE_N 128
-static char g_ro_name[RELAX_ONCE_N][64];
+static char  g_ro_name[RELAX_ONCE_N][64];
+static void* g_ro_cond[RELAX_ONCE_N];
 static int  g_ro_i = 0;
 static int  g_ro_log = 0;
-static int relax_once(const char* gn) {
+static int relax_once_cond(const char* gn, void* cond) {
     if (!gn || !gn[0]) return 1;
     for (int i = 0; i < RELAX_ONCE_N; ++i)
-        if (g_ro_name[i][0] && strcmp(g_ro_name[i], gn) == 0) {
-            if (g_ro_log++ < 12) LOGI("[relax] 图 %s 已放宽过一次 -> 本次走原版", gn);
+        if (g_ro_name[i][0] && g_ro_cond[i] == cond && strcmp(g_ro_name[i], gn) == 0) {
+            if (g_ro_log++ < 12) LOGI("[relax] 图 %s 条件 %p 已放宽过 -> 本次走原版", gn, cond);
             return 0;
         }
     snprintf(g_ro_name[g_ro_i], sizeof(g_ro_name[0]), "%s", gn);
+    g_ro_cond[g_ro_i] = cond;
     g_ro_i = (g_ro_i + 1) % RELAX_ONCE_N;
     return 1;
 }
@@ -781,15 +797,53 @@ static int relax_once(const char* gn) {
  *    该地址属于 OnLoadFinished 自身（帧 #01 = 0x226A03C 在同一函数体内）→ 说明那个位置
  *    不适合做 16 字节内联补丁（跳板重定位踩到 PC 相对指令）。该钩子已撤掉，改走既有信号。 */
 static void relax_once_reset(void) {
-    memset(g_ro_name, 0, sizeof(g_ro_name));
-    g_ro_i = 0;
-}
 
+    memset(g_ro_name, 0, sizeof(g_ro_name));
+    memset(g_ro_cond, 0, sizeof(g_ro_cond));
+    g_ro_i = 0;
+    /* v242：**不再调用 flat_reset()**。
+     *
+     * v239 在读档时清空 g_done / g_flat_gate，v241 又在清之前用记录的旧 port 指针还原改线 ——
+     * 两条路都不对，因为前提错了：**读档后图会重新加载，改线本来就自动丢失**。
+     *
+     * v239 的后果：清掉 g_done → 重新处理已改过线的图 → 门对 0 → 重试 32 次放弃 → 门表空 → 卡住。
+     * v241 的后果：还原时 g_rewire[].port 指向已释放的对象 → 往失效地址写对象引用 → 把图写坏。
+     *     （v241 实测：门判定全部失效，只剩 _4_6 或干脆不播）
+     *
+     * 图重载后指针必然变化，flat_done 的「指针 + 指纹」自然不命中，本来就会重新处理 ——
+     * 不需要清表，更不需要还原。这里只清日志计数。 */
+    g_miss_log = 0;
+    g_hold_dbg = 0;
+}
 /* 带 TTL 缓存的入口：条件检查是热路径，若每次读图名 + 调 GetCharacter 会卡。
  * 入队状态会变，所以 TTL 3 秒，不能永久缓存。 */
 static int keep_original_for(void* condNode) {
+
     if ((uintptr_t)condNode < 0x10000) return 0;
 
+    /* v260：**放宽只对被展平的门对生效**。
+     *
+     * 用户的规则：「不放宽没有展平的门对」。
+     *
+     * 为什么：没展开的门对，放宽只会让 G0/G1 两侧都判真，而引擎在分叉点只走最后一条
+     * 连接 —— 结果是「只播不在队侧」，反而不如原版「各走各的」。
+     * 离线实测：651 对里展开 517（继续放宽），region=0 的 55 对与无出口的 79 对不再放宽；
+     * 代价只有 3 对（在队剧情原本只靠放宽才播得到）。
+     *
+     * **孤立门不受影响** —— 它们不成对（flatten_is_pair_cond 为假），继续走下面的原规则。 */
+    if (flatten_cond_always_true(condNode)) return 0;   /* 已展平 → 放宽（且不受额度限制） */
+    if (flatten_is_pair_cond(condNode)) {
+        /* v262：**不放宽，但仍然要清临时名**。
+         *
+         * v260 这里直接 `return 1` 就返回了，于是后半段的 unstranger_apply_uid 整段被跳过
+         * —— 用户实测「有时清除临时名功能失效」就是这个。
+         *
+         * 这和 v148 是同一类问题：当时是「清名被放宽额度限制」，现在是「清名被是否展平限制」。
+         * **清名与放宽是两件事** —— 放不放宽是玩法取舍，清不清名是显示层的独立性。 */
+        int p0 = *(int*)((char*)condNode + OFF_PARTNER_ID);
+        if (p0 > 0) unstranger_apply_uid(p0, 0);
+        return 1;                                       /* 是门对但没展开 → 不放宽 */
+    }
     uint64_t now = rule_now_ms();
     for (int i = 0; i < RULE_CACHE_N; ++i) {
         if (g_rule_cache[i].node == condNode) {
@@ -929,7 +983,23 @@ static int keep_original_for_uncached(void* condNode) {
          * 计数器，它只该限制"放宽"，不该限制"清名字"。否则同一张图（如 R10049-2 有 19 个
          * partnerID）第一个条件用掉那一次之后，后面所有角色都清不到（凌梦蝶就是这样漏掉的）。 */
         unstranger_apply_uid(pid, 0);
-        return relax_once(gn) ? 0 : 1;
+
+        /* v235：**被「分支展开」接管过的条件不受「每条件一次」限制**。
+         *
+         * 实测链条（v234 日志）：
+         *   [flat] 图 R10049-2-1：门对 4，展开 4，改线 7 条        ← 改线成功
+         *   播放 _4_1 → _4_2（李乐雅）→ _4_6（都不在队）          ← _4_3/_4_4 被跳过
+         *   放宽记录只有 uid=10061 / 10052，**没有 10075**
+         *
+         * 原因：原版路径已经走过 10075 的在队门、relax_once_cond 的额度用掉了；
+         * 改线后再走到那道门就不放宽 → 判假 → 掉进 Neg=1 分支一路到 _4_6。
+         * 而梯子链（10061→10075→10052→10098）要求同一条链上每道门都能放宽，
+         * 否则整条链只会播「都不在队」的兜底版本。
+         *
+         * 展平接管过的条件本来就会被 flatten_gate_forced 整门判真，本来也不需要
+         * relax_once 去防重复；这里直接放行，不再记账。 */
+        if (flatten_cond_always_true(condNode)) return 0;
+        return relax_once_cond(gn, condNode) ? 0 : 1;   /* v214：按「图+条件」记账 */
     }
 
     if (is_bond_graph(g, gn)) {                      /* v95：结缘图跳过放宽 */
@@ -938,14 +1008,23 @@ static int keep_original_for_uncached(void* condNode) {
         return 1;                                    /* 故意不放宽 → 也不清名字（避免剧透） */
     }
     if (never_joined(pid)) return 1;                 /* 本命角色：从未入队 → 不放宽，同样不清 */
+
     unstranger_apply_uid(pid, 0);                     /* ★ 只在"本来会放宽"时才清 */
-    return relax_once(gn) ? 0 : 1;                   /* 已入过队 → 只放宽一次 */
+    if (flatten_cond_always_true(condNode)) return 0; /* v235：展平接管的条件不受「每条件一次」限制 */
+    return relax_once_cond(gn, condNode) ? 0 : 1;
 }
 
 /* 每次「需要伙伴 / 有伙伴」条件判定 +1（按线程）。
  * HoldNode.CheckCondition 用它判断「这次判定到底有没有碰队友条件」：
  * 没碰就说明这个 Hold 与放宽无关，不该被压制 —— 否则会打断游戏设计的可重复剧情。 */
 static __thread int g_team_cond_hits = 0;
+
+/* v211：本次门判定里「真的放宽过几次」。
+ * 原来 hold_check_core 的守卫用 g_team_cond_hits（碰过队友条件）当判据，
+ * 于是「原版本来就为真」的判定也被当成「放宽引起的重复触发」压掉 ——
+ * 需要反复触发同一张图的任务（如 R10049-2 带柳月樱游览）第二段起永远进不去。
+ * 改成只认「真的放宽过」：没放宽就一行都不干预。 */
+static __thread int g_ev_relax_hits = 0;
 
 /* ---- 剧情期间显示「熟悉后姓名」（v61 → v72 改多槽） ---------------------
  * 放宽之后剧情触发并不算"互动过一次"，所以那些角色仍是陌生名（@冷峻严肃的中年人），
@@ -1731,7 +1810,7 @@ static void* hook_ssn_onactive(void* self) {
         if (kb[0]) {
             void* g = *(void**)((char*)self + OFF_NODE_GRAPH);
             scene_record(g, kb);
-            if (g_play_hook_log++ < 15) {
+            if (g_play_hook_log++ < 2000) {   /* v243：15 → 2000（原来前 15 条之后全被吞，观测严重失真） */
                 char gb[96] = {0};
                 if ((uintptr_t)g > 0x10000) obj_name(g, gb, sizeof(gb));
                 LOGI("[name] 播放开始 ScenarioKey=%s（图 %s）", kb, gb);
@@ -1867,21 +1946,18 @@ static void unstranger_apply_uid(int pid, int force) {
 }
 
 static bool hook_check_joined(void* self, int io, void* line) {
+    /* v212：**IsJoinedTeamCondition（「曾经加入过队伍」）不参与放宽。**
+     *
+     * 它的语义与 HavePartnerCondition（当前在队）不同：放宽"曾经加入过"等于允许
+     * 「从未加入」也能触发该角色的本命事件 —— 这正是"燕歌行从未入队、师父线照样触发"
+     * 的一条通路。
+     *
+     * 所以这里两条放宽路径都去掉：
+     *   · flatten_cond_always_true —— 展平的"条件恒真"同样等于丢掉这一条；
+     *   · keep_original_for 放宽    —— 按图名/名单判断的常规放宽。
+     * 判定完整走原版，只保留 g_team_cond_hits 计数与 flatten_try（图照常处理）。 */
     g_team_cond_hits++;
-    flatten_try(self);                      /* v65：顺手把「分支展开」补丁套到这张图上（只做一次） */
-    /* v70：被「分支展开」接管的条件恒真。用基类实现 = 丢掉这一个条件，
-     * 但 partnerID/Negate 原值仍在，下面 mark_relaxed 才能继续为「姓名替换」开窗口。 */
-    if (flatten_cond_always_true(self)) {
-        mark_relaxed(self);
-        unstranger_relaxed(self);           /* v138：这条在队条件被跳过 → 清该角色的陌生名 */
-        if (base_check_all) return base_check_all(self, io, line);
-        return true;
-    }
-    if (F_STORY && base_check_all && !keep_original_for(self)) {
-        mark_relaxed(self);                 /* v61：记下"这次放宽放过了谁"，用于显示真名 */
-        unstranger_relaxed(self);           /* v138：同上 */
-        return base_check_all(self, io, line);
-    }
+    flatten_try(self);
     return orig_check_joined ? orig_check_joined(self, io, line) : false;
 }
 
@@ -1890,12 +1966,14 @@ static bool hook_check_partner(void* self, int io, void* line) {
     flatten_try(self);
     if (flatten_cond_always_true(self)) {
         mark_relaxed(self);
+        g_ev_relax_hits++;                  /* v211 */
         unstranger_relaxed(self);           /* v138 */
         if (base_check_all) return base_check_all(self, io, line);
         return true;
     }
     if (F_STORY && base_check_all && !keep_original_for(self)) {
         mark_relaxed(self);
+        g_ev_relax_hits++;                  /* v211：记「这次真的放宽了」 */
         unstranger_relaxed(self);           /* v138 */
         return base_check_all(self, io, line);
     }
@@ -2445,11 +2523,19 @@ static bool hold_check_core(void* self) {
     flatten_try(self);
     /* 判据不再看"图名像不像角色剧情"，而是看**这次判定到底有没有碰队友条件**：
      *   - 没碰（计数没变）→ 这个 Hold 与放宽无关，一行都不碰；
-     *   - 碰过 + times!=0 + 这次仍然通过 → 是放宽把"一次性"变成了"可重复"→ 压回 false。 */
+     *   - 碰过 + times!=0 + 这次仍然通过 → 是放宽把"一次性"变成了"可重复"→ 压回 false。
+     *
+     * v211 修正：光"碰过队友条件"不够 —— 原版本就为真（角色真在队、或条件本就满足）时
+     * g_team_cond_hits 同样会涨，于是被误判成「放宽引起的重复触发」压掉。
+     * 实测后果：R10049-2（带柳月樱游览大梁城繁花似锦楼）第一段播完后，
+     * 第二段起每次都被压回 false，任务卡在 overview2 永远推进不了。
+     * 现在再加一条：**这次必须真的放宽过**（g_ev_relax_hits > 0）才进入压制逻辑。 */
     int before = g_team_cond_hits;
+    g_ev_relax_hits = 0;
     bool r = orig_hold_check ? orig_hold_check(self) : false;
     if (!F_STORY || !r) return r;
     if (g_team_cond_hits == before) return r;      /* 本次判定没碰队友条件：不干预 */
+    if (g_ev_relax_hits == 0) return r;            /* v211：本次没有真放宽 → 不压制 */
     if ((uintptr_t)self < 0x10000) return r;
 
     int times = *(int*)((char*)self + OFF_HOLD_TIMES);
@@ -2488,11 +2574,28 @@ static bool hold_check_core(void* self) {
  * Patch_FlattenGate 盖住 HoldOnceGuard（注册顺序决定），这里用「先核心、后强制」显式对齐。
  * 另外 flatten_gate_forced 故意不看 F_FLAT —— 线已改指，门必须继续放行，否则卡死。 */
 static bool hook_hold_check(void* self) {
+
+    /* v254：清理调试代码 —— v226 的 `[hold-dbg]`（只在 R10049-2-1 上打）已删。
+     * 保留 `[gate-miss]`：它能抓「改线已做但门没被接管」这种一致性故障，有长期价值。 */
     bool r = hold_check_core(self);
-    if (!r && flatten_gate_forced(self)) return true;
+    if (!r) {
+        /* v237：判定失败的每个门记一笔 —— 之前无法区分「压制生效但门没被接管」
+         * 与「干脆没压制」。R10049-2-1 的 _4_3 不播就卡在这一层。 */
+        extern int g_miss_log;
+        int forced = flatten_gate_forced(self);
+        if (!forced && g_miss_log < 60) {
+            g_miss_log++;
+            void* gg = *(void**)((char*)self + OFF_NODE_GRAPH);
+            char gb9[96];
+            const char* gn9 = ((uintptr_t)gg > 0x10000) ? obj_name(gg, gb9, sizeof(gb9)) : "?";
+            LOGI("[gate-miss] 图=%s 门=%p 判假且未被接管（压制生效）", gn9 ? gn9 : "?", self);
+        }
+        if (forced) return true;
+    }
     return r;
 }
-
+int g_miss_log = 0;
+int g_hold_dbg = 0;
 /* ---- AssetBundle CRC 放行 ----
  * mod 的 *.bundle 被本工程改写过（数据移植 / UnityPy 重存），
  * catalog 里记录的 CRC 与实际文件对不上时 Unity 直接拒载：
@@ -2715,8 +2818,12 @@ static void install_tweaks() {
 
     /* 兜底：名单外的剧情图，times 非 0 就不再放行（防未知的循环事件）。
      * 名单内的图在这里直接放行，交给原版判断。 */
-    hook_install("剧情.HoldCheck", (void*)(g_base + RVA_HOLD_CHECK),
-                 (void*)hook_hold_check, (void**)&orig_hold_check);
+    if (hook_install("剧情.HoldCheck", (void*)(g_base + RVA_HOLD_CHECK),
+                     (void*)hook_hold_check, (void**)&orig_hold_check)) {
+        LOGI("剧情: HoldCheck 已挂 @ 0x%X（分支展开在这里触发）", RVA_HOLD_CHECK);
+    } else {
+        LOGE("剧情: HoldCheck **挂载失败** @ 0x%X —— 分支展开整条链都不会跑", RVA_HOLD_CHECK);
+    }
 
     /* v96：控制台 join 指令（静默，命中即吞） */
     join_install_hooks();

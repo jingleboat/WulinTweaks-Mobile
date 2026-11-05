@@ -13,7 +13,18 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "V1.2.0820B131"
-#define MOD_VER "v179"         /* v179：放宽与展平解耦（删除 region=0 限制）；移除"仅强制"通道 */
+
+/* v261：版本号由 build.ps1 注入（构建时间 + git 短 hash）。
+ * 用「宏字符串化」而不是直接传 -DMOD_VER="..." —— 因为 clang.cmd 是批处理，
+ * 会再解析一次命令行，引号会在传递中丢失（实测报 "invalid digit in octal constant"）。
+ * 之前这里硬编码 "v179" 从没改过，排查时多次误判「装了新版」实际还是旧版。 */
+#define WL_STR2(x) #x
+#define WL_STR(x) WL_STR2(x)
+#ifdef MOD_VER_RAW
+#define MOD_VER WL_STR(MOD_VER_RAW)
+#else
+#define MOD_VER "dev"
+#endif
 #define PKG_NAME "com.xd.dxlzz.global.gp"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/wulin.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
@@ -49,6 +60,9 @@ int flatten_cond_always_true(void* cond);
 /* v87：该**门**（HoldNode）是否已被接管 —— 由 hook_hold_check 整门判真，与 PC 的
  * BranchFlatten.IsGateForced 同一语义（故意不看开关）。 */
 int flatten_gate_forced(void* gate);
+/* v260：这个条件是否属于「某个门对」（不管该对是否展开）。
+ * keep_original_for 用它区分「没展开的门对」（不放宽）与「孤立门」（按原规则放宽）。 */
+int flatten_is_pair_cond(void* cond);
 int flatten_gate_pid(void* gate, int* in_team);
 const char* flatten_gate_cls(void* gate);
 const char* flat_node_name(void* nd);
