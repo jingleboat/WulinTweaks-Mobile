@@ -54,6 +54,28 @@
 #define RVA_PTM_ADD              0x22B78C0   /* bool AddCharacter(GCI) */
 
 #define RVA_GCM_GET_CHARACTER    0x2263114   /* GCI GetCharacter(int) */
+/* v282：按模板实例化。uid 收的是「模板ID」（CharacterPoolData 的 id），不是 InstanceId；
+ * 模板表里查不到该 id 时函数返回 null。参数顺序对齐原版 GameConsole.AddTeamMember 里的调用：
+ *   CreateCharacter(uid, forceInstanceId=-1, isPernament=true, factionJob=-1, equipCraftLevel=-1) */
+#define RVA_GCM_CREATE_CHARACTER 0x226A210
+
+/* v283：新建实例没有地图/坐标，按「大地图」形状落位。
+ * 偏移由四个 setter 逐条反汇编核对（PC 与手机完全一致）：
+ *   SetMapId     写 +0x180 m_curMapId，alsoChangeTarget 时同时写 +0x184 m_targetMapId
+ *   SetPos       写 +0x188 m_curPos{x,y,z}，同上时同时写 +0x194 m_targetPos{x,y,z}
+ *   SetDir       写 +0x1B0 m_dir
+ *   SetAnimState 写 +0x1B4 m_AnimState
+ * 参考值取自 Save0 里 m_curMapId == -1（大地图）的实例。 */
+#define OFF_GCI_CUR_MAP          0x180
+#define OFF_GCI_TARGET_MAP       0x184
+#define OFF_GCI_CUR_POS          0x188
+#define OFF_GCI_TARGET_POS       0x194
+#define OFF_GCI_DIR              0x1B0
+#define OFF_GCI_ANIM_STATE       0x1B4
+#define OW_MAP_ID                (-1)
+#define OW_POS_X                 85
+#define OW_POS_Y                 125
+#define OW_DIR                   1
 #define RVA_CFG_POOL_DATA        0x2269B88   /* CharacterPoolDataScriptObject get_CharacterPoolDataScriptObject() */
 
 #define RVA_SM_HAVE_STRING       0x2309778   /* bool HaveString(string) */
@@ -94,6 +116,7 @@ static int is_cls(void* o, const char* name)
 static void* g_cfg = nullptr;
 static void* g_ptm = nullptr;
 static void* g_sm = nullptr;
+static void* g_gcm = nullptr;      /* v282：GameCharacterManager 独立缓存槽 */
 static uint64_t g_cache_t = 0;
 
 static uint64_t jnow_ms(void)
@@ -106,7 +129,9 @@ static uint64_t jnow_ms(void)
 static void* mng(void** slot, const char* ns, const char* name)
 {
     uint64_t now = jnow_ms();
-    if (*slot && (uintptr_t)*slot > 0x10000 && now - g_cache_t < 60000) return *slot;
+    /* v282：命中也必须核对类名 —— 以前 g_cfg 一个槽被 GameConfig / GameCharacterManager /
+     * CharacterTeamMemberExtendDataScriptObject 轮流复用，60 秒内会互相返回错对象。 */
+    if (*slot && (uintptr_t)*slot > 0x10000 && now - g_cache_t < 60000 && is_cls(*slot, name)) return *slot;
     void* k = find_class(ns, name);
     void* inst = k ? find_object_of_type(k) : nullptr;
     *slot = is_cls(inst, name) ? inst : nullptr;
@@ -122,10 +147,38 @@ static void* str(const char* s) { return s ? A_string_new(s) : nullptr; }
 
 static void* get_char(int uid)
 {
-    void* m = mng(&g_cfg, "WuLin", "GameCharacterManager");
+    void* m = mng(&g_gcm, "WuLin", "GameCharacterManager");
     if (!m) return nullptr;
     void* c = CALL(void*, RVA_GCM_GET_CHARACTER, void*, int)(m, uid, nullptr);
     return is_cls(c, "GameCharacterInstance") ? c : nullptr;
+}
+
+/* v282：实例不存在时按模板创建（游戏自带能力，原版 AddTeamMember 就是这么兜底的）。
+ * uid 必须是模板ID：CreateCharacter 内部先 ContainsKey(uid) 查模板表，查不到直接返回 null。 */
+static void* char_create(int uid)
+{
+    void* m = mng(&g_gcm, "WuLin", "GameCharacterManager");
+    if (!m) { LOGI("[join] 取不到 GameCharacterManager，无法实例化"); return nullptr; }
+    void* c = CALL(void*, RVA_GCM_CREATE_CHARACTER, void*, int, int, int, int, int)
+                  (m, uid, -1, 1, -1, -1, nullptr);
+    return is_cls(c, "GameCharacterInstance") ? c : nullptr;
+}
+
+/* v283：给新建实例落位。只在「刚从模板创建出来」时调用，不碰已有实例的位置。
+ * 与游戏自己的 StoryManager.LoadNpcPos 同形：SetMapId + SetPos + 写朝向。 */
+static void place_on_overworld(void* inst)
+{
+    if (!inst) return;
+    *(int*)((char*)inst + OFF_GCI_CUR_MAP)         = OW_MAP_ID;
+    *(int*)((char*)inst + OFF_GCI_TARGET_MAP)      = OW_MAP_ID;
+    *(int*)((char*)inst + OFF_GCI_CUR_POS)         = OW_POS_X;
+    *(int*)((char*)inst + OFF_GCI_CUR_POS + 4)     = OW_POS_Y;
+    *(int*)((char*)inst + OFF_GCI_CUR_POS + 8)     = 0;
+    *(int*)((char*)inst + OFF_GCI_TARGET_POS)      = OW_POS_X;
+    *(int*)((char*)inst + OFF_GCI_TARGET_POS + 4)  = OW_POS_Y;
+    *(int*)((char*)inst + OFF_GCI_TARGET_POS + 8)  = 0;
+    *(int*)((char*)inst + OFF_GCI_DIR)             = OW_DIR;
+    *(int*)((char*)inst + OFF_GCI_ANIM_STATE)      = -1;
 }
 
 static int  gci_uid(void* inst)   { return CALL(int,  RVA_GCI_TEMPLETE_UID, void*)(inst, nullptr); }
@@ -776,11 +829,54 @@ static int join_handle(const char* text)
     if (uid <= 0) { LOGI("[join] 找不到目标：%s", target); return 1; }
 
     void* inst = get_char(uid);
-    if (!inst) { LOGI("[join] uid=%d 实例不存在（还没被游戏创建）", uid); return 1; }
+    if (!inst)
+    {
+        /* v282：原版 GameConsole.AddTeamMember 在这条路上会自己 CreateCharacter 兜底，
+         * 我们这条 join 以前只查实例就停了，所以「还没被游戏创建」的角色永远进不来。 */
+        LOGI("[join] uid=%d 实例不存在，按模板创建", uid);
+        inst = char_create(uid);
+        if (!inst)
+        {
+            LOGI("[join] uid=%d 模板创建失败：模板表里没有该 id，或该类角色不允许创建", uid);
+            return 1;
+        }
+        LOGI("[join] uid=%d 已实例化 inst=%p iid=%d 模板uid=%d 存活=%d",
+             uid, inst, gci_iid(inst), gci_uid(inst), (int)gci_alive(inst));
+        if (!gci_alive(inst)) LOGI("[join] uid=%d 复活=%d", uid, revive(inst));
+        LOGI("[join] uid=%d 落位前：map=%d target=%d pos=(%d,%d,%d) dir=%d anim=%d",
+             uid,
+             *(int*)((char*)inst + OFF_GCI_CUR_MAP),
+             *(int*)((char*)inst + OFF_GCI_TARGET_MAP),
+             *(int*)((char*)inst + OFF_GCI_CUR_POS),
+             *(int*)((char*)inst + OFF_GCI_CUR_POS + 4),
+             *(int*)((char*)inst + OFF_GCI_CUR_POS + 8),
+             *(int*)((char*)inst + OFF_GCI_DIR),
+             *(int*)((char*)inst + OFF_GCI_ANIM_STATE));
+        place_on_overworld(inst);
+        LOGI("[join] uid=%d 落位：map=%d target=%d pos=(%d,%d,%d) targetPos=(%d,%d,%d) dir=%d anim=%d",
+             uid,
+             *(int*)((char*)inst + OFF_GCI_CUR_MAP),
+             *(int*)((char*)inst + OFF_GCI_TARGET_MAP),
+             *(int*)((char*)inst + OFF_GCI_CUR_POS),
+             *(int*)((char*)inst + OFF_GCI_CUR_POS + 4),
+             *(int*)((char*)inst + OFF_GCI_CUR_POS + 8),
+             *(int*)((char*)inst + OFF_GCI_TARGET_POS),
+             *(int*)((char*)inst + OFF_GCI_TARGET_POS + 4),
+             *(int*)((char*)inst + OFF_GCI_TARGET_POS + 8),
+             *(int*)((char*)inst + OFF_GCI_DIR),
+             *(int*)((char*)inst + OFF_GCI_ANIM_STATE));
+    }
 
     /* v99：只做「入队」这一步，其余动作（解除陌生/家园/结缘）先关掉 ——
      * v98 在动作层仍然段错误，逐层打开比一次全开更容易定位。 */
     LOGI("[join] uid=%d 实例=%p，开始入队", uid, inst);
+    {
+        void* t = ptm();
+        if (t) LOGI("[join] 队伍 %d/%d 人",
+                    CALL(int, RVA_PTM_TEAM_SIZE, void*)(t, nullptr),
+                    CALL(int, RVA_PTM_MAX_SIZE,  void*)(t, nullptr));
+        else LOGI("[join] 取不到 PlayerTeamManager");
+    }
     int joined = team_add2(inst, uid);
     if (joined < 0) joined = team_add(uid);
     unstranger_m(inst);

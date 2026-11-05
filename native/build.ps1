@@ -13,7 +13,7 @@ try {
     if ($LASTEXITCODE -eq 0 -and $g) { $gitHash = "$g".Trim() }
 } catch { }
 $stamp = Get-Date -Format 'MMdd-HHmm'
-$ver   = "v261-$stamp-$gitHash"
+$ver   = "v283-$stamp-$gitHash"
 
 $defineVer = "-DMOD_VER_RAW=$ver"
 
