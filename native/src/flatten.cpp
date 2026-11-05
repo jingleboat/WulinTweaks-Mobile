@@ -870,6 +870,30 @@ void flatten_try(void* any_node) {
             int is_team2 = n2 && (strcmp(n2, "需要伙伴") == 0);
             if (!is_team1 || !is_team2) continue;      /* 不是队友条件 → 不是门对 */
         }
+        /* v281（P0-2 补）：**门的 conditionPort 必须恰好 1 条连接**。
+         *
+         * 强制放行的粒度是**门**（hook_hold_check 里 flatten_gate_forced → 直接 return true，
+         * 不再跑条件判定）。门上若串了多个条件，放行整个门就把**所有条件**一起跳过了。
+         *
+         * 实证：Fame-4-1 pid=10099 的 G0 门有 2 个条件（「需要伙伴」+「判断角色带有Buff」）
+         * → 强制放行绕过了 Buff 限制 → 剧情在不该播的时候播。
+         *
+         * 审查意见原话：「宁可漏识别，也不要在条件结构不完整时接管门。」 */
+        {
+            int cp0 = 0, cp1 = 0;
+            void* opc0 = node_port(g_nd[a], "conditionPort", 1);
+            void* opc1 = node_port(g_nd[b], "conditionPort", 1);
+            if ((uintptr_t)opc0 > 0x10000) cp0 = port_conn_count(opc0);
+            if ((uintptr_t)opc1 > 0x10000) cp1 = port_conn_count(opc1);
+            if (cp0 != 1 || cp1 != 1) {
+                if (g_log_graph < FLAT_LOG_GRAPH) {
+                    g_log_graph++;
+                    LOGI("[flat-reject] 图 %s 的门 conditionPort=%d/%d（要求恰好 1）→ 拒绝该对",
+                         gn, cp0, cp1);
+                }
+                continue;
+            }
+        }
         int pa = *(int*)((char*)ca + OFF_HP_PARTNER_ID);
         int pb = *(int*)((char*)cb + OFF_HP_PARTNER_ID);
         if (pa <= 0 || pa != pb) continue;             /* partnerID<=0 不是「需要伙伴」 */
@@ -1153,6 +1177,7 @@ void flatten_try(void* any_node) {
 
 
 
+        int rw_start = g_rewire_n;      /* v281（P0-7）：本次改线起点，用于失败回滚 */
         int ok = 0, bad = 0;
         for (int e = 0; e < p->ex_n; ++e) {
             FLAT_EDGE* ed = &g_edge[g_exit[p->ex_start + e]];
@@ -1168,6 +1193,23 @@ void flatten_try(void* any_node) {
             } else bad++;
         }
         redirected += ok;      /* v238 替换改线目标时把这行弄丢了 → 汇总永远显示「改线 0 条」 */
+
+        /* v281（P0-7）：**事务化** —— 任一出口改线失败就回滚本次全部改线，
+         * 并且**不登记门表**（避免「连接只改了一半 + 门被强制放行」这种不一致）。
+         *
+         * 审查意见原话：「任意步骤失败都恢复原连接，不留下部分改线或部分门表。」 */
+        if (bad > 0) {
+            for (int i = g_rewire_n - 1; i >= rw_start; --i)
+                port_set_conn_node(g_rewire[i].port, g_rewire[i].slot, g_rewire[i].orig);
+            g_rewire_n = rw_start;
+            redirected -= ok;
+            skipped++;
+            if (g_log_pair < 300) {
+                g_log_pair++;
+                LOGI("[flat-rollback] pid=%d 有 %d 条出口改线失败 → 回滚本次改线，不登记门表", p->pid, bad);
+            }
+            continue;
+        }
 
         /* v244：**把本对的 G1 门（不在队）出边改指本对的 G0 门（在队）**。
          *
@@ -1202,7 +1244,18 @@ void flatten_try(void* any_node) {
                             }
                             continue;
                         }
-                        if (port_set_conn_node(op1, k2, g_nd[p->g0])) redirected++;
+                        {
+                            void* orig2 = port_conn_node(op1, k2);
+                            if (port_set_conn_node(op1, k2, g_nd[p->g0])) {
+                                if (g_rewire_n < FLAT_MAX_EDGES) {
+                                    g_rewire[g_rewire_n].port = op1;
+                                    g_rewire[g_rewire_n].slot = k2;
+                                    g_rewire[g_rewire_n].orig = orig2;
+                                    g_rewire_n++;
+                                }
+                                redirected++;
+                            }
+                        }
                     }
                 }
             }
