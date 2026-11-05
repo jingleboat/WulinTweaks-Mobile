@@ -821,29 +821,6 @@ static int keep_original_for(void* condNode) {
 
     if ((uintptr_t)condNode < 0x10000) return 0;
 
-    /* v260：**放宽只对被展平的门对生效**。
-     *
-     * 用户的规则：「不放宽没有展平的门对」。
-     *
-     * 为什么：没展开的门对，放宽只会让 G0/G1 两侧都判真，而引擎在分叉点只走最后一条
-     * 连接 —— 结果是「只播不在队侧」，反而不如原版「各走各的」。
-     * 离线实测：651 对里展开 517（继续放宽），region=0 的 55 对与无出口的 79 对不再放宽；
-     * 代价只有 3 对（在队剧情原本只靠放宽才播得到）。
-     *
-     * **孤立门不受影响** —— 它们不成对（flatten_is_pair_cond 为假），继续走下面的原规则。 */
-    if (flatten_cond_always_true(condNode)) return 0;   /* 已展平 → 放宽（且不受额度限制） */
-    if (flatten_is_pair_cond(condNode)) {
-        /* v262：**不放宽，但仍然要清临时名**。
-         *
-         * v260 这里直接 `return 1` 就返回了，于是后半段的 unstranger_apply_uid 整段被跳过
-         * —— 用户实测「有时清除临时名功能失效」就是这个。
-         *
-         * 这和 v148 是同一类问题：当时是「清名被放宽额度限制」，现在是「清名被是否展平限制」。
-         * **清名与放宽是两件事** —— 放不放宽是玩法取舍，清不清名是显示层的独立性。 */
-        int p0 = *(int*)((char*)condNode + OFF_PARTNER_ID);
-        if (p0 > 0) unstranger_apply_uid(p0, 0);
-        return 1;                                       /* 是门对但没展开 → 不放宽 */
-    }
     uint64_t now = rule_now_ms();
     for (int i = 0; i < RULE_CACHE_N; ++i) {
         if (g_rule_cache[i].node == condNode) {

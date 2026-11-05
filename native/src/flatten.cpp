@@ -162,31 +162,6 @@ static void flat_add_cond(void* cond) {
     if (g_flat_cond_n < FLAT_MAX_CONDS) g_flat_cond[g_flat_cond_n++] = cond;
 }
 
-/* v260：**门对条件表** —— 记录「所有构成门对的条件节点」，不管那一对后来有没有展开。
- *
- * 为什么需要它：v260 起「放宽」只对被展平的门对生效，但「孤立门」（不成对的队友条件）
- * 仍按原规则放宽。两者在 keep_original_for 里必须能区分 ——
- *   g_flat_cond  = 已展平的门对条件 → 放宽
- *   g_pair_cond  = 是门对但没展开   → **不放宽**
- *   两者都不在   = 孤立门           → 按原规则放宽
- * 没有这张表就无法把「没展开的门对」和「孤立门」分开。 */
-static void* g_pair_cond[FLAT_MAX_CONDS];
-static int g_pair_cond_n = 0;
-
-static void flat_add_pair_cond(void* cond) {
-    if ((uintptr_t)cond < 0x10000) return;
-    for (int i = 0; i < g_pair_cond_n; ++i)
-        if (g_pair_cond[i] == cond) return;
-    if (g_pair_cond_n < FLAT_MAX_CONDS) g_pair_cond[g_pair_cond_n++] = cond;
-}
-
-/* 这个条件是否属于「某个门对」（不管该对是否展开）。由 keep_original_for 调用。 */
-int flatten_is_pair_cond(void* cond) {
-    if ((uintptr_t)cond < 0x10000) return 0;
-    for (int i = 0; i < g_pair_cond_n; ++i)
-        if (g_pair_cond[i] == cond) return 1;
-    return 0;
-}
 
 /* v87：被接管的**门**（HoldNode）本身 —— 与 PC 的 BranchFlatten._gateForced 对齐。
  * 为什么需要它：手机上条件层只能在 IsJoinedTeamCondition / HavePartnerCondition 两个
@@ -504,79 +479,9 @@ static int flat_build(void* g) {
 
 /* v256：从 start 出发（沿 OutPort）是否能到达 target。用 g_reg 的临时位图做 visited。
  * 用于「最后一对改指 G1 之前」的成环校验 —— 只在改线阶段跑一次，不在热路径。 */
-/* v260：目标节点除 exclude_src 之外还有没有别的入边。
- * 用于「孤岛判据」：region 的出口边 (x→t) 一旦改指别处，若 t 只有这一条入边，
- * t 连同它的整个下游都会不可达（实测 DBZX-6 丢 43 个节点，含 6 次强制NPC死亡）。
- * 只在改线阶段跑一次，不在热路径。 */
-static int flat_has_other_in(int tgt, int exclude_src) {
-    for (int i = 0; i < g_nnodes; ++i) {
-        if (i == exclude_src) continue;
-        for (int e = 0; e < g_ec[i]; ++e)
-            if (g_edge[g_e0[i] + e].tgt == tgt) return 1;
-    }
-    return 0;
-}
 
 
 
-/* v266：这一对在**结构上**能不能展开（不含「最后一对的成环校验」）。
- *
- * 用途：链式接续时校验 next_g0 —— **改线目标必须是一道会放行的门**。
- *
- * 实测事故（R10049-0 大梁捞朱）：5 对门、5 段剧情 _3_2.._3_6 都汇合到 _3_8。
- * 链式接续把 _3_5 的出口改指 20063 的 G0，而 20063 是最后一对、被成环校验拦下
- * → 没展开 → 门不接管 → 判假 → 流程停在 _3_6 之前，事件直接中断。
- * 用户看到的是「花四娘(20025)那段播完，事件就结束了」。
- *
- * 修法：结构上不可展开的对不能当改线目标 → 回落自己的 G1（保持 v245 行为）。
- */
-static int is_story_idx(int i);   /* v268：前向声明（定义在后面） */
-
-/* v268：**分支汇合判据** —— 这几段是「互斥分支 + 共同收尾」，不是梯子链，不能展平。
- *
- * 判据：本对的「剧情出口」如果同时也是**其它对的剧情出口**指向的目标，说明这些段共用同一个收尾。
- *
- * 实测事故（R10049-0，用户报「花四娘那段没播，而且都没播」）：
- *   5 对门的剧情 _3_2/_3_3/_3_4/_3_5/_3_6 **全部**指向 _3_8。
- *   原版：任一角色在队 → 播他那段 → 播 _3_8 收尾 → 结束。
- *   展平当成梯子链 → 每段出口改指下一段 → **_3_8 这个共同收尾被跳过**，
- *   而且 5 段在几毫秒内连续触发，玩家根本看不到内容。
- *
- * 全库离线：8 张图有这种结构（M5061-5 / R10049-0 / R10049-2 / DNJH-6 / DNJH-7-3
- * / M10140-3 / A15015-1 / R10103-2）。
- */
-static int flat_is_shared_exit(int k, int exit_tgt) {
-    for (int q = 0; q < g_npairs; ++q) {
-        if (q == k) continue;
-        FLAT_PAIR* oq = &g_pair[q];
-        if (oq->g0 < 0 || oq->g0 >= g_nnodes) continue;
-        for (int e = 0; e < g_ec[oq->g0]; ++e) {
-            int st = g_edge[g_e0[oq->g0] + e].tgt;
-            if (!is_story_idx(st)) continue;
-            for (int e2 = 0; e2 < g_ec[st]; ++e2) {
-                if (g_edge[g_e0[st] + e2].tgt == exit_tgt) return 1;
-            }
-            break;
-        }
-    }
-    return 0;
-}
-
-static int flat_pair_ok(int k) {
-    FLAT_PAIR* p = &g_pair[k];
-    if (p->reg_n == 0 || p->reg_n > FLAT_MAX_REGION || p->ex_n == 0) return 0;
-    for (int q = 0; q < g_npairs; ++q) {
-        if (q == k) continue;
-        if (g_pair[q].reg_n == 0) continue;
-        for (int i = 0; i < g_nnodes; ++i)
-            if (g_reg[k][i] == 1 && g_reg[q][i] == 1) return 0;
-    }
-    for (int e = 0; e < p->ex_n; ++e) {
-        FLAT_EDGE* ed = &g_edge[g_exit[p->ex_start + e]];
-        if (!flat_has_other_in(ed->tgt, ed->src)) return 0;
-    }
-    return 1;
-}
 
 static int is_story_idx(int i) {
     if (i < 0 || i >= g_nnodes) return 0;
@@ -906,11 +811,6 @@ void flatten_try(void* any_node) {
         FLAT_PAIR* p = &g_pair[k];
 
 
-        /* v260：**先登记这一对的条件**（不管后面展开与否）。
-         * keep_original_for 靠它区分「没展开的门对」（不放宽）与「孤立门」（按原规则放宽）。 */
-        flat_add_pair_cond(g_cond[p->g0]);
-        flat_add_pair_cond(g_cond[p->g1]);
-
         p->reg_n = flat_region(k);
         p->ex_start = g_nexit;
         p->ex_n = 0;
@@ -1015,132 +915,10 @@ void flatten_try(void* any_node) {
                 }
             }
         }
-        /* v266：**改线目标必须是会放行的门** —— 目标对结构上不可展开就回落自己的 G1。
-         * 否则会改指一道永远判假的门，流程在那里断掉（R10049-0 的 _3_6 就是这样丢的）。 */
-        if (next_g0 >= 0) {
-            int qq = -1;
-            for (int q = 0; q < g_npairs; ++q) {
-                if (q == k) continue;
-                if (g_pair[q].g0 == next_g0) { qq = q; break; }
-            }
-            if (qq < 0 || !flat_pair_ok(qq)) {
-                if (g_log_pair < 300) {
-                    g_log_pair++;
-                    LOGI("[flat-next] pid=%d 的下一对不可展开 → 回落自己的 G1（避免改指死门）", p->pid);
-                }
-                next_g0 = -1;
-            }
-        }
 
-        /* v256 + v258：**最后一对改指自己的 G1 之前的两道校验**。
-         *
-         * 只有「最后一对」（next_g0 = -1）才走这里，因为只有它会把出口改指 G1。
-         *
-         * 校验① **G0（在队）侧没有剧情节点 → 整对跳过**（v258）
-         *   在队侧本来就没内容，「先播在队、再播不在队」无从谈起，改指毫无意义；
-         *   而改指还会制造环 —— R10039-5 的 pair0 就是这样：G0 侧空，G1 侧是 _7，
-         *   出口 _6 被改指 G1 后 `_6 → G1 → _7 → … → _6` 死循环。
-         *   离线全库：加上这条后「改线新增环」从 1 → **0**。
-         *
-         * 校验② **G1 能绕回本对的在队剧情 → 整对跳过**（v256）
-         *   不加这条时，154 张有改线的图里有 24 处「原版无环、改线后有环」。
-         *   典型 R10039-5 pair1：G0=_2 会被改指 G1，而 G1 原版路径能绕回 _2 → 环。
-         *   加上后 24 → 1（剩下的 1 处正是校验①覆盖的）。
-         *
-         * 两道校验都不改变任何「G0 剧情可达性」（离线验证 0 损失）。 */
-        if (next_g0 < 0 && p->g0 >= 0 && p->g0 < g_nnodes && p->g1 >= 0 && p->g1 < g_nnodes) {
-            int story_of_g0 = -1;
-            for (int e = 0; e < g_ec[p->g0]; ++e) {
-                int t = g_edge[g_e0[p->g0] + e].tgt;
-                if (is_story_idx(t)) { story_of_g0 = t; break; }
-            }
-            /* v264：第二道校验改成**短路判据** —— 改指 G1 后，G1 的**直接出口**里有没有
-             * 「本对剧情」或「region 内节点」。有就是一步绕回，必然循环。
-             *
-             * 为什么不再用「图论成环」：环形图**原版就处处是环** —— R10049-2-1 原版 9 个剧情节点
-             * 全部「成环」，但 v255 实测完全正常，因为实际运行时门判定会断开那些路。
-             * v256/v263 的判据因此误伤了 pid=10098（鱼薇儿的 _4_5 不播）。
-             *
-             * 而 v246 实测真死循环的 Role1-1，恰恰是「G1 直接指回同一段剧情」这种一步之遥。
-             *
-             * 离线全库：短路判据拦下 0 对；展开率 452 → 470（69.4% → 72.2%）。 */
-            int would_cycle = 0;
-            if (story_of_g0 >= 0) {
-                for (int e = 0; e < g_ec[p->g1] && !would_cycle; ++e) {
-                    int t = g_edge[g_e0[p->g1] + e].tgt;
-                    if (t == story_of_g0) { would_cycle = 1; break; }
-                    for (int i = 0; i < p->reg_n; ++i) {
-                        /* region 是 g_reg[k] 里的位图；这里只查 t 是否在区内 */
-                        if (t >= 0 && t < g_nnodes && g_reg[k][t]) { would_cycle = 1; break; }
-                    }
-                }
-            }
-            const char* why = nullptr;
-            if (story_of_g0 < 0) why = "在队侧没有剧情，改指无意义";
-            else if (would_cycle) why = "短路命中";
-            if (why) {
-                /* v267 诊断：把 region 内容和 G1 出边打出来，定位误拦 */
-                if (g_log_pair < 300) {
-                    g_log_pair++;
-                    char nmbuf[64];
-                    const char* sn = (story_of_g0 >= 0) ? flat_node_name(g_nd[story_of_g0]) : "-";
-                    LOGI("[flat-guard-dbg] pid=%d why=%s reg_n=%d story=%s g1_outs:",
-                         p->pid, why, p->reg_n, sn ? sn : "?");
-                    for (int e = 0; e < g_ec[p->g1]; ++e) {
-                        int t = g_edge[g_e0[p->g1] + e].tgt;
-                        int inreg = (t >= 0 && t < g_nnodes) ? g_reg[k][t] : -1;
-                        const char* tn = (t >= 0 && t < g_nnodes) ? flat_node_name(g_nd[t]) : "?";
-                        LOGI("     g1→ %s  in_region=%d  is_story=%d", tn ? tn : "?", inreg, (t == story_of_g0));
-                        (void)nmbuf;
-                    }
-                }
-                if (g_log_pair < 300) {
-                    g_log_pair++;
-                    LOGI("[flat-guard] pid=%d %s → 不改指 G1（避免成环）", p->pid, why);
-                }
-                continue;      /* 整对跳过，保持原版出口 */
-            }
-        }
         void* rewire_to = (next_g0 >= 0 && next_g0 < g_nnodes) ? g_nd[next_g0] : g_nd[p->g1];
 
 
-        /* v268：**分支汇合判据** —— 出口是别的对也指向的共同收尾 → 不展平 */
-        {
-            int shared = 0;
-            for (int e = 0; e < p->ex_n && !shared; ++e) {
-                FLAT_EDGE* ed = &g_edge[g_exit[p->ex_start + e]];
-                if (flat_is_shared_exit(k, ed->tgt)) shared = 1;
-            }
-            if (shared) {
-                skipped++;
-                if (g_log_pair < 300) {
-                    g_log_pair++;
-                    LOGI("[flat-guard] pid=%d 出口是共同收尾（分支汇合结构）→ 不展开，保持原版",
-                         p->pid);
-                }
-                continue;
-            }
-        }
-
-        /* v260：**孤岛判据** —— 任何一条出口边的目标若「除这条边外没有其它入边」，
-         * 改线会让它连同整个下游不可达。实测（离线全库 455 对改线）：只有 5 处命中，
-         * 但丢的是整段内容 —— DBZX-6 丢 43 个节点（6 段剧情 + 强制NPC死亡×6 + 删除标记×10）。
-         * 这就是用户说的「丢失流程 / 丢失存档标记」风险的统一判据。 */
-        {
-            int orphan = 0;
-            for (int e = 0; e < p->ex_n && !orphan; ++e) {
-                FLAT_EDGE* ed = &g_edge[g_exit[p->ex_start + e]];
-                if (!flat_has_other_in(ed->tgt, ed->src)) orphan = 1;
-            }
-            if (orphan) {
-                skipped++;
-                if (g_log_pair < 300) {
-                    g_log_pair++;
-                    LOGI("[flat-guard] pid=%d 出口目标会变孤岛 → 整对不展开（避免丢流程/丢标记）", p->pid);
-                }
-                continue;
-            }
-        }
 
         int ok = 0, bad = 0;
         for (int e = 0; e < p->ex_n; ++e) {
