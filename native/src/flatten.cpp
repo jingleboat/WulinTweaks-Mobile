@@ -830,10 +830,23 @@ void flatten_try(void* any_node) {
             char nb1[64], nb2[64];
             const char* n1 = unity_name(ca, nb1, sizeof(nb1));
             const char* n2 = unity_name(cb, nb2, sizeof(nb2));
-            int is_team1 = n1 && (strcmp(n1, "需要伙伴") == 0 || strcmp(n1, "需要角色加入") == 0 ||
-                                  strcmp(n1, "是否加入过队伍") == 0 || strcmp(n1, "需要角色加入过队伍") == 0);
-            int is_team2 = n2 && (strcmp(n2, "需要伙伴") == 0 || strcmp(n2, "需要角色加入") == 0 ||
-                                  strcmp(n2, "是否加入过队伍") == 0 || strcmp(n2, "需要角色加入过队伍") == 0);
+            /* v272：**只认「需要伙伴」**（HavePartnerCondition）。
+             *
+             * 实现目标是「角色是否在队」这一个语义 —— 只有它符合。
+             * 之前这里是 4 个名字，后三个（需要角色加入 / 是否加入过队伍 / 需要角色加入过队伍）
+             * 是 IsJoinedTeamCondition（**历史入队**），与「当前在队」不是同一维度；
+             * 而且 v212 已决定它**不放宽** → 对它展平不会生效（展平依赖放宽让 G0 判真），
+             * 只会白登记门表/条件表。
+             *
+             * 来源是离线工具里的一句「后者在 ModEditor 里没直接观察到，先留名备用」——
+             * 运行时照抄了这个「备用」白名单 → 隐患：DLC 图里若出现「是否加入过队伍」，
+             * 会被误当成「在队/不在队」门对按 Negate 互补去展平，语义完全错。
+             *
+             * 离线全库实测：伙伴/入队类条件 1546(需要伙伴) + 402(队伍有空闲位置)
+             * + 196(判断队伍属性满足) + 7(判断NPC加入过队伍)，后三个备用名 **0 次**。
+             * 收窄后门对总数不变（651 对 / 209 图），零影响。 */
+            int is_team1 = n1 && (strcmp(n1, "需要伙伴") == 0);
+            int is_team2 = n2 && (strcmp(n2, "需要伙伴") == 0);
             if (!is_team1 || !is_team2) continue;      /* 不是队友条件 → 不是门对 */
         }
         int pa = *(int*)((char*)ca + OFF_HP_PARTNER_ID);
