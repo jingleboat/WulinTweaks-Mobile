@@ -387,6 +387,7 @@ static FLAT_PAIR      g_pair[FLAT_MAX_PAIRS];
  *   离线对比：宽松比严格只少 5 对（489 vs 494），组数 438 vs 548（链更完整）。
  */
 static int g_will_expand[FLAT_MAX_PAIRS];   /* 该对最终会不会展开 */
+static int g_diag_log = 0;                  /* v275：3a/chain 诊断的**独立**计数器（不与 g_log_graph 抢配额） */
 
 /* v271：**未展开的链 → 禁止放宽**。
  *
@@ -605,8 +606,8 @@ static void flat_chain_decide(void) {
                 while (par[rj] != rj) rj = par[rj];
                 if (rj == ri && g_will_expand[j]) cnt++;
             }
-            if (g_log_graph < FLAT_LOG_GRAPH) {
-                g_log_graph++;
+            if (g_diag_log < 600) {
+                g_diag_log++;
                 LOGI("[flat-chain] 链组内有对未通过 → 整组清零（本组原有 %d 对通过，现全清）", cnt);
             }
             for (int j = 0; j < g_npairs; ++j) {
@@ -1137,8 +1138,8 @@ void flatten_try(void* any_node) {
         }
         g_will_expand[k] = 1;
     }
-    /* v274 诊断：③a 后每对的结果（定位「整图展开 0」） */
-    if (g_log_graph < FLAT_LOG_GRAPH) {
+    /* v275 诊断：③a 后每对的结果（独立配额，每图只打一次） */
+    if (g_diag_log < 600) {
         int cs = 0;
         char buf[256];
         int off = 0;
@@ -1148,8 +1149,8 @@ void flatten_try(void* any_node) {
             if (off < 254) buf[off++] = g_will_expand[k] ? '1' : '0';
         }
         buf[off < 255 ? off : 255] = 0;
-        if (cs < g_npairs) {
-            g_log_graph++;
+        {
+            g_diag_log++;
             char nb[96];
             const char* gn2 = unity_name(g, nb, sizeof(nb));
             LOGI("[flat-3a] 图=%s 逐对结果=[%s] 通过 %d/%d",
