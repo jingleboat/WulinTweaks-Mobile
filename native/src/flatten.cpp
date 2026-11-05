@@ -538,6 +538,27 @@ static int flat_build(void* g) {
  * 那个门还有父节点指着）→ 改指安全；若指向**自己独占的下级**（只有 G1 指着）→ 改指就切断。
  * 三种策略离线对比：全部改指 42 对丢 3046；只改门对成员 42 对丢 3046；只改仍有别的入边 **0 对丢 0**。
  */
+/* v280：**目标是不是某个门对的 G0 或 G1**。
+ *
+ * 用途：孤岛判据的排除项。
+ *
+ * 为什么必须排除：门对成员在改线时**必然被处理**（要么成为改线目标，要么被串联），
+ * 不会因为「这条出口边被改指」而下落不明。
+ *
+ * 实证（JuQingYouHua 覆盖版 R10049-2-1，64 节点）：
+ *   10098 对的 region 膨胀到 20 个节点，出口 4 条全部判孤岛 ——
+ *   但它们的目标正是 10061/10075/10052 三对的 G0（30/36/42）和它自己的 G0（48），
+ *   每条入度都只有 1（mod 把「G1 门」和「下一对的父节点」合成了同一个节点）。
+ *   按旧判据 → 4 条全中 → 整链清零 → 只播 _4_6（用户实测现象）。
+ *   而原版（无 mod 覆盖）下该对 reg=2、出口 1 条指向汇合点（入度 8）→ 正常展开。
+ */
+static int flat_is_pair_gate(int tgt) {
+    for (int q = 0; q < g_npairs; ++q) {
+        if (g_pair[q].g0 == tgt || g_pair[q].g1 == tgt) return 1;
+    }
+    return 0;
+}
+
 static int flat_has_other_in_ptr(void* tgt_nd, void* exclude_nd) {
     if ((uintptr_t)tgt_nd < 0x10000) return 0;
     for (int i = 0; i < g_nnodes; ++i) {
@@ -1027,7 +1048,8 @@ void flatten_try(void* any_node) {
                 for (int e2 = 0; e2 < g_ec[i]; ++e2)
                     if (g_edge[g_e0[i] + e2].tgt == ed->tgt) { other = 1; break; }
             }
-            if (!other) orphan2 = 1;
+            /* v280：目标是门对成员 → 不算孤岛（改线时会处理它） */
+            if (!other && !flat_is_pair_gate(ed->tgt)) orphan2 = 1;
         }
         if (orphan2) continue;
         g_will_expand[k] = 1;
@@ -1092,7 +1114,7 @@ void flatten_try(void* any_node) {
                 for (int e2 = 0; e2 < g_ec[i]; ++e2)
                     if (g_edge[g_e0[i] + e2].tgt == tgt) { other = 1; break; }
             }
-            if (!other) orphan = 1;
+            if (!other && !flat_is_pair_gate(ed->tgt)) orphan = 1;   /* v280：门对成员不算孤岛 */
         }
         if (orphan) {
             skipped++;
