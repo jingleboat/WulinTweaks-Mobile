@@ -817,17 +817,6 @@ static void relax_once_reset(void) {
 }
 /* 带 TTL 缓存的入口：条件检查是热路径，若每次读图名 + 调 GetCharacter 会卡。
  * 入队状态会变，所以 TTL 3 秒，不能永久缓存。 */
-/* v273（P0-6）：决策完成后清空放宽判定的 TTL 缓存。
- *
- * 时序窗口的正确修法：不是「未决策就不放宽」（那会波及孤立门，违背「只针对门对」），
- * 而是「决策完成后让缓存失效」—— ban 表刚建好时，之前缓存下的「放宽」决定必须作废。
- *
- * 由 flatten.cpp 的 flat_build 在 g_pair_ban 建好后调用。
- */
-void relax_rule_cache_clear(void) {
-    for (int i = 0; i < RULE_CACHE_N; ++i) g_rule_cache[i].node = nullptr;
-}
-
 static int keep_original_for(void* condNode) {
 
     if ((uintptr_t)condNode < 0x10000) return 0;

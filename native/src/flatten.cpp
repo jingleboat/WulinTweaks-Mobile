@@ -387,7 +387,6 @@ static FLAT_PAIR      g_pair[FLAT_MAX_PAIRS];
  *   离线对比：宽松比严格只少 5 对（489 vs 494），组数 438 vs 548（链更完整）。
  */
 static int g_will_expand[FLAT_MAX_PAIRS];   /* 该对最终会不会展开 */
-static int g_diag_log = 0;                  /* v275：3a/chain 诊断的**独立**计数器（不与 g_log_graph 抢配额） */
 
 /* v271：**未展开的链 → 禁止放宽**。
  *
@@ -408,15 +407,6 @@ static void flat_add_ban(void* cond) {
 }
 
 /* 供 keep_original_for 调用：这个条件是否属于「未展开的链」→ 禁止放宽 */
-/* v273（P0-6）：**这张图是否已经完成决策**（扫描 + 逐对判定 + 整链决策 + 改线）。
- *
- * 用途：keep_original_for 在放宽之前必须先确认图已决策，否则会出现
- * 「图还在 BUILDING，g_pair_ban 还是空的 → 落进普通放宽」的时序窗口。
- *
- * 判据：图已在 g_done 表里（flatten_try 处理完才登记），或者它压根没有门对（无需决策）。
- * 更精确的做法是维护 UNSEEN/BUILDING/DECIDED_* 状态机，但 g_done 已经能表达「决策完成」，
- * 这里先用它 —— 引入完整状态机需要改动 flatten_try 的生命周期，风险更大。
- */
 int flatten_is_banned_cond(void* cond) {
     if ((uintptr_t)cond < 0x10000) return 0;
     for (int i = 0; i < g_pair_ban_n; ++i)
@@ -600,16 +590,6 @@ static void flat_chain_decide(void) {
             if (!g_will_expand[j]) { all_ok = 0; break; }
         }
         if (!all_ok) {
-            int cnt = 0;
-            for (int j = 0; j < g_npairs; ++j) {
-                int rj = j;
-                while (par[rj] != rj) rj = par[rj];
-                if (rj == ri && g_will_expand[j]) cnt++;
-            }
-            if (g_diag_log < 600) {
-                g_diag_log++;
-                LOGI("[flat-chain] 链组内有对未通过 → 整组清零（本组原有 %d 对通过，现全清）", cnt);
-            }
             for (int j = 0; j < g_npairs; ++j) {
                 int rj = j;
                 while (par[rj] != rj) rj = par[rj];
@@ -883,34 +863,6 @@ void flatten_try(void* any_node) {
         int g0 = na ? b : a;                           /* Negate=0 = 在队侧 */
         int g1 = na ? a : b;
 
-        /* v273（P0-2）：**门的 conditionPort 必须恰好 1 条连接**。
-         *
-         * 为什么：强制放行的粒度是**门**（`hook_hold_check` 里 `flatten_gate_forced(self)` →
-         * 直接 `return true`，不再跑条件判定）。门上若串了多个条件，把这整个门放行
-         * 就把**所有条件**一起跳过了。
-         *
-         * 实证：Fame-4-1 pid=10099 的 G0 门有 2 个条件 ——
-         *   「需要伙伴」+「判断角色带有Buff」
-         * 强制放行 → Buff 限制被绕过 → 剧情在不该播的时候播。
-         * 全库 124 对门存在这种多条件情况。
-         *
-         * 审查意见 P0-2 原话：「宁可漏识别，也不要在条件结构不完整时接管门。」 */
-        {
-            int cp0 = 0, cp1 = 0;
-            void* op0 = node_port(g_nd[g0], "conditionPort", 1);
-            void* op1 = node_port(g_nd[g1], "conditionPort", 1);
-            if ((uintptr_t)op0 > 0x10000) cp0 = port_conn_count(op0);
-            if ((uintptr_t)op1 > 0x10000) cp1 = port_conn_count(op1);
-            if (cp0 != 1 || cp1 != 1) {
-                if (g_log_graph < FLAT_LOG_GRAPH) {
-                    g_log_graph++;
-                    LOGI("[flat-reject] 图 %s pid=%d 的门 conditionPort=%d/%d（要求恰好 1）→ 拒绝该对",
-                         gn, pa, cp0, cp1);
-                }
-                continue;
-            }
-        }
-
         int s0 = story_exit(g0), s1 = story_exit(g1);
         if (!s0 && !s1) continue;                      /* X 类不动 */
 
@@ -1078,116 +1030,9 @@ void flatten_try(void* any_node) {
             if (!other) orphan2 = 1;
         }
         if (orphan2) continue;
-        /* v273（P0-5）：**多出口时，各目标的下游必须有共同汇合点**。
-         *
-         * 出口改线是把「region 的所有出口」统一改指下一对的 G0。若这些出口原本通向
-         * 语义不同的路径（一个设标记、一个给奖励），强行合流会改变执行语义。
-         *
-         * 判据：各出口目标的下游可达集（含自身）求交，排除本对 G1 后必须非空 ——
-         * 说明它们最终都会汇到同一个节点，合流不改变「之后走哪」。
-         *
-         * 离线：146 对多出口里 145 对有共同汇合（放行），只有 M2190-1 pid=20001 没有（拒绝）。 */
-        {
-            int tg0 = -1;
-            int multi = 0;
-            for (int e = 0; e < p->ex_n; ++e) {
-                int t = g_edge[g_exit[p->ex_start + e]].tgt;
-                if (tg0 < 0) tg0 = t;
-                else if (t != tg0) { multi = 1; break; }
-            }
-            if (multi) {
-                /* 对每个目标做 BFS（避开本对 G1），再求交 */
-                static unsigned char hit1[FLAT_MAX_NODES];
-                static unsigned char hit2[FLAT_MAX_NODES];
-                static int q[FLAT_MAX_NODES];
-                int first = 1;
-                for (int e = 0; e < p->ex_n; ++e) {
-                    int t = g_edge[g_exit[p->ex_start + e]].tgt;
-                    if (t < 0 || t >= g_nnodes) continue;
-                    memset(hit2, 0, (size_t)g_nnodes);
-                    int head = 0;
-                    hit2[t] = 1; q[head++] = t;
-                    while (head > 0) {
-                        int cur = q[--head];
-                        for (int ee = 0; ee < g_ec[cur]; ++ee) {
-                            int nx = g_edge[g_e0[cur] + ee].tgt;
-                            if (nx == p->g1) continue;      /* 不穿过本对 G1 */
-                            if (nx < 0 || nx >= g_nnodes || hit2[nx]) continue;
-                            hit2[nx] = 1;
-                            if (head < FLAT_MAX_NODES) q[head++] = nx;
-                        }
-                    }
-                    if (first) {
-                        memcpy(hit1, hit2, (size_t)g_nnodes);
-                        first = 0;
-                    } else {
-                        for (int i = 0; i < g_nnodes; ++i) hit1[i] &= hit2[i];
-                    }
-                }
-                int common = 0;
-                for (int i = 0; i < g_nnodes; ++i)
-                    if (hit1[i] && i != p->g1) { common = 1; break; }
-                if (!common) {
-                    if (g_log_pair < 300) {
-                        g_log_pair++;
-                        LOGI("[flat-reject] pid=%d 有多个出口且各目标下游无共同汇合 → 不展开", p->pid);
-                    }
-                    continue;
-                }
-            }
-        }
         g_will_expand[k] = 1;
     }
-    /* v275 诊断：③a 后每对的结果（独立配额，每图只打一次） */
-    if (g_diag_log < 600) {
-        int cs = 0;
-        char buf[256];
-        int off = 0;
-        for (int k = 0; k < g_npairs && off < 240; ++k) {
-            if (g_will_expand[k]) cs++;
-            if (k && off < 254) buf[off++] = ',';
-            if (off < 254) buf[off++] = g_will_expand[k] ? '1' : '0';
-        }
-        buf[off < 255 ? off : 255] = 0;
-        {
-            g_diag_log++;
-            char nb[96];
-            const char* gn2 = unity_name(g, nb, sizeof(nb));
-            LOGI("[flat-3a] 图=%s 逐对结果=[%s] 通过 %d/%d",
-                 (gn2 && gn2[0]) ? gn2 : "?", buf, cs, g_npairs);
-        }
-    }
-
-    flat_chain_decide();        /* 整链决策：链内任一不通过 → 整链清零 */
-    /* v274：**撤掉 P0-3'（改线后线性检查）** —— 用户要求：「P0-3 那项不要改动，
-     * 用审查之前的版本代码就行，只要进行逻辑上判断无风险即可」。
-     * 离线已验证改线后 R10049-2-1 / R10049-0 都是纯线性，逻辑上无风险；
-     * 不再在运行时加这道判据（它会因为实现细节误拒整图）。 */
-
-    /* v273（P0-2 第 5 条 / P0-7）：**改线记录容量不足 → 整图不展开**。
-     *
-     * 审查意见原话：「任一扫描、数组容量或改线记录容量不足时，整图保持原版，
-     * 不得部分登记强制放行门。」
-     *
-     * g_rewire[] 用来记录改线前的原目标（供失败回滚）。容量不够时回滚会不完整 →
-     * 留下半改线状态。所以先算一遍总改线数，超了就整图拒绝。 */
-    {
-        int need = 0;
-        for (int k = 0; k < g_npairs; ++k) {
-            if (!g_will_expand[k]) continue;
-            need += g_pair[k].ex_n;                 /* 出口改线 */
-            int g1 = g_pair[k].g1;
-            if (g1 >= 0 && g1 < g_nnodes) need += g_ec[g1];   /* G1→G0 改线 */
-        }
-        if (g_rewire_n + need > FLAT_MAX_EDGES) {
-            if (g_log_graph < FLAT_LOG_GRAPH) {
-                g_log_graph++;
-                LOGI("[flat-reject] 改线记录容量不足（需 %d，剩 %d）→ 整图不展开",
-                     need, FLAT_MAX_EDGES - g_rewire_n);
-            }
-            for (int k = 0; k < g_npairs; ++k) g_will_expand[k] = 0;
-        }
-    }
+    flat_chain_decide();   /* 整链决策：链内任一不通过 → 整链清零 */
 
     /* 未展开的对 → 它们的条件进「禁止放宽」表 */
     for (int k = 0; k < g_npairs; ++k) {
@@ -1195,9 +1040,6 @@ void flatten_try(void* any_node) {
         flat_add_ban(g_cond[g_pair[k].g0]);
         flat_add_ban(g_cond[g_pair[k].g1]);
     }
-    /* v273（P0-6）：ban 表刚建好 → 清放宽判定的 TTL 缓存。
-     * 否则之前（图还在决策中时）缓存下的「放宽」决定会继续生效，形成时序窗口。 */
-    relax_rule_cache_clear();
 
     /* ---------------- ③b 逐对落地（只处理整链通过的） ---------------- */
     int expanded = 0, redirected = 0, skipped = 0;
@@ -1289,7 +1131,6 @@ void flatten_try(void* any_node) {
 
 
 
-        int rw_start = g_rewire_n;      /* v273（P0-7）：本次改线的起点，用于失败回滚 */
         int ok = 0, bad = 0;
         for (int e = 0; e < p->ex_n; ++e) {
             FLAT_EDGE* ed = &g_edge[g_exit[p->ex_start + e]];
@@ -1305,23 +1146,6 @@ void flatten_try(void* any_node) {
             } else bad++;
         }
         redirected += ok;      /* v238 替换改线目标时把这行弄丢了 → 汇总永远显示「改线 0 条」 */
-
-        /* v273（P0-7）：**事务化** — 任一出口改线失败就回滚本次全部改线，
-         * 并且**不登记门表**（避免「连接只改了一半 + 门被强制放行」这种不一致）。
-         *
-         * 审查意见原话：「任意步骤失败都恢复原连接，不留下部分改线或部分门表。」 */
-        if (bad > 0) {
-            for (int i = g_rewire_n - 1; i >= rw_start; --i)
-                port_set_conn_node(g_rewire[i].port, g_rewire[i].slot, g_rewire[i].orig);
-            g_rewire_n = rw_start;
-            redirected -= ok;
-            skipped++;
-            if (g_log_pair < 300) {
-                g_log_pair++;
-                LOGI("[flat-rollback] pid=%d 有 %d 条出口改线失败 → 回滚本次改线，不登记门表", p->pid, bad);
-            }
-            continue;
-        }
 
         /* v244：**把本对的 G1 门（不在队）出边改指本对的 G0 门（在队）**。
          *
@@ -1356,16 +1180,7 @@ void flatten_try(void* any_node) {
                             }
                             continue;
                         }
-                        void* orig2 = port_conn_node(op1, k2);
-                        if (port_set_conn_node(op1, k2, g_nd[p->g0])) {
-                            if (g_rewire_n < FLAT_MAX_EDGES) {
-                                g_rewire[g_rewire_n].port = op1;
-                                g_rewire[g_rewire_n].slot = k2;
-                                g_rewire[g_rewire_n].orig = orig2;
-                                g_rewire_n++;
-                            }
-                            redirected++;
-                        }
+                        if (port_set_conn_node(op1, k2, g_nd[p->g0])) redirected++;
                     }
                 }
             }

@@ -363,6 +363,3 @@ typedef struct { float x, y, w, h; } Rect4;
 
 /* v271：该条件是否属于「未展开的链」→ 禁止放宽（只针对门对） */
 int flatten_is_banned_cond(void* cond);
-
-/* v273（P0-6）：这张图是否已完成决策（用于消除放宽的时序窗口） */
-void relax_rule_cache_clear(void);   /* v273（P0-6）：决策完成后清放宽判定缓存 */
